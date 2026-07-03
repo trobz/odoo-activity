@@ -43,6 +43,8 @@ extend-safe-fixes = ["UP008"]
 
 [lint.per-file-ignores]
 "tests/*" = ["S101"]
+# fixed-argv calls to systemctl/supervisorctl/ps/psql/odoo-db, not untrusted input
+"odoo_activity/probes.py" = ["S603", "S607"]
 
 [format]
 preview = true

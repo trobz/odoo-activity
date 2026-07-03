@@ -1,11 +1,15 @@
 import typer
 
-app = typer.Typer()
+from odoo_activity.tui import OdooActivity
+
+app = typer.Typer(add_completion=False)
 
 
-@app.command()
-def hello(name: str):
-    print(f"Hello {name}")
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context) -> None:
+    """odoo-activity — TUI for local Odoo instances."""
+    if ctx.invoked_subcommand is None:
+        OdooActivity().run()
 
 
 if __name__ == "__main__":
