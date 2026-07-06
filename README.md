@@ -23,9 +23,12 @@ for the database category tabs.
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` | move through instances and their nested dbs |
-| `s` / `p` / `r` | start / stop / restart (confirm popup) |
+| `s` / `r` | start/stop toggle / restart (confirm popup) |
 | `[` / `]` | switch tab in the detail pane |
+| `t` / `l` | Top / Logs (instance row highlighted) |
 | `u` / `l` / `j` / `c` | Users / Locks / Jobs / Crons (db row highlighted) |
+| `/` | search (Logs tab) |
+| `q` | quit |
 
 `ODOO_ACTIVITY_DB_ROLE` overrides the postgres role used to resolve an
 instance's databases (default: the instance's `db_user`, falling back to

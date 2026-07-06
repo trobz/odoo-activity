@@ -4,6 +4,13 @@ from types import SimpleNamespace
 from odoo_activity import probes, tui
 
 
+def test_bar_colors_by_htop_thresholds():
+    assert "[green]" in tui._bar(49)
+    assert "[yellow]" in tui._bar(50)
+    assert "[yellow]" in tui._bar(79)
+    assert "[red]" in tui._bar(80)
+
+
 def test_systemd_instances_filters_templates_and_maps_status(monkeypatch):
     files = (
         "gnome@.service           disabled enabled\n"  # template, dropped

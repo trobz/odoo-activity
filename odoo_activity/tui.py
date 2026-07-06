@@ -15,7 +15,8 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Label, ListItem, ListView, Static
+from textual.theme import Theme
+from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
@@ -33,6 +34,18 @@ from odoo_activity.probes import (
 # sort priority for the instances list: running first, then a failure state
 # (systemd "failed", supervisor "exited"/"fatal"), then a clean "stopped"
 _STATUS_ORDER = {"running": 0, "stopped": 2}
+
+# Trobz brand palette (see trobz brand-guidelines skill)
+TROBZ_THEME = Theme(
+    name="trobz",
+    primary="#E54F0D",
+    accent="#E54F0D",
+    background="#1A110E",
+    surface="#311E18",
+    panel="#311E18",
+    foreground="#FFFFFF",
+    dark=True,
+)
 
 
 def _compute_status(inst: dict) -> str:
@@ -61,8 +74,10 @@ def _db_label(db: str, port: str | None, name_width: int, uptime_width: int) -> 
 
 
 def _bar(pct: float, width: int = 24) -> str:
+    """htop-style bar: green/yellow/red fill by load, dim track."""
     filled = min(width, round(pct / 100 * width))
-    return "█" * filled + "░" * (width - filled)
+    color = "red" if pct >= 80 else "yellow" if pct >= 50 else "green"
+    return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -131,29 +146,35 @@ class OdooActivity(App):
         ("r", "restart", "Restart"),
         ("[", "prev_tab", "Prev tab"),
         ("]", "next_tab", "Next tab"),
-        ("u", "select_db_tab('Users')", "Users"),
-        ("l", "select_db_tab('Locks')", "Locks"),
-        ("j", "select_db_tab('Jobs')", "Jobs"),
-        ("c", "select_db_tab('Crons')", "Crons"),
+        ("t", "select_tab('Top')", "Top"),
+        ("l", "select_tab('Logs')", "Logs"),
+        ("l", "select_tab('Locks')", "Locks"),
+        ("u", "select_tab('Users')", "Users"),
+        ("j", "select_tab('Jobs')", "Jobs"),
+        ("c", "select_tab('Crons')", "Crons"),
         ("slash", "search", "Search"),
     ]
 
     def compose(self) -> ComposeResult:
-        yield Header()
-
         with Vertical(id="body"):
             with Horizontal(id="stats-row"):
                 with Vertical(id="cpu-panel", classes="stat-panel"):
                     with Horizontal():
-                        yield Static("SYSTEM CPU", classes="stat-title")
+                        yield Static("CPU", classes="stat-title")
                         yield Static("", id="cpu-pct", classes="stat-value")
                     yield Static("", id="cpu-bar")
 
                 with Vertical(id="mem-panel", classes="stat-panel"):
                     with Horizontal():
-                        yield Static("MEMORY LOAD", classes="stat-title")
+                        yield Static("MEM", classes="stat-title")
                         yield Static("", id="mem-pct", classes="stat-value")
                     yield Static("", id="mem-bar")
+
+                with Vertical(id="swap-panel", classes="stat-panel"):
+                    with Horizontal():
+                        yield Static("SWAP", classes="stat-title")
+                        yield Static("", id="swap-pct", classes="stat-value")
+                    yield Static("", id="swap-bar")
 
                 with Vertical(id="uptime-panel", classes="stat-panel"):
                     yield Static("", id="uptime-text")
@@ -164,6 +185,9 @@ class OdooActivity(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.register_theme(TROBZ_THEME)
+        self.theme = "trobz"
+
         self.query_one("#instances", ListView).border_title = "Instances"
 
         self._cpu = read_cpu_times()
@@ -202,12 +226,14 @@ class OdooActivity(App):
         self._cpu = (total, idle)
 
         cpu_pct = (1 - d_idle / d_total) * 100 if d_total else 0.0
-        mem_pct, _swap_pct = read_mem()
+        mem_pct, swap_pct = read_mem()
 
         self.query_one("#cpu-pct", Static).update(f"{cpu_pct:4.1f}%")
         self.query_one("#cpu-bar", Static).update(_bar(cpu_pct, self._get_bar_width("cpu-panel")))
         self.query_one("#mem-pct", Static).update(f"{mem_pct:4.1f}%")
         self.query_one("#mem-bar", Static).update(_bar(mem_pct, self._get_bar_width("mem-panel")))
+        self.query_one("#swap-pct", Static).update(f"{swap_pct:4.1f}%")
+        self.query_one("#swap-bar", Static).update(_bar(swap_pct, self._get_bar_width("swap-panel")))
 
         load1, load5, load15 = read_loadavg()
         self.query_one("#uptime-text", Static).update(
@@ -381,13 +407,16 @@ class OdooActivity(App):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         # False hides the footer key entirely (None just dims it — Textual's
         # Screen.active_bindings skips on `is False`, not falsy)
-        if action in ("start", "stop", "restart"):
+        if action in ("toggle_start_stop", "restart"):
             focused = self.focused
             return bool(focused is not None and focused.id == "instances")
 
-        # db-tab shortcuts (u/l/j/c) only make sense with a database highlighted
-        if action == "select_db_tab":
-            return bool(self.highlighted_db() is not None)
+        # a tab shortcut only makes sense if its name is one of the current
+        # mode's tabs (instance: Top/Logs, database: the rest); "l" binds
+        # both Logs and Locks, gated here so only the active one shows/fires
+        if action == "select_tab":
+            (name,) = parameters
+            return self.query_one(ActivityPane).has_tab(str(name))
 
         if action == "search":
             return self.query_one(ActivityPane).is_logs_active()
@@ -402,7 +431,7 @@ class OdooActivity(App):
         self.query_one(ActivityPane).next_tab()
         self.refresh_bindings()
 
-    def action_select_db_tab(self, name: str) -> None:
+    def action_select_tab(self, name: str) -> None:
         self.query_one(ActivityPane).select_tab_by_name(name)
 
     def action_search(self) -> None:

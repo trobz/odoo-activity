@@ -215,6 +215,10 @@ class ActivityPane(Vertical):
         if name in tabs:
             self.select_tab(tabs.index(name))
 
+    def has_tab(self, name: str) -> bool:
+        """True if `name` is one of the current mode's tabs."""
+        return name in self.TABS[self._mode]
+
     def prev_tab(self) -> None:
         self.select_tab(self._tab - 1)
 
