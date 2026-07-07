@@ -40,6 +40,17 @@ def test_systemd_instances_filters_templates_and_maps_status(monkeypatch):
     ]
 
 
+def test_parse_odoo_db_output_falls_back_to_raw_for_non_json():
+    rows, raw = probes.parse_odoo_db_output("queue_job module not installed.\n", "")
+    assert rows is None
+    assert raw == "queue_job module not installed."
+
+
+def test_parse_odoo_db_output_wraps_a_single_json_object():
+    rows, _raw = probes.parse_odoo_db_output('{"db": "demo"}', "")
+    assert rows == [{"db": "demo"}]
+
+
 def test_supervisor_instances_maps_status_vocab_and_uptime(monkeypatch, tmp_path):
     monkeypatch.setattr(probes, "SUPERVISOR_CONFD", tmp_path / "absent")  # status only
     status = (

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -25,9 +26,10 @@ from odoo_activity.probes import (
     CLK_TCK,
     db_port_of,
     logfile_of,
-    odoo_db_rows,
+    parse_odoo_db_output,
     proc_cpu_ticks,
     procs_of,
+    start_odoo_db,
     stringify,
     table_columns,
     tail,
@@ -39,6 +41,24 @@ if TYPE_CHECKING:
 
 def _inst_key(inst: dict | None) -> str | None:
     return f"{inst['manager']}:{inst['name']}" if inst else None
+
+
+class _DbTab:
+    """The pane's one db-tab fetch/result — one pane shows one db tab at a
+    time, so there's never more than one to track."""
+
+    def __init__(self) -> None:
+        self.ident: tuple[str, str] | None = None  # (category, db) most recently requested
+        self.proc: subprocess.Popen[str] | None = None  # its still-running odoo-db, if any
+        self.rows: list[dict] = []  # raw (untruncated) rows behind #actable, outlives the fetch
+
+    def abandon(self) -> None:
+        """Kill a still-running fetch and forget it. Its process (and the
+        query on Postgres's side) may keep running for a while regardless —
+        see start_odoo_db — this only stops us from waiting on it."""
+        if self.proc is not None:
+            self.proc.kill()
+            self.proc = None
 
 
 class ActivityTab(Static):
@@ -106,7 +126,7 @@ class ActivityPane(Vertical):
         self._top_prev: dict[str, tuple[int, float]] = {}  # pid -> (ticks, monotonic)
         self._inflight: dict[str, object] = {}  # key -> ident of the run in progress
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
-        self._dbtab_rows: list[dict] = []  # raw (untruncated) rows behind #actable
+        self._dbtab = _DbTab()
         self._showing_raw = False  # viewing one row's raw json in #acbody
         self._render_mode()
 
@@ -174,8 +194,8 @@ class ActivityPane(Vertical):
             return
 
         idx = int(event.row_key.value)
-        if idx < len(self._dbtab_rows):
-            self._show_raw(self._dbtab_rows[idx])
+        if idx < len(self._dbtab.rows):
+            self._show_raw(self._dbtab.rows[idx])
 
     def _show_raw(self, row: dict) -> None:
         self._showing_raw = True
@@ -196,6 +216,7 @@ class ActivityPane(Vertical):
 
     def show_instance(self, inst: dict | None) -> None:
         """Switch to instance mode (Top/Logs) for `inst`."""
+        self._dbtab.abandon()  # leaving database mode; don't leave a fetch running unseen
         self._mode = "instance"
         self._instance = inst
         self._render_mode()
@@ -388,18 +409,44 @@ class ActivityPane(Vertical):
             return
 
         _inst, db = self._db
-        self._coalesce("dbtab", (category, db), lambda: self._fetch_db_tab(category, db))
+        ident = (category, db)
+        if ident == self._dbtab.ident and self._dbtab.proc is not None:
+            return  # already fetching this exact tab; let it finish rather than restart
 
-    async def _fetch_db_tab(self, category: str, db: str) -> None:
+        self._dbtab.abandon()  # drop the previous tab's client (see start_odoo_db)
+        self._dbtab.ident = ident
+        self.run_worker(self._fetch_db_tab(category, db, ident), group="dbtab")
+
+    async def _fetch_db_tab(self, category: str, db: str, ident: tuple[str, str]) -> None:
         port = db_port_of(self._db[0]) if self._db else None
-        rows, raw = await asyncio.to_thread(odoo_db_rows, category.lower(), db, port)
+        proc = await asyncio.to_thread(start_odoo_db, category.lower(), db, port)
+        self._dbtab.proc = proc
 
+        def _wait() -> tuple[str, str] | None:
+            try:
+                return proc.communicate(timeout=90)
+            except subprocess.TimeoutExpired:  # backstop for a genuinely stuck call
+                proc.kill()
+                return None
+
+        result = await asyncio.to_thread(_wait)
+
+        if ident != self._dbtab.ident:
+            return  # superseded by a newer tab selection; this result is stale
+
+        self._dbtab.proc = None
+
+        if result is None:
+            self._log_body("(odoo-db timed out after 90s)")
+            return
+
+        rows, raw = parse_odoo_db_output(*result)
         if rows is None:
             self._log_body(raw or "(no output)")
         elif not rows:
             self._log_body("(empty)")
         else:
-            self._dbtab_rows = rows
+            self._dbtab.rows = rows
             self._show_datatable(rows)
 
     def _use(self, which: str) -> None:

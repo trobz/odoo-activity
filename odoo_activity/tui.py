@@ -205,7 +205,7 @@ class OdooActivity(App):
         self.set_interval(1.0, self.refresh_host)
         self.set_interval(0.5, self.query_one(ActivityPane).poll)
         self.set_interval(5.0, self.poll_instances)
-        self.set_interval(0.6, self._pulse_running)
+        self.set_interval(0.7, self._pulse_running)
 
     def on_show(self) -> None:
         """Run after layout is complete and app is shown."""
@@ -323,7 +323,7 @@ class OdooActivity(App):
         if status == "stopped":
             return "○"
         if status == "running":
-            return "[green]●[/]" if self._pulse_on else "[dim green]●[/]"
+            return "[green]●[/]" if self._pulse_on else " "
         return "[red]●[/]"  # failed / exited / fatal
 
     def _pulse_running(self) -> None:

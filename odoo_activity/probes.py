@@ -483,23 +483,37 @@ def tail(path: Path, lines: int = 200) -> str:
         return f"(no log: {exc})"
 
 
-def odoo_db_rows(command: str, db: str, port: str | None = None) -> tuple[list[dict] | None, str]:
-    """Run `odoo-db --output-format json <command> <db>`, on `port` if the
+def start_odoo_db(command: str, db: str, port: str | None = None) -> subprocess.Popen[str]:
+    """Start `odoo-db --output-format json <command> <db>`, on `port` if the
     instance's cluster isn't the default one (odoo-db has no --port flag of
     its own, but honors PGPORT like any libpq client).
 
-    Returns (rows, raw). `rows` is None when the output isn't JSON (e.g. a
-    plain message like "queue_job module not installed."); `raw` is then the
-    message to show as-is.
+    Returns the live process rather than waiting on it, so a caller can
+    `.kill()` it if abandoned (e.g. the tab driving it was switched away
+    from) instead of blocking behind a slow query. Note this only stops *our*
+    client and its thread — odoo-db opens a plain psycopg connection with no
+    SIGTERM handling, so Postgres notices the dropped connection and cancels
+    the backend query on its own schedule, not instantly
+    (see odoo-db/db.py connect()).
     """
     env = {**os.environ, "PGPORT": port} if port else None
-    out = subprocess.run(
+    return subprocess.Popen(
         ["odoo-db", "--output-format", "json", command, db],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         env=env,
     )
-    raw = out.stdout.strip() or out.stderr.strip()
+
+
+def parse_odoo_db_output(stdout: str, stderr: str) -> tuple[list[dict] | None, str]:
+    """(rows, raw) from a `start_odoo_db` process's captured output.
+
+    `rows` is None when the output isn't JSON (e.g. a plain message like
+    "queue_job module not installed."); `raw` is then the message to show
+    as-is.
+    """
+    raw = stdout.strip() or stderr.strip()
 
     try:
         data = json.loads(raw)
