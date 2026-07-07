@@ -78,8 +78,8 @@ class ActivityPane(Vertical):
     the db-mode tabs for the highlighted database."""
 
     DEFAULT_CSS = """
-    ActivityPane { border: round $primary; background: transparent; }
-    ActivityPane:focus-within { border: round $accent; }
+    ActivityPane { border: round $accent; background: transparent; }
+    ActivityPane:focus-within { border: round $primary; }
     #actabs { height: 1; margin-bottom: 1; padding: 0 1; }
     ActivityTab { width: auto; padding: 0 1; color: $text-muted; }
     ActivityTab:hover { color: $text; }

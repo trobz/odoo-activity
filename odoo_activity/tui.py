@@ -120,14 +120,14 @@ class OdooActivity(App):
     #body { height: 1fr; }
 
     #stats-row { height: 4; }
-    .stat-panel { border: round $primary; width: 1fr; padding: 0 1; }
+    .stat-panel { border: round $accent; width: 1fr; padding: 0 1; }
     .stat-title { width: 1fr; }
     .stat-value { width: auto; text-style: bold; }
     #uptime-text { height: 2; }
 
-    #instances { border: round $primary; background: transparent; height: 6; }
+    #instances { border: round $accent; background: transparent; height: 6; }
     #activity { height: 1fr; }
-    #instances:focus { border: round $accent; }
+    #instances:focus { border: round $primary; }
 
     /* selected item stays visible whether or not its list has focus;
        color: auto keeps the text readable on top of the accent background */
