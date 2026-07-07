@@ -10,12 +10,14 @@ license-files = ["LICENSE"]
 
 dependencies = [
     "typer>=0.20",
+    "textual>=8",
 ]
 
 [project.urls]
 Repository = "https://github.com/trobz/odoo-activity"
 [project.scripts]
 odoo-activity = "odoo_activity.main:app"
+oa = "odoo_activity.main:app"
 
 [dependency-groups]
 dev = [
