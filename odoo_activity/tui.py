@@ -1,14 +1,15 @@
 """odoo-activity TUI — host stats, instances (with their dbs), activity pane.
 
-The app here is just the shell: it lays out the rows and wires focus,
-selection and the refresh timers. The system data lives in
-:mod:`odoo_activity.probes`; the mode-switched Top/Logs and db-mode tabs
-are in :mod:`odoo_activity.panes.detail`.
+The app here is just the shell: it lays out the rows and wires focus, selection
+and the refresh timers. The system data lives in :mod:`odoo_activity.probes`;
+the mode-switched instance-mode and db-mode tabs are in
+:mod:`odoo_activity.panes.detail`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import signal
 from typing import ClassVar
 
 from textual import events, work
@@ -29,6 +30,7 @@ from odoo_activity.probes import (
     read_loadavg,
     read_mem,
     read_uptime,
+    signal_process,
 )
 
 # sort priority for the instances list: running first, then a failure state
@@ -146,13 +148,17 @@ class OdooActivity(App):
         ("r", "restart", "Restart"),
         ("[", "prev_tab", "Prev tab"),
         ("]", "next_tab", "Next tab"),
-        ("t", "select_tab('Top')", "Top"),
+        ("p", "select_tab('Processes')", "Processes"),
         ("l", "select_tab('Logs')", "Logs"),
         ("l", "select_tab('Locks')", "Locks"),
+        ("c", "select_tab('Config')", "Config"),
+        ("c", "select_tab('Crons')", "Crons"),
         ("u", "select_tab('Users')", "Users"),
         ("j", "select_tab('Jobs')", "Jobs"),
-        ("c", "select_tab('Crons')", "Crons"),
         ("slash", "search", "Search"),
+        ("K", "kill_process", "Kill -9"),
+        ("L", "quit_process", "Log dump -3"),
+        ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -412,20 +418,26 @@ class OdooActivity(App):
             return bool(focused is not None and focused.id == "instances")
 
         # a tab shortcut only makes sense if its name is one of the current
-        # mode's tabs (instance: Top/Logs, database: the rest); "l" binds
-        # both Logs and Locks, gated here so only the active one shows/fires
+        # mode's tabs (instance-mode, db-mode); "l"/"c" each bind two names,
+        # gated here so only the active one shows/fires
         if action == "select_tab":
             (name,) = parameters
             return self.query_one(ActivityPane).has_tab(str(name))
 
         if action == "search":
-            return self.query_one(ActivityPane).is_logs_active()
+            return self.query_one(ActivityPane).has_search()
+
+        if action in ("kill_process", "quit_process"):
+            return self.query_one(ActivityPane).is_processes_active()
+
+        if action == "toggle_config_mode":
+            return self.query_one(ActivityPane).is_config_active()
 
         return True
 
     def action_prev_tab(self) -> None:
         self.query_one(ActivityPane).prev_tab()
-        self.refresh_bindings()  # Search only shows in the footer on the Logs tab
+        self.refresh_bindings()
 
     def action_next_tab(self) -> None:
         self.query_one(ActivityPane).next_tab()
@@ -433,6 +445,7 @@ class OdooActivity(App):
 
     def action_select_tab(self, name: str) -> None:
         self.query_one(ActivityPane).select_tab_by_name(name)
+        self.refresh_bindings()
 
     def action_search(self) -> None:
         self.query_one(ActivityPane).open_search()
@@ -471,6 +484,30 @@ class OdooActivity(App):
         name, manager = inst["name"], inst["manager"]
         await asyncio.to_thread(instance_action, name, action, manager)
         self.poll_instances()  # re-label in place; keeps selection, no flicker
+
+    def action_kill_process(self) -> None:
+        proc = self.query_one(ActivityPane).selected_process()
+        if proc is None:
+            return
+
+        def on_confirm(confirmed: bool | None) -> None:
+            if confirmed:
+                signal_process(proc["pid"], signal.SIGKILL)
+
+        self.push_screen(ConfirmScreen(f"Kill PID {proc['pid']}?"), on_confirm)
+
+    def action_quit_process(self) -> None:
+        """Send SIGQUIT (kill -3) — the process dumps a traceback to its
+        logfile — then jump to Logs so the dump is visible right away."""
+        proc = self.query_one(ActivityPane).selected_process()
+        if proc is None:
+            return
+
+        signal_process(proc["pid"], signal.SIGQUIT)
+        self.query_one(ActivityPane).select_tab_by_name("Logs")
+
+    def action_toggle_config_mode(self) -> None:
+        self.query_one(ActivityPane).toggle_config_mode()
 
 
 def run() -> None:

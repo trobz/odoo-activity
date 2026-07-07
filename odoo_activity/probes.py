@@ -7,6 +7,7 @@ databases lives here so it stays testable without spinning up Textual.
 from __future__ import annotations
 
 import configparser
+import contextlib
 import json
 import os
 import platform
@@ -311,6 +312,24 @@ def _config_names(instance_name: str) -> list[str]:
     return ["odoo.conf", "server.conf"]
 
 
+def _config_file(inst: dict) -> Path | None:
+    """The first `<workdir>/config/` file matching `_config_names`, or None."""
+    workdir = instance_workdir(inst)
+    for name in _config_names(inst["name"]):
+        path = workdir / "config" / name
+        if path.is_file():
+            return path
+
+    return None
+
+
+def configfile_of(inst: dict) -> Path | None:
+    """The instance's resolved config file path, for tools (e.g. the
+    `odoo-config` CLI) that operate on the file directly rather than its
+    parsed values."""
+    return _config_file(inst)
+
+
 def instance_config(inst: dict) -> tuple[Path, configparser.RawConfigParser | None]:
     """(workdir, parsed odoo config) — the single source of db + log settings.
 
@@ -318,14 +337,13 @@ def instance_config(inst: dict) -> tuple[Path, configparser.RawConfigParser | No
     returns (workdir, None) when none exists.
     """
     workdir = instance_workdir(inst)
-    for name in _config_names(inst["name"]):
-        path = workdir / "config" / name
-        if path.is_file():
-            parser = configparser.RawConfigParser()  # odoo configs may contain `%`
-            parser.read(path)
-            return workdir, parser
+    path = _config_file(inst)
+    if path is None:
+        return workdir, None
 
-    return workdir, None
+    parser = configparser.RawConfigParser()  # odoo configs may contain `%`
+    parser.read(path)
+    return workdir, parser
 
 
 def _opt(parser: configparser.RawConfigParser | None, key: str) -> str | None:
@@ -455,6 +473,47 @@ def procs_of(inst: dict) -> list[dict[str, str]]:
         stack.extend(children.get(pid, []))
 
     return [by_pid[pid] for pid in keep]
+
+
+def signal_process(pid: str, sig: int) -> None:
+    """Send `sig` to `pid`; a pid that's already gone is not an error."""
+    with contextlib.suppress(ProcessLookupError, ValueError):
+        os.kill(int(pid), sig)
+
+
+def instance_version(inst: dict) -> str | None:
+    """The instance's Odoo version, via the `odoo-addons-path` CLI (layout/
+    addons-path detection lives there, not here)."""
+    try:
+        out = subprocess.run(
+            ["odoo-addons-path", str(instance_workdir(inst)), "--verbose", "--format", "json"],
+            capture_output=True,
+            text=True,
+        ).stdout
+    except FileNotFoundError:
+        return None
+
+    try:
+        return json.loads(out).get("version")
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def render_config(config: Path, version: str | None, mode: str) -> str:
+    """`odoo-config <mode> <config>` output — plain ini text (compact = only
+    keys differing from odoo's default; expand = every valid option filled
+    in). `version` is omitted when unknown; odoo-config then falls back to
+    its newest schema."""
+    cmd = ["odoo-config", mode, str(config)]
+    if version:
+        cmd += ["--version", version]
+
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return "(odoo-config not found on PATH)"
+
+    return out.stdout.strip() or out.stderr.strip() or f"(odoo-config exit {out.returncode})"
 
 
 _TAIL_CHUNK = 64 * 1024
