@@ -64,14 +64,20 @@ def _compute_status(inst: dict) -> str:
     return inst["status"]
 
 
-def _db_label(db: str, port: str | None, name_width: int, uptime_width: int) -> str:
+def _display_name(inst: dict) -> str:
+    """Instance name for display — `.service` is systemd-unit plumbing, not
+    part of the name a user recognizes."""
+    return inst["name"].removesuffix(".service")
+
+
+def _db_label(db: str, port: str | None, name_width: int, uptime_width: int, indent: int) -> str:
     """`dbname            port` — port's right edge lands on the same column
-    as the instance rows' uptime right edge (2-space indent + dot + space +
-    name_width + space + the uptime field), not a fixed column."""
+    as the instance rows' uptime right edge (dot + space + name_width + space
+    + the uptime field) regardless of `indent`, not a fixed column."""
     if not port:
         return db
 
-    pad = max(1, name_width + uptime_width + 1 - len(db) - len(port))
+    pad = max(1, name_width + uptime_width + 1 - indent - len(db) - len(port))
     return f"{db}{' ' * pad}[dim]{port}[/]"
 
 
@@ -290,7 +296,8 @@ class OdooActivity(App):
                 db_key = f"{key}::db::{db}"
                 self._row_owner[db_key] = key
                 self._row_db[db_key] = db
-                items.append(ListItem(Label("  " + _db_label(db, port, name_width, uptime_width)), name=db_key))
+                label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}"
+                items.append(ListItem(Label(label), name=db_key))
                 keys.append(db_key)
 
         if items:
@@ -305,7 +312,7 @@ class OdooActivity(App):
         every row's uptime/status against a longer neighbour)."""
         if not self._instances:
             return 24
-        return max(24, max(len(inst["name"]) for inst in self._instances.values()))
+        return max(24, max(len(_display_name(inst)) for inst in self._instances.values()))
 
     def _uptime_width(self) -> int:
         """Uptime column width, sized to the longest uptime currently shown.
@@ -323,7 +330,7 @@ class OdooActivity(App):
         color = {"running": "green", "stopped": "dim"}.get(status, "red")
         width = self._name_width()
         uptime_width = self._uptime_width()
-        return f"{dot} {inst['name']:<{width}} {inst['uptime']:>{uptime_width}}  [{color}]{status.upper()}[/]"
+        return f"{dot} {_display_name(inst):<{width}} {inst['uptime']:>{uptime_width}}  [{color}]{status.upper()}[/]"
 
     def _dot(self, status: str) -> str:
         if status == "stopped":

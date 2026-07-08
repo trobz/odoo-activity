@@ -25,11 +25,13 @@ from odoo_activity.probes import (
     CLK_TCK,
     configfile_of,
     db_port_of,
+    instance_procs,
     instance_version,
     logfile_of,
+    odoo_pid_for_port,
     parse_odoo_db_output,
+    pg_client_port,
     proc_cpu_ticks,
-    procs_of,
     render_config,
     start_odoo_db,
     stringify,
@@ -219,14 +221,44 @@ class ActivityPane(Vertical):
             event.stop()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        # only db-mode tabs drill into raw json; the Processes tab reuses
-        # #actable too, but a re-click there just re-confirms the selection
-        if self._mode != "database" or event.row_key.value is None:
+        if event.row_key.value is None:
             return
 
         idx = int(event.row_key.value)
+
+        if self.is_processes_active():
+            self.run_worker(self._jump_from_process_row(idx))
+            return
+
+        # only db-mode tabs drill into raw json
+        if self._mode != "database":
+            return
+
         if idx < len(self._dbtab.rows):
             self._show_raw(self._dbtab.rows[idx])
+
+    async def _jump_from_process_row(self, idx: int) -> None:
+        """`enter` on a postgres row moves the cursor to the Odoo worker
+        driving it, traced via the backend's client port (see
+        probes.odoo_pid_for_port). A no-op on an Odoo row, or when nothing
+        in this table matches (a different instance's worker, a unix-socket
+        connection with no port, `lsof` missing)."""
+        if not (0 <= idx < len(self._proc_rows)):
+            return
+
+        row = self._proc_rows[idx]
+        if row.get("kind") != "pg":
+            return
+
+        port = pg_client_port(row["cmd"])
+        target = await asyncio.to_thread(odoo_pid_for_port, port) if port else None
+        row_idx = next((i for i, p in enumerate(self._proc_rows) if p["pid"] == target), None)
+
+        if row_idx is None:
+            self.app.notify("No matching Odoo process found", severity="warning", timeout=2)
+            return
+
+        self.query_one("#actable", DataTable).move_cursor(row=row_idx)
 
     def _show_raw(self, row: dict) -> None:
         self._showing_raw = True
@@ -312,7 +344,11 @@ class ActivityPane(Vertical):
         if self._log_query:
             self._render_log()
         else:
-            self.query_one("#acbody", Log).write(data)
+            body = self.query_one("#acbody", Log)
+            # only follow the tail if the user was already at the bottom —
+            # else a scroll-up to read older lines gets yanked back down
+            # every time new data lands
+            body.write(data, scroll_end=self._at_bottom(body))
 
     def _render_mode(self) -> None:
         tabs = self.TABS[self._mode]
@@ -388,6 +424,7 @@ class ActivityPane(Vertical):
 
     def _render_log(self) -> None:
         body = self.query_one("#acbody", Log)
+        was_at_bottom = self._at_bottom(body)
         body.clear()
 
         if not self._log_query:
@@ -397,10 +434,16 @@ class ActivityPane(Vertical):
             lines = [ln for ln in self._log_text.splitlines() if needle in ln.lower()]
             text = "\n".join(lines) if lines else f"(no match: {self._log_query})"
 
-        # Tail logs at the bottom; open the static config at the top
-        body.write(text, scroll_end=self.is_logs_active())
+        # Tail logs stick to the bottom only if already there (a fresh,
+        # still-empty widget counts as "at bottom" so a first load still
+        # opens tailing); the static config always opens at the top
+        body.write(text, scroll_end=self.is_logs_active() and was_at_bottom)
         if not self.is_logs_active():
             body.scroll_home(animate=False)
+
+    @staticmethod
+    def _at_bottom(body: Log) -> bool:
+        return body.scroll_y >= body.max_scroll_y - 1
 
     def toggle_config_mode(self) -> None:
         """Cycle the Config tab through odoo-config's views: compact (only
@@ -453,7 +496,8 @@ class ActivityPane(Vertical):
             self._show_process_table([])
             return
 
-        procs = await asyncio.to_thread(procs_of, inst)
+        odoo_procs, pg_procs = await asyncio.to_thread(instance_procs, inst)
+        procs = [{**p, "kind": "odoo"} for p in odoo_procs] + [{**p, "kind": "pg"} for p in pg_procs]
         now = time.monotonic()
         prev, self._top_prev = self._top_prev, {}
         rows = []
@@ -474,15 +518,22 @@ class ActivityPane(Vertical):
 
             rows.append({**p, "time": time_str, "cpu": f"{cpu:.1f}"})
 
+        # sort by cpu load desc, in order to quickly spot the ones that matters
+        rows.sort(key=lambda p: float(p["cpu"]), reverse=True)
         self._proc_rows = rows
         self._show_process_table(rows)
 
     def _show_process_table(self, rows: list[dict]) -> None:
-        """Populate the DataTable and preserve the user's selected PID across refreshes."""
+        """Populate the DataTable, preserving the user's selected PID and
+        scroll position across refreshes."""
         table = self.query_one("#actable", DataTable)
 
-        # Track selected PID before clearing, read directly from the UI row 0
         keep_pid = table.get_row_at(table.cursor_row)[0] if table.row_count else None
+        # clear(columns=True) below wipes both scroll axes too, not just the
+        # rows — without saving them here, the 1s tick would yank a
+        # manually-scrolled (horizontally or vertically) view back to the
+        # top-left corner on every refresh
+        scroll_x, scroll_y = table.scroll_x, table.scroll_y
 
         table.clear(columns=True)
         table.add_columns("PID", "PPID", "USER", "TIME", "CPU%", "MEM%", "COMMAND")
@@ -495,6 +546,7 @@ class ActivityPane(Vertical):
         # Find where the old PID moved to, default to row 0 if missing
         restore = next((i for i, p in enumerate(rows) if p["pid"] == keep_pid), 0)
         table.move_cursor(row=restore)
+        table.scroll_to(x=scroll_x, y=scroll_y, animate=False)
 
     def _load_db_tab(self, category: str) -> None:
         self._showing_raw = False
