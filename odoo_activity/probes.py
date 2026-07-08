@@ -475,6 +475,86 @@ def procs_of(inst: dict) -> list[dict[str, str]]:
     return [by_pid[pid] for pid in keep]
 
 
+def instance_procs(inst: dict) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """(odoo_processes, postgres_backends) from one `ps` call, halving the
+    system-wide `ps` fork+parse the Processes tab used to do twice a tick.
+
+    Postgres process titles vary by cluster configuration, so backends are
+    matched by db-name membership rather than a fixed token position.
+    """
+    master = instance_pid(inst)
+    dbs = set(databases_of(inst)[0])
+
+    lines = subprocess.run(
+        ["ps", "-eo", "pid,ppid,user,%mem,args"],
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()[1:]
+
+    by_pid: dict[str, dict[str, str]] = {}
+    children: dict[str, list[str]] = {}
+    pg_rows: list[dict[str, str]] = []
+
+    for ln in lines:
+        cols = ln.split(maxsplit=4)
+        if len(cols) < 5:
+            continue
+
+        row = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
+        by_pid[row["pid"]] = row
+        children.setdefault(row["ppid"], []).append(row["pid"])
+
+        if dbs and row["cmd"].startswith("postgres:") and dbs.intersection(row["cmd"].split()):
+            pg_rows.append(row)
+
+    odoo_rows: list[dict[str, str]] = []
+    if master is not None:
+        keep: list[str] = []
+        stack = [master]
+        while stack:
+            pid = stack.pop()
+            if pid in keep or pid not in by_pid:
+                continue
+            keep.append(pid)
+            stack.extend(children.get(pid, []))
+        odoo_rows = [by_pid[pid] for pid in keep]
+
+    return odoo_rows, pg_rows
+
+
+_PG_CLIENT_PORT_RE = re.compile(r"\((\d+)\)")
+
+
+def pg_client_port(cmd: str) -> str | None:
+    """The client TCP port out of a postgres backend's `ps` title, or None
+    over a unix socket (`[local]`, no parenthesized port at all)."""
+    m = _PG_CLIENT_PORT_RE.search(cmd)
+    return m.group(1) if m else None
+
+
+def odoo_pid_for_port(port: str) -> str | None:
+    """The pid on the other end of the TCP connection whose port is `port`
+    (a postgres backend's client port), via `lsof` — traces a postgres
+    backend back to the Odoo worker that opened it. `lsof -i :port` matches
+    the connection from either endpoint, so postgres's own accepting side
+    is excluded by name; None if `lsof` is missing or nothing else matches."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-Pni", f":{port}"],
+            capture_output=True,
+            text=True,
+        ).stdout
+    except FileNotFoundError:
+        return None
+
+    for line in out.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) > 1 and cols[0] != "postgres" and cols[1].isdigit():
+            return cols[1]
+
+    return None
+
+
 def signal_process(pid: str, sig: int) -> None:
     """Send `sig` to `pid`; a pid that's already gone is not an error."""
     with contextlib.suppress(ProcessLookupError, ValueError):
