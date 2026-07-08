@@ -1,9 +1,8 @@
-"""ActivityPane — the tabbed view for whichever row is highlighted.
+"""ActivityPane — Tabbed view for the selected row.
 
-The app just tells it what's selected (an instance, or one of its
-databases); this pane decides how to show it, switching a tab strip over a
-Log (text) and a DataTable. Instance mode shows Top/Logs; database mode
-shows its db-mode tabs — one pane, mode-switched, no popups.
+Switches dynamically based on selection: Instance mode shows
+Processes/Logs/Config, while Database mode shows db-specific tabs. Mode-switched
+inline, no popups.
 """
 
 from __future__ import annotations
@@ -24,11 +23,14 @@ from textual.widgets import DataTable, Input, Log, Static
 
 from odoo_activity.probes import (
     CLK_TCK,
+    configfile_of,
     db_port_of,
+    instance_version,
     logfile_of,
     parse_odoo_db_output,
     proc_cpu_ticks,
     procs_of,
+    render_config,
     start_odoo_db,
     stringify,
     table_columns,
@@ -60,6 +62,10 @@ class _DbTab:
             self.proc.kill()
             self.proc = None
 
+        # Clearing `ident` forces `_fetch_db_tab` to reject stale results,
+        # preventing them from overwriting the active view.
+        self.ident = None
+
 
 class ActivityTab(Static):
     """A clickable tab in ActivityPane's header."""
@@ -74,8 +80,8 @@ class ActivityTab(Static):
 
 
 class ActivityPane(Vertical):
-    """Mode-switched tab view: Top/Logs for the highlighted instance, or
-    the db-mode tabs for the highlighted database."""
+    """Mode-switched tab view: the instance-mode tabs for the highlighted
+    instance, or the db-mode tabs for the highlighted database."""
 
     DEFAULT_CSS = """
     ActivityPane { border: round $accent; background: transparent; }
@@ -90,8 +96,10 @@ class ActivityPane(Vertical):
     #acraw { background: transparent; display: none; }
     """
 
+    CONFIG_MODES: ClassVar = ["compact", "explain", "expand", "clean"]
+
     TABS: ClassVar = {
-        "instance": ["Top", "Logs"],
+        "instance": ["Processes", "Logs", "Config"],
         "database": ["Users", "Locks", "Jobs", "Crons", "Modules", "Stats"],
     }
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
@@ -124,6 +132,8 @@ class ActivityPane(Vertical):
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
         self._log_query: str | None = None
         self._top_prev: dict[str, tuple[int, float]] = {}  # pid -> (ticks, monotonic)
+        self._proc_rows: list[dict] = []  # rows behind #actable in the Processes tab
+        self._config_mode = self.CONFIG_MODES[0]  # which odoo-config view the Config tab shows
         self._inflight: dict[str, object] = {}  # key -> ident of the run in progress
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
         self._dbtab = _DbTab()
@@ -167,8 +177,27 @@ class ActivityPane(Vertical):
     def is_logs_active(self) -> bool:
         return self._mode == "instance" and self.TABS["instance"][self._tab] == "Logs"
 
+    def is_config_active(self) -> bool:
+        return self._mode == "instance" and self.TABS["instance"][self._tab] == "Config"
+
+    def is_processes_active(self) -> bool:
+        return self._mode == "instance" and self.TABS["instance"][self._tab] == "Processes"
+
+    def has_search(self) -> bool:
+        """Logs and Config both render plain text into #acbody with the same
+        substring filter (see _render_log)."""
+        return self.is_logs_active() or self.is_config_active()
+
+    def selected_process(self) -> dict | None:
+        """The process under the Processes tab's table cursor, if any."""
+        if not self.is_processes_active() or not self._proc_rows:
+            return None
+
+        idx = self.query_one("#actable", DataTable).cursor_row
+        return self._proc_rows[idx] if 0 <= idx < len(self._proc_rows) else None
+
     def open_search(self) -> None:
-        if not self.is_logs_active():
+        if not self.has_search():
             return
 
         box = self.query_one("#acsearch", Input)
@@ -190,7 +219,9 @@ class ActivityPane(Vertical):
             event.stop()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.row_key.value is None:
+        # only db-mode tabs drill into raw json; the Processes tab reuses
+        # #actable too, but a re-click there just re-confirms the selection
+        if self._mode != "database" or event.row_key.value is None:
             return
 
         idx = int(event.row_key.value)
@@ -215,7 +246,7 @@ class ActivityPane(Vertical):
         self._render_log()
 
     def show_instance(self, inst: dict | None) -> None:
-        """Switch to instance mode (Top/Logs) for `inst`."""
+        """Switch to instance mode for `inst`."""
         self._dbtab.abandon()  # leaving database mode; don't leave a fetch running unseen
         self._mode = "instance"
         self._instance = inst
@@ -247,9 +278,10 @@ class ActivityPane(Vertical):
         self.select_tab(self._tab + 1)
 
     def tick(self) -> None:
-        """Keep Top live while it's the active tab. Called on the host refresh timer."""
-        if self._mode == "instance" and self.TABS["instance"][self._tab] == "Top":
-            self._render_top()
+        """Keep Processes live while it's the active tab. Called on the host
+        refresh timer."""
+        if self.is_processes_active():
+            self._render_processes()
 
     def poll(self) -> None:
         """Append newly-written log lines while Logs is the active tab. Called
@@ -283,8 +315,6 @@ class ActivityPane(Vertical):
             self.query_one("#acbody", Log).write(data)
 
     def _render_mode(self) -> None:
-        self.border_title = self._title()
-
         tabs = self.TABS[self._mode]
         if self._mode != self._tabs_mode:
             self._tabs_mode = self._mode
@@ -294,7 +324,10 @@ class ActivityPane(Vertical):
         self._render_active()
 
     def _title(self) -> str:
-        return f"{self.MODE_TITLE[self._mode]}"
+        title = self.MODE_TITLE[self._mode]
+        if self.is_config_active():
+            return f"{title} — Config ({self._config_mode})"
+        return title
 
     def _build_tabs(self, names: list[str]) -> None:
         strip = self.query_one("#actabs", Horizontal)
@@ -307,18 +340,23 @@ class ActivityPane(Vertical):
         self._tab %= len(tabs)
         for tab in self.query(ActivityTab):
             tab.set_class(tab.index == self._tab, "-active")
+        self.border_title = self._title()
 
         active = tabs[self._tab]
         self._log_path = None
         self.query_one("#acsearch", Input).display = False
 
         if self._mode == "instance":
-            self._use("log")
             if active == "Logs":
+                self._use("log")
                 self._load_log(self._instance)
-            else:  # Top
+            elif active == "Config":
+                self._use("log")
+                self._render_config()
+            else:  # Processes
+                self._use("table")
                 self._top_prev = {}
-                self._render_top()
+                self._render_processes()
         else:
             self._load_db_tab(active)
 
@@ -353,30 +391,72 @@ class ActivityPane(Vertical):
         body.clear()
 
         if not self._log_query:
-            body.write(self._log_text)
+            text = self._log_text
+        else:
+            needle = self._log_query.lower()
+            lines = [ln for ln in self._log_text.splitlines() if needle in ln.lower()]
+            text = "\n".join(lines) if lines else f"(no match: {self._log_query})"
+
+        # Tail logs at the bottom; open the static config at the top
+        body.write(text, scroll_end=self.is_logs_active())
+        if not self.is_logs_active():
+            body.scroll_home(animate=False)
+
+    def toggle_config_mode(self) -> None:
+        """Cycle the Config tab through odoo-config's views: compact (only
+        non-default keys), explain (those same keys plus help + default,
+        the "exhaustive" one), expand (every valid option filled in) and
+        clean (drops anything unknown to the schema or invalid for the
+        version/edition)."""
+        if not self.is_config_active():
             return
 
-        needle = self._log_query.lower()
-        lines = [ln for ln in self._log_text.splitlines() if needle in ln.lower()]
-        body.write("\n".join(lines) if lines else f"(no match: {self._log_query})")
+        idx = (self.CONFIG_MODES.index(self._config_mode) + 1) % len(self.CONFIG_MODES)
+        self._config_mode = self.CONFIG_MODES[idx]
+        self.border_title = self._title()
+        self.app.notify(f"Config mode: {self._config_mode}", timeout=2)
+        self._render_config()
 
-    def _render_top(self) -> None:
-        self._coalesce("top", _inst_key(self._instance), self._do_render_top)
+    def _render_config(self) -> None:
+        self._log_body(f"Loading {self._config_mode}…")  # else the prior tab/mode's text lingers until the fetch lands
+        self._coalesce("config", (_inst_key(self._instance), self._config_mode), self._do_render_config)
 
-    async def _do_render_top(self) -> None:
+    async def _do_render_config(self) -> None:
         inst = self._instance
-        body = self.query_one("#acbody", Log)
         if inst is None:
-            body.clear()
-            body.write("(no instance)")
+            self._show_config_text("(no instance)")
+            return
+
+        config = await asyncio.to_thread(configfile_of, inst)
+        if config is None:
+            self._show_config_text("(no config file found)")
+            return
+
+        version = await asyncio.to_thread(instance_version, inst)
+        text = await asyncio.to_thread(render_config, config, version, self._config_mode)
+        self._show_config_text(text)
+
+    def _show_config_text(self, text: str) -> None:
+        # not a tailed file, so #log_path stays None — poll() then leaves it alone
+        self._log_path = None
+        self._log_query = None
+        self._log_text = text
+        self._render_log()
+
+    def _render_processes(self) -> None:
+        self._coalesce("processes", _inst_key(self._instance), self._do_render_processes)
+
+    async def _do_render_processes(self) -> None:
+        inst = self._instance
+        if inst is None:
+            self._proc_rows = []
+            self._show_process_table([])
             return
 
         procs = await asyncio.to_thread(procs_of, inst)
         now = time.monotonic()
         prev, self._top_prev = self._top_prev, {}
-        lines = [
-            f"{'PID':>7} {'PPID':>7} {'USER':<9} {'TIME':>9} {'CPU%':>5} {'MEM%':>5}  COMMAND",
-        ]
+        rows = []
 
         for p in procs:
             pid = p["pid"]
@@ -392,13 +472,29 @@ class ActivityPane(Vertical):
                 if pid in prev and (dt := now - prev[pid][1]) > 0:
                     cpu = max(0.0, ticks - prev[pid][0]) / CLK_TCK / dt * 100
 
-            lines.append(f"{pid:>7} {p['ppid']:>7} {p['user']:<9} {time_str:>9} {cpu:5.1f} {p['mem']:>5}  {p['cmd']}")
+            rows.append({**p, "time": time_str, "cpu": f"{cpu:.1f}"})
 
-        if not procs:
-            lines.append("(no running processes)")
+        self._proc_rows = rows
+        self._show_process_table(rows)
 
-        body.clear()
-        body.write("\n".join(lines))
+    def _show_process_table(self, rows: list[dict]) -> None:
+        """Populate the DataTable and preserve the user's selected PID across refreshes."""
+        table = self.query_one("#actable", DataTable)
+
+        # Track selected PID before clearing, read directly from the UI row 0
+        keep_pid = table.get_row_at(table.cursor_row)[0] if table.row_count else None
+
+        table.clear(columns=True)
+        table.add_columns("PID", "PPID", "USER", "TIME", "CPU%", "MEM%", "COMMAND")
+        for i, p in enumerate(rows):
+            table.add_row(p["pid"], p["ppid"], p["user"], p["time"], p["cpu"], p["mem"], p["cmd"], key=str(i))
+
+        if not rows:
+            return
+
+        # Find where the old PID moved to, default to row 0 if missing
+        restore = next((i for i, p in enumerate(rows) if p["pid"] == keep_pid), 0)
+        table.move_cursor(row=restore)
 
     def _load_db_tab(self, category: str) -> None:
         self._showing_raw = False
