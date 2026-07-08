@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.2.0 (2026-07-08)
+
+### Features
+
+- **tui**: Add Processes and Config tabs, support process signals
+  ([`4fd17fc`](https://github.com/trobz/odoo-activity/commit/4fd17fc8ebd876eb3f42ba5f5fb8e2eca454f7c3))
+
+
 ## v0.1.0 (2026-07-07)
 
 ### Bug Fixes
