@@ -9,6 +9,6 @@ package_name: odoo_activity
 project_description: TUI tool named odoo-activity (inspired by pg_activity)
 project_name: odoo-activity
 project_type: cli
-publish_to_pypi: false
+publish_to_pypi: true
 repository_name: odoo-activity
 repository_namespace: trobz
