@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0 (2026-07-08)
+
+### Features
+
+- **tui**: Optimize process fetching, preserve table scroll, improve UI format
+  ([`740ba9e`](https://github.com/trobz/odoo-activity/commit/740ba9e134afdda0e5564fa926517919f0c6972d))
+
+
 ## v0.2.0 (2026-07-08)
 
 ### Features

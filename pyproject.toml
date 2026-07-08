@@ -1,6 +1,6 @@
 [project]
 name = "odoo-activity"
-version = "0.2.0"
+version = "0.3.0"
 description = "TUI tool named odoo-activity (inspired by pg_activity)"
 authors = [{name = "trobz", email = "contact@trobz.com"}]
 requires-python = ">=3.10"
