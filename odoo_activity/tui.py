@@ -136,6 +136,9 @@ class OdooActivity(App):
     #instances { border: round $accent; background: transparent; height: 6; }
     #activity { height: 1fr; }
     #instances:focus { border: round $primary; }
+    /* fixed height 6 is right for the normal layout, but maximize should
+       fill the screen like every other pane, not center at that height */
+    #instances.-maximized { height: 1fr; }
 
     /* selected item stays visible whether or not its list has focus;
        color: auto keeps the text readable on top of the accent background */
@@ -165,6 +168,7 @@ class OdooActivity(App):
         ("K", "kill_process", "Kill -9"),
         ("L", "quit_process", "Log dump -3"),
         ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
+        ("f", "toggle_maximize", "Maximize"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -456,6 +460,12 @@ class OdooActivity(App):
 
     def action_search(self) -> None:
         self.query_one(ActivityPane).open_search()
+
+    def action_toggle_maximize(self) -> None:
+        if self.screen.maximized is not None:
+            self.screen.minimize()
+        elif self.focused is not None:
+            self.screen.maximize(self.focused)
 
     def action_toggle_start_stop(self) -> None:
         inst = self.current_instance()

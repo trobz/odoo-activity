@@ -401,6 +401,35 @@ def databases_by_role(role: str, port: str | None = None) -> list[str]:
     return [line.strip() for line in out.stdout.splitlines() if line.strip()]
 
 
+_LONG_QUERIES_SQL = (
+    "SELECT json_agg(t) FROM ("
+    "SELECT pid, datname, query_start, age(now(), query_start) AS duration, query "
+    "FROM pg_stat_activity "
+    "WHERE state != 'idle' AND pid != pg_backend_pid() AND datname = :'db' "
+    "ORDER BY duration DESC"
+    ") t"
+)
+
+
+def long_queries(db: str, port: str | None = None) -> list[dict]:
+    """Non-idle queries on `db`, longest-running first, via psql on `port`.
+
+    odoo-db has no equivalent command; this queries pg_stat_activity
+    directly instead, the same way databases_by_role reads pg_database.
+    """
+    cmd = ["psql", "-d", "postgres"]
+    if port:
+        cmd += ["-p", port]
+
+    cmd += ["-v", f"db={db}", "-tA", "-f", "-"]
+    out = subprocess.run(cmd, input=_LONG_QUERIES_SQL, capture_output=True, text=True)
+
+    try:
+        return json.loads(out.stdout.strip()) or []
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
 def proc_cpu_ticks(pid: str) -> int | None:
     """utime+stime (CPU jiffies) for a pid, or None if it's gone."""
     try:
