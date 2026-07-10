@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-07-10)
+
+### Features
+
+- **tui**: Add Queries tab and pane maximize
+  ([`fe74367`](https://github.com/trobz/odoo-activity/commit/fe743670580263b0a1b78eb4af404ff048a3b1a8))
+
+
 ## v0.3.0 (2026-07-08)
 
 ### Features
