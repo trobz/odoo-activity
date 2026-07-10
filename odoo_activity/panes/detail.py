@@ -28,6 +28,7 @@ from odoo_activity.probes import (
     instance_procs,
     instance_version,
     logfile_of,
+    long_queries,
     odoo_pid_for_port,
     parse_odoo_db_output,
     pg_client_port,
@@ -81,6 +82,14 @@ class ActivityTab(Static):
         self.app.query_one(ActivityPane).select_tab(self.index)
 
 
+class _RawScroll(VerticalScroll):
+    """VerticalScroll (like every Container) hardcodes ALLOW_MAXIMIZE = False,
+    which would block `f` from walking up to the pane while this is
+    focused — opt back in."""
+
+    ALLOW_MAXIMIZE = True
+
+
 class ActivityPane(Vertical):
     """Mode-switched tab view: the instance-mode tabs for the highlighted
     instance, or the db-mode tabs for the highlighted database."""
@@ -98,11 +107,15 @@ class ActivityPane(Vertical):
     #acraw { background: transparent; display: none; }
     """
 
+    # ALLOW_MAXIMIZE makes maximizing a focused child (DataTable/Log/Input)
+    # maximize the pane instead of just that child.
+    ALLOW_MAXIMIZE = True
+
     CONFIG_MODES: ClassVar = ["compact", "explain", "expand", "clean"]
 
     TABS: ClassVar = {
         "instance": ["Processes", "Logs", "Config"],
-        "database": ["Users", "Locks", "Jobs", "Crons", "Modules", "Stats"],
+        "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules"],
     }
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
 
@@ -118,9 +131,9 @@ class ActivityPane(Vertical):
             placeholder="search logs, enter to apply, empty clears",
             compact=True,
         )
-        yield Log(id="acbody", highlight=False)
+        yield Log(id="acbody", highlight=True)
         yield DataTable(id="actable", zebra_stripes=True, cursor_type="row")
-        with VerticalScroll(id="acraw"):
+        with _RawScroll(id="acraw"):
             yield Static(id="acraw-body")
 
     def on_mount(self) -> None:
@@ -497,6 +510,10 @@ class ActivityPane(Vertical):
             return
 
         odoo_procs, pg_procs = await asyncio.to_thread(instance_procs, inst)
+
+        if self._instance is not inst or not self.is_processes_active():
+            return  # instance or tab changed while this was fetching; the result is stale
+
         procs = [{**p, "kind": "odoo"} for p in odoo_procs] + [{**p, "kind": "pg"} for p in pg_procs]
         now = time.monotonic()
         prev, self._top_prev = self._top_prev, {}
@@ -567,6 +584,20 @@ class ActivityPane(Vertical):
 
     async def _fetch_db_tab(self, category: str, db: str, ident: tuple[str, str]) -> None:
         port = db_port_of(self._db[0]) if self._db else None
+
+        if category == "Queries":
+            # see `long_queries`
+            rows = await asyncio.to_thread(long_queries, db, port)
+            if ident != self._dbtab.ident:
+                return
+
+            if not rows:
+                self._log_body("(empty)")
+            else:
+                self._dbtab.rows = rows
+                self._show_datatable(rows)
+            return
+
         proc = await asyncio.to_thread(start_odoo_db, category.lower(), db, port)
         self._dbtab.proc = proc
 
