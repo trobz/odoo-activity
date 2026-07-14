@@ -16,10 +16,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from rich.syntax import Syntax
+from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import DataTable, Input, Log, Static
+from textual.widgets import DataTable, Input, RichLog, Static
 
 from odoo_activity.probes import (
     CLK_TCK,
@@ -131,7 +132,7 @@ class ActivityPane(Vertical):
             placeholder="search logs, enter to apply, empty clears",
             compact=True,
         )
-        yield Log(id="acbody", highlight=True)
+        yield RichLog(id="acbody", highlight=True, wrap=True)
         yield DataTable(id="actable", zebra_stripes=True, cursor_type="row")
         with _RawScroll(id="acraw"):
             yield Static(id="acraw-body")
@@ -143,6 +144,7 @@ class ActivityPane(Vertical):
         self._instance: dict | None = None
         self._db: tuple[dict, str] | None = None  # (instance, db name) in database mode
         self._log_path: Path | None = None
+        self._config_path: Path | None = None
         self._log_pos = 0
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
         self._log_query: str | None = None
@@ -154,6 +156,14 @@ class ActivityPane(Vertical):
         self._dbtab = _DbTab()
         self._showing_raw = False  # viewing one row's raw json in #acbody
         self._render_mode()
+
+    def on_resize(self, event: events.Resize) -> None:
+        # COMMAND's width is derived from table.size, which is still 0 the
+        # first time _render_processes runs (on_mount fires before layout
+        # has sized anything) — redraw once the real size lands instead of
+        # leaving it wrapped narrow until the next 1s poll tick.
+        if self.is_processes_active():
+            self._show_process_table(self._proc_rows)
 
     def _coalesce(self, key: str, ident: object, factory: Callable[[], Awaitable[None]]) -> None:
         """Run at most one task per `key` at a time, identified by `ident`.
@@ -357,7 +367,7 @@ class ActivityPane(Vertical):
         if self._log_query:
             self._render_log()
         else:
-            body = self.query_one("#acbody", Log)
+            body = self.query_one("#acbody", RichLog)
             # only follow the tail if the user was already at the bottom —
             # else a scroll-up to read older lines gets yanked back down
             # every time new data lands
@@ -374,8 +384,15 @@ class ActivityPane(Vertical):
 
     def _title(self) -> str:
         title = self.MODE_TITLE[self._mode]
+
         if self.is_config_active():
-            return f"{title} — Config ({self._config_mode})"
+            title += f" — Config ({self._config_mode})"
+            if self._config_path:
+                title += f" — {self._config_path}"
+
+        elif self.is_logs_active() and self._log_path:
+            title += f" — {self._log_path}"
+
         return title
 
     def _build_tabs(self, names: list[str]) -> None:
@@ -393,6 +410,7 @@ class ActivityPane(Vertical):
 
         active = tabs[self._tab]
         self._log_path = None
+        self._config_path = None
         self.query_one("#acsearch", Input).display = False
 
         if self._mode == "instance":
@@ -420,6 +438,7 @@ class ActivityPane(Vertical):
     def _follow_log(self, path: Path | None, text: str | None) -> None:
         self._log_path = path
         self._log_query = None
+        self.border_title = self._title()
 
         if path is None:
             self._log_pos = 0
@@ -436,7 +455,7 @@ class ActivityPane(Vertical):
             self._log_pos = 0
 
     def _render_log(self) -> None:
-        body = self.query_one("#acbody", Log)
+        body = self.query_one("#acbody", RichLog)
         was_at_bottom = self._at_bottom(body)
         body.clear()
 
@@ -455,7 +474,7 @@ class ActivityPane(Vertical):
             body.scroll_home(animate=False)
 
     @staticmethod
-    def _at_bottom(body: Log) -> bool:
+    def _at_bottom(body: RichLog) -> bool:
         return body.scroll_y >= body.max_scroll_y - 1
 
     def toggle_config_mode(self) -> None:
@@ -488,6 +507,7 @@ class ActivityPane(Vertical):
             self._show_config_text("(no config file found)")
             return
 
+        self._config_path = config
         version = await asyncio.to_thread(instance_version, inst)
         text = await asyncio.to_thread(render_config, config, version, self._config_mode)
         self._show_config_text(text)
@@ -497,6 +517,7 @@ class ActivityPane(Vertical):
         self._log_path = None
         self._log_query = None
         self._log_text = text
+        self.border_title = self._title()
         self._render_log()
 
     def _render_processes(self) -> None:
@@ -553,9 +574,28 @@ class ActivityPane(Vertical):
         scroll_x, scroll_y = table.scroll_x, table.scroll_y
 
         table.clear(columns=True)
-        table.add_columns("PID", "PPID", "USER", "TIME", "CPU%", "MEM%", "COMMAND")
+        headers = ("PID", "PPID", "USER", "TIME", "CPU%", "MEM%")
+        fields = ("pid", "ppid", "user", "time", "cpu", "mem")
+        table.add_columns(*headers)
+        # COMMAND takes whatever's left of the table's width (re-derived every
+        # tick, so it tracks terminal resizes) instead of a guessed constant
+        other_width = sum(
+            max(len(h), max((len(p[f]) for p in rows), default=0)) + 2 * table.cell_padding
+            for h, f in zip(headers, fields, strict=True)
+        )
+        table.add_column("COMMAND", width=max(20, (table.size.width or 80) - other_width))
         for i, p in enumerate(rows):
-            table.add_row(p["pid"], p["ppid"], p["user"], p["time"], p["cpu"], p["mem"], p["cmd"], key=str(i))
+            table.add_row(
+                p["pid"],
+                p["ppid"],
+                p["user"],
+                p["time"],
+                p["cpu"],
+                p["mem"],
+                Text(p["cmd"], no_wrap=False),
+                key=str(i),
+                height=None,
+            )
 
         if not rows:
             return
@@ -591,14 +631,14 @@ class ActivityPane(Vertical):
             if ident != self._dbtab.ident:
                 return
 
-            if not rows:
-                self._log_body("(empty)")
-            else:
-                self._dbtab.rows = rows
-                self._show_datatable(rows)
+            self._handle_rows(rows)
             return
 
         proc = await asyncio.to_thread(start_odoo_db, category.lower(), db, port)
+        if proc is None:
+            self._log_body("(odoo-db not found on PATH)")
+            return
+
         self._dbtab.proc = proc
 
         def _wait() -> tuple[str, str] | None:
@@ -620,6 +660,9 @@ class ActivityPane(Vertical):
             return
 
         rows, raw = parse_odoo_db_output(*result)
+        self._handle_rows(rows, raw)
+
+    def _handle_rows(self, rows: list[dict] | None, raw: str = "") -> None:
         if rows is None:
             self._log_body(raw or "(no output)")
         elif not rows:
@@ -630,7 +673,7 @@ class ActivityPane(Vertical):
 
     def _use(self, which: str) -> None:
         """Show the Log, the DataTable, or the raw-json view in the pane body."""
-        self.query_one("#acbody", Log).display = which == "log"
+        self.query_one("#acbody", RichLog).display = which == "log"
         self.query_one("#actable", DataTable).display = which == "table"
         self.query_one("#acraw", VerticalScroll).display = which == "raw"
 
@@ -647,6 +690,6 @@ class ActivityPane(Vertical):
 
     def _log_body(self, text: str) -> None:
         self._use("log")
-        body = self.query_one("#acbody", Log)
+        body = self.query_one("#acbody", RichLog)
         body.clear()
         body.write(text)

@@ -12,12 +12,18 @@ import json
 import os
 import platform
 import re
+import signal
 import socket
 import subprocess
 import time
 from pathlib import Path
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+# Some envs (like odoo.sh) export PATH with an unexpanded `~` (e.g., `~/.local/bin`).
+# While shells auto-expand this, os.execvp / subprocess.run treat it as a literal
+# string, making those binaries invisible. Expand it manually for this process tree.
+os.environ["PATH"] = os.pathsep.join(os.path.expanduser(p) for p in os.environ.get("PATH", "").split(os.pathsep))
 
 
 def read_uptime() -> float:
@@ -91,12 +97,12 @@ def _is_odoo(*text: str) -> bool:
 
 
 def list_instances() -> list[dict[str, str]]:
-    """All local Odoo instances, from systemd --user and supervisor.
+    """All local Odoo instances, from systemd --user, supervisor and odoo.sh.
 
     Each row carries its `manager` so actions route to the right controller;
-    the two managers can even expose the same name (e.g. odoo-demo).
+    managers can even expose the same name (e.g. odoo-demo).
     """
-    return systemd_instances() + supervisor_instances()
+    return systemd_instances() + supervisor_instances() + odoosh_instances()
 
 
 def systemd_instances() -> list[dict[str, str]]:
@@ -108,11 +114,14 @@ def systemd_instances() -> list[dict[str, str]]:
     """
     # --user only; add system-wide (`systemctl` without --user) when a
     # host needs it.
-    files = subprocess.run(
-        ["systemctl", "--user", "list-unit-files", "--type=service", "--no-legend", "--plain", "--no-pager"],
-        capture_output=True,
-        text=True,
-    ).stdout
+    try:
+        files = subprocess.run(
+            ["systemctl", "--user", "list-unit-files", "--type=service", "--no-legend", "--plain", "--no-pager"],
+            capture_output=True,
+            text=True,
+        ).stdout
+    except FileNotFoundError:
+        return []
 
     # drop template units (foo@.service) — `show` errors out on them
     units = [tok for tok in files.split() if tok.endswith(".service") and not tok.endswith("@.service")]
@@ -249,19 +258,119 @@ def _supervisor_confs() -> dict[str, dict[str, str]]:
     return confs
 
 
+# odoo.sh: no systemd/supervisor, one build per host — discovered from the
+# env vars its login shell sources (PGDATABASE et al.) rather than any
+# process-manager listing. odoo-activity runs *on* the odoo.sh host itself
+# (installed alongside odoo-config/odoo-db via requirements.txt), so this is
+# a plain local probe like the other two managers, not a remote one.
+def _odoosh_env() -> dict[str, str] | None:
+    """This host's odoo.sh build env, or None off odoo.sh."""
+    db = os.environ.get("PGDATABASE")
+    if not db:
+        return None
+    return {"db": db, "version": os.environ.get("ODOO_VERSION", "")}
+
+
+def _proc_uptime(pid: str) -> float | None:
+    """Seconds `pid` has been running, from /proc/<pid>/stat's starttime
+    (clock ticks since boot) against /proc/uptime — None if it's gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+
+    fields = data[data.rindex(")") + 2 :].split()
+    return read_uptime() - int(fields[19]) / CLK_TCK
+
+
+def odoosh_instances() -> list[dict[str, str]]:
+    """The single build this host is running, when this host is odoo.sh.
+
+    One SSH-accessible odoo.sh host is one build, not several — "the
+    instance" is just "this box", nothing to enumerate. `uptime` tracks the
+    live `odoo-bin` worker rather than the build itself: odoo.sh spawns and
+    reaps workers on demand, so "-" here means idle (no worker alive right
+    now), not stopped.
+    """
+    env = _odoosh_env()
+    if env is None:
+        return []
+
+    uptime = "(idle)"
+    if (pid := _odoosh_master_pid()) is not None and (secs := _proc_uptime(pid)) is not None:
+        uptime = format_duration(secs)
+
+    return [
+        {
+            "name": env["db"],
+            "status": "running",
+            "uptime": uptime,
+            "manager": "odoosh",
+            "db": env["db"],
+            "version": env["version"],
+        }
+    ]
+
+
+def _odoosh_master_pid() -> str | None:
+    """Returns the PID of the top-level `odoo-bin` process, or None.
+
+    PID 1 is the container init and reaps unrelated orphans, so we cannot
+    simply walk descendants from it. Instead, we identify the master
+    `odoo-bin` as the only "odoo-bin" process whose parent is not also
+    an "odoo-bin" process.
+    """
+    out = subprocess.run(["ps", "-eo", "pid,ppid,args"], capture_output=True, text=True).stdout
+    odoo_ppid: dict[str, str] = {}
+
+    for line in out.splitlines()[1:]:
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, cmd = parts
+        if "odoo-bin" in cmd:
+            odoo_ppid[pid] = ppid
+
+    return next((pid for pid, ppid in odoo_ppid.items() if ppid not in odoo_ppid), None)
+
+
 def instance_action(unit: str, action: str, manager: str = "systemd") -> str:
     """start/stop/restart an instance via its process manager.
 
-    Odoo instances run under systemd --user or supervisor; the caller passes
-    the `manager` recorded at discovery time so the right controller is used.
-    Returns "" on success, else the controller's error output (so the UI can
-    show why nothing happened instead of failing silently).
+    Odoo instances run under systemd --user, supervisor or odoo.sh; the
+    caller passes the `manager` recorded at discovery time so the right
+    controller is used. Returns "" on success, else the controller's error
+    output (so the UI can show why nothing happened instead of failing
+    silently).
     """
+    if manager == "odoosh":
+        # odoo.sh has no separate start/stop — sleep/wake is the platform's
+        # call, not ours; only a restart of the http workers is exposed.
+        if action != "restart":
+            return "start/stop not supported — odoo.sh handles sleep/wake on its own"
+
+        # odoosh-restart takes one service at a time, unlike `supervisorctl
+        # restart` which restarts everything for the instance in one call —
+        # so restart both services it's equivalent to.
+        for service in ("http", "cron"):
+            try:
+                out = subprocess.run(["odoosh-restart", service], capture_output=True, text=True)
+            except FileNotFoundError:
+                return "odoosh-restart not found on PATH"
+
+            if out.returncode != 0:
+                return out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
+        return ""
+
     # synchronous; --user odoo units activate fast. Move to a worker
     # if a unit's start/restart ever blocks the UI.
     cmd = ["supervisorctl", action, unit] if manager == "supervisor" else ["systemctl", "--user", action, unit]
 
-    out = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return f"{cmd[0]} not found on PATH"
 
     if out.returncode == 0:
         return ""
@@ -292,10 +401,13 @@ def _systemd_workdir(unit: str) -> Path:
 
 
 def instance_workdir(inst: dict) -> Path:
-    """The instance's working directory (supervisor `directory=` or the
-    systemd unit's WorkingDirectory)."""
+    """The instance's working directory (supervisor `directory=`, the
+    systemd unit's WorkingDirectory, or $HOME on odoo.sh)."""
     if inst["manager"] == "supervisor":
         return Path(inst.get("directory") or ".")
+
+    if inst["manager"] == "odoosh":
+        return Path.home()
 
     return _systemd_workdir(inst["name"])
 
@@ -313,7 +425,12 @@ def _config_names(instance_name: str) -> list[str]:
 
 
 def _config_file(inst: dict) -> Path | None:
-    """The first `<workdir>/config/` file matching `_config_names`, or None."""
+    """The first `<workdir>/config/` file matching `_config_names`, or the
+    fixed `~/.config/odoo/odoo.conf` odoo.sh always writes."""
+    if inst["manager"] == "odoosh":
+        path = instance_workdir(inst) / ".config" / "odoo" / "odoo.conf"
+        return path if path.is_file() else None
+
     workdir = instance_workdir(inst)
     for name in _config_names(inst["name"]):
         path = workdir / "config" / name
@@ -355,7 +472,13 @@ def _opt(parser: configparser.RawConfigParser | None, key: str) -> str | None:
 
 
 def logfile_of(inst: dict) -> Path | None:
-    """The instance's odoo logfile, from the `logfile` key of its config."""
+    """The instance's odoo logfile, from the `logfile` key of its config, or
+    odoo.sh's fixed `~/logs/odoo.log` (its config is sparse — no `logfile`
+    key at all)."""
+    if inst["manager"] == "odoosh":
+        path = instance_workdir(inst) / "logs" / "odoo.log"
+        return path if path.is_file() else None
+
     workdir, parser = instance_config(inst)
     logfile = _opt(parser, "logfile")
     if logfile is None:
@@ -379,7 +502,13 @@ def databases_of(inst: dict) -> tuple[list[str], str | None]:
     The odoo config gives both the role (db_user — locally `openerp`, in prod
     the instance's own role) and the db_port, so we query the right role on the
     right postgres cluster.
+
+    odoo.sh is a single env-provided db (`PGDATABASE`), not role-queried —
+    there's no `databases_by_role` dance since there's exactly one db.
     """
+    if inst["manager"] == "odoosh":
+        return [inst["db"]], None
+
     _, parser = instance_config(inst)
     port = db_port_of(inst)
     role = DB_ROLE or _opt(parser, "db_user") or inst["name"].removesuffix(".service")
@@ -450,6 +579,9 @@ def instance_pid(inst: dict) -> str | None:
     backends do, since they connect to a specific db), so a db-name-in-argv
     heuristic both misses the real process and can misfire on postgres.
     """
+    if inst["manager"] == "odoosh":
+        return _odoosh_master_pid()
+
     if inst["manager"] == "supervisor":
         out = subprocess.run(
             ["supervisorctl", "pid", inst["name"]],
@@ -585,14 +717,34 @@ def odoo_pid_for_port(port: str) -> str | None:
 
 
 def signal_process(pid: str, sig: int) -> None:
-    """Send `sig` to `pid`; a pid that's already gone is not an error."""
-    with contextlib.suppress(ProcessLookupError, ValueError):
+    """Send `sig` to `pid`; a pid that's already gone, or owned by another
+    user (e.g. a postgres backend), is not an error."""
+    with contextlib.suppress(ProcessLookupError, PermissionError, ValueError):
         os.kill(int(pid), sig)
+
+
+def dump_all_stacks(inst: dict) -> str:
+    """SIGQUIT every worker of `inst` (master + descendants, from
+    `procs_of`) instead of odoo.sh's own `odoosh-dumpstacks` — same effect
+    (each process dumps its traceback to the instance's log) but manager-
+    agnostic, since pids are already local for every manager."""
+    procs = procs_of(inst)
+    if not procs:
+        return "(no workers alive)"
+
+    for proc in procs:
+        signal_process(proc["pid"], signal.SIGQUIT)
+
+    return ""
 
 
 def instance_version(inst: dict) -> str | None:
     """The instance's Odoo version, via the `odoo-addons-path` CLI (layout/
-    addons-path detection lives there, not here)."""
+    addons-path detection lives there, not here) — or straight from
+    odoo.sh's own `$ODOO_VERSION` env var, captured at discovery time."""
+    if inst["manager"] == "odoosh":
+        return inst.get("version")
+
     try:
         out = subprocess.run(
             ["odoo-addons-path", str(instance_workdir(inst)), "--verbose", "--format", "json"],
@@ -651,7 +803,7 @@ def tail(path: Path, lines: int = 200) -> str:
         return f"(no log: {exc})"
 
 
-def start_odoo_db(command: str, db: str, port: str | None = None) -> subprocess.Popen[str]:
+def start_odoo_db(command: str, db: str, port: str | None = None) -> subprocess.Popen[str] | None:
     """Start `odoo-db --output-format json <command> <db>`, on `port` if the
     instance's cluster isn't the default one (odoo-db has no --port flag of
     its own, but honors PGPORT like any libpq client).
@@ -663,15 +815,21 @@ def start_odoo_db(command: str, db: str, port: str | None = None) -> subprocess.
     SIGTERM handling, so Postgres notices the dropped connection and cancels
     the backend query on its own schedule, not instantly
     (see odoo-db/db.py connect()).
+
+    None if `odoo-db` isn't on PATH (degrade like render_config does for
+    odoo-config, instead of crashing the app on a host that lacks it).
     """
     env = {**os.environ, "PGPORT": port} if port else None
-    return subprocess.Popen(
-        ["odoo-db", "--output-format", "json", command, db],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
+    try:
+        return subprocess.Popen(
+            ["odoo-db", "--output-format", "json", command, db],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+    except FileNotFoundError:
+        return None
 
 
 def parse_odoo_db_output(stdout: str, stderr: str) -> tuple[list[dict] | None, str]:
