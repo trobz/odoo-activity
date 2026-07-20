@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-07-20)
+
+### Documentation
+
+- **readme**: Document odoo.sh manager and new keybindings
+  ([`76e4c18`](https://github.com/trobz/odoo-activity/commit/76e4c1823a08703828dc4fb0e6bba15d27d9321e))
+
+### Features
+
+- **tui**: Add odoo.sh instance support
+  ([`8773ac2`](https://github.com/trobz/odoo-activity/commit/8773ac2bf7cc1dee17eadce69bd8e4818859c43d))
+
+
 ## v0.4.0 (2026-07-10)
 
 ### Features
