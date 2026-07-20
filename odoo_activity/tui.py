@@ -22,6 +22,7 @@ from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
     databases_of,
+    dump_all_stacks,
     format_duration,
     instance_action,
     list_instances,
@@ -167,6 +168,7 @@ class OdooActivity(App):
         ("slash", "search", "Search"),
         ("K", "kill_process", "Kill -9"),
         ("L", "quit_process", "Log dump -3"),
+        ("D", "dumpstacks", "Dump stacks"),
         ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
         ("f", "toggle_maximize", "Maximize"),
     ]
@@ -441,6 +443,9 @@ class OdooActivity(App):
         if action in ("kill_process", "quit_process"):
             return self.query_one(ActivityPane).is_processes_active()
 
+        if action == "dumpstacks":
+            return self.current_instance() is not None
+
         if action == "toggle_config_mode":
             return self.query_one(ActivityPane).is_config_active()
 
@@ -499,12 +504,14 @@ class OdooActivity(App):
             return
 
         name, manager = inst["name"], inst["manager"]
-        await asyncio.to_thread(instance_action, name, action, manager)
+        error = await asyncio.to_thread(instance_action, name, action, manager)
+        if error:
+            self.app.notify(error, severity="warning", timeout=3)
         self.poll_instances()  # re-label in place; keeps selection, no flicker
 
     def action_kill_process(self) -> None:
         proc = self.query_one(ActivityPane).selected_process()
-        if proc is None:
+        if proc is None or proc.get("kind") == "pg":
             return
 
         def on_confirm(confirmed: bool | None) -> None:
@@ -515,9 +522,12 @@ class OdooActivity(App):
 
     def action_quit_process(self) -> None:
         """Send SIGQUIT (kill -3) — the process dumps a traceback to its
-        logfile — then jump to Logs so the dump is visible right away."""
+        logfile — then jump to Logs so the dump is visible right away.
+
+        Odoo rows only: a postgres backend isn't ours to signal directly
+        (use the DB tools' own termination, not SIGQUIT/SIGKILL)."""
         proc = self.query_one(ActivityPane).selected_process()
-        if proc is None:
+        if proc is None or proc.get("kind") == "pg":
             return
 
         signal_process(proc["pid"], signal.SIGQUIT)
@@ -525,6 +535,23 @@ class OdooActivity(App):
 
     def action_toggle_config_mode(self) -> None:
         self.query_one(ActivityPane).toggle_config_mode()
+
+    def action_dumpstacks(self) -> None:
+        inst = self.current_instance()
+        if inst is None:
+            return
+        self._run_dumpstacks(inst)
+
+    @work(exclusive=True, group="dumpstacks")
+    async def _run_dumpstacks(self, inst: dict) -> None:
+        """Trigger a stack dump, then jump to Logs to see it — same pattern
+        as action_quit_process's local SIGQUIT.
+        """
+        out = await asyncio.to_thread(dump_all_stacks, inst)
+
+        if out:
+            self.app.notify(out, timeout=3)
+        self.query_one(ActivityPane).select_tab_by_name("Logs")
 
 
 def run() -> None:

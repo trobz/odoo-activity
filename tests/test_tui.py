@@ -115,6 +115,22 @@ def test_instance_action_routes_by_manager(monkeypatch):
     ]
 
 
+def test_instance_action_odoosh_restarts_both_services(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **_):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(probes.subprocess, "run", fake_run)
+    assert probes.instance_action("demo", "restart", manager="odoosh") == ""
+    assert calls == [
+        ["odoosh-restart", "http"],
+        ["odoosh-restart", "cron"],
+    ]
+    assert probes.instance_action("demo", "start", manager="odoosh") != ""
+
+
 def test_compute_status_promotes_ambiguous_stopped_but_not_explicit_failure(monkeypatch):
     # a live process promotes an ambiguous "stopped" report to running
     monkeypatch.setattr(tui, "procs_of", lambda _: [{"pid": "1"}])

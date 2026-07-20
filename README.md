@@ -16,23 +16,43 @@ uv tool install odoo-activity
 odoo-activity  # or: oa
 ```
 
-Assumes Odoo instances run under `systemd --user` and/or `supervisor`
-(both are discovered and merged), and that the `odoo-db` CLI is on `PATH`
-for the database category tabs. The Config tab additionally needs
-`odoo-config` and `odoo-addons-path` on `PATH`.
+Discovers Odoo instances under `systemd --user`, `supervisor`, and odoo.sh
+(all three are merged), and needs the `odoo-db` CLI on `PATH` for the
+database category tabs. The Config tab additionally needs `odoo-config`
+and `odoo-addons-path` on `PATH`. See [Managers](#managers) for what each
+one supports.
 
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` | move through instances and their nested dbs |
 | `s` / `r` | start/stop toggle / restart (confirm popup) |
 | `[` / `]` | switch tab in the detail pane |
+| `f` | maximize/minimize the focused pane |
 | `p` / `l` / `c` | Processes / Logs / Config |
 | `u` / `l` / `j` / `c` | Users / Locks / Jobs / Crons |
 | `K` | kill -9 the selected process (Processes tab, confirm popup) |
 | `L` | kill -3 the selected process, then jump to Logs (Processes tab) |
+| `D` | dump stacks of all workers, then jump to Logs (Processes tab) |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
 | `/` | search (Logs and Config tabs) |
 | `q` | quit |
+
+## Managers
+
+An instance's `manager` — `systemd`, `supervisor`, or `odoosh` — is
+discovered per instance, not configured, and decides which controller
+process/log/start-stop-restart lookups route through:
+
+- **`systemd`** — a `systemd --user` unit, controlled via `systemctl --user`.
+- **`supervisor`** — a `supervisorctl status` program, controlled via
+  `supervisorctl`.
+- **`odoosh`** — the odoo.sh build a host is running, when odoo-activity
+  itself runs directly on that host (installed via `requirements.txt` at
+  build time, same as `odoo-config`/`odoo-db`). One host is one build, so
+  there's nothing to enumerate — the whole box is "the instance". Start/stop
+  isn't supported (odoo.sh handles sleep/wake on its own); restart goes
+  through `odoosh-restart`, needed on `PATH` — which ships pre-installed on
+  odoo.sh hosts.
 
 ### Config tab modes
 
