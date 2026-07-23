@@ -911,9 +911,16 @@ def start_odoo_db(command: str, db: str, port: str | None = None) -> subprocess.
     odoo-config, instead of crashing the app on a host that lacks it).
     """
     env = {**os.environ, "PGPORT": port} if port else None
+
+    cmd = ["odoo-db", "--output-format", "json", command]
+    if command == "crons":
+        # show scheduled actions' code
+        cmd += ["--include-code"]
+    cmd += [db]
+
     try:
         return subprocess.Popen(
-            ["odoo-db", "--output-format", "json", command, db],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

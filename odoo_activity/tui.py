@@ -20,7 +20,6 @@ from textual.theme import Theme
 from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 
 from odoo_activity.panes.detail import ActivityPane
-from odoo_activity.panes.stacks import StacksPane
 from odoo_activity.probes import (
     databases_of,
     dump_and_parse_stacks,
@@ -201,7 +200,6 @@ class OdooActivity(App):
 
             yield ListView(id="instances")
             yield ActivityPane(id="activity")
-            yield StacksPane(id="stacks")
 
         yield Footer()
 
@@ -525,7 +523,8 @@ class OdooActivity(App):
 
     def action_quit_process(self) -> None:
         """Send SIGQUIT (kill -3) — the process dumps a traceback to its
-        logfile — then jump to Logs so the dump is visible right away.
+        logfile — then jump to Stacks (the last dump's parsed view; raw text
+        is still one tab over, on Logs).
 
         Odoo rows only: a postgres backend isn't ours to signal directly
         (use the DB tools' own termination, not SIGQUIT/SIGKILL)."""
@@ -534,7 +533,7 @@ class OdooActivity(App):
             return
 
         signal_process(proc["pid"], signal.SIGQUIT)
-        self.query_one(ActivityPane).select_tab_by_name("Logs")
+        self.query_one(ActivityPane).select_tab_by_name("Stacks")
 
     def action_toggle_config_mode(self) -> None:
         self.query_one(ActivityPane).toggle_config_mode()
@@ -547,17 +546,17 @@ class OdooActivity(App):
 
     @work(exclusive=True, group="dumpstacks")
     async def _run_dumpstacks(self, inst: dict) -> None:
-        """Trigger a stack dump, parse it into the Stacks panel (the point:
+        """Trigger a stack dump, parse it into the Stacks tab (the point:
         surfacing what's actually long-running without the user having to
-        guess which worker first), then jump to Logs so the raw dump is
-        still there too."""
+        guess which worker first), then jump there."""
         error, workers = await asyncio.to_thread(dump_and_parse_stacks, inst)
+        activity = self.query_one(ActivityPane)
 
         if error:
             self.app.notify(error, timeout=3)
-        elif not self.query_one(StacksPane).show(workers, instance_workdir(inst)):
+        elif not activity.render_stacks(workers, instance_workdir(inst)):
             self.app.notify("dump ok — nothing long-running", timeout=3)
-        self.query_one(ActivityPane).select_tab_by_name("Logs")
+        activity.select_tab_by_name("Stacks")
 
 
 def run() -> None:

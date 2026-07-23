@@ -20,10 +20,12 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import DataTable, Input, RichLog, Static
+from textual.widgets import DataTable, Input, RichLog, Static, Tree
 
+from odoo_activity.panes.stacks import render_stacks
 from odoo_activity.probes import (
     CLK_TCK,
+    Worker,
     configfile_of,
     db_port_of,
     instance_procs,
@@ -106,6 +108,7 @@ class ActivityPane(Vertical):
     #actable { background: transparent; display: none; }
     #acsearch { margin-bottom: 1; }
     #acraw { background: transparent; display: none; }
+    #acstacks { background: transparent; display: none; }
     """
 
     # ALLOW_MAXIMIZE makes maximizing a focused child (DataTable/Log/Input)
@@ -115,7 +118,7 @@ class ActivityPane(Vertical):
     CONFIG_MODES: ClassVar = ["compact", "explain", "expand", "clean"]
 
     TABS: ClassVar = {
-        "instance": ["Processes", "Logs", "Config"],
+        "instance": ["Processes", "Stacks", "Logs", "Config"],
         "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules"],
     }
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
@@ -136,6 +139,7 @@ class ActivityPane(Vertical):
         yield DataTable(id="actable", zebra_stripes=True, cursor_type="row")
         with _RawScroll(id="acraw"):
             yield Static(id="acraw-body")
+        yield Tree("stacks", id="acstacks")
 
     def on_mount(self) -> None:
         self._mode = "instance"
@@ -155,6 +159,7 @@ class ActivityPane(Vertical):
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
         self._dbtab = _DbTab()
         self._showing_raw = False  # viewing one row's raw json in #acbody
+        self.query_one("#acstacks", Tree).show_root = False
         self._render_mode()
 
     def on_resize(self, event: events.Resize) -> None:
@@ -164,6 +169,8 @@ class ActivityPane(Vertical):
         # leaving it wrapped narrow until the next 1s poll tick.
         if self.is_processes_active():
             self._show_process_table(self._proc_rows)
+        elif self._dbtab.rows and not self._showing_raw:
+            self._populate_datatable(self._dbtab.rows)
 
     def _coalesce(self, key: str, ident: object, factory: Callable[[], Awaitable[None]]) -> None:
         """Run at most one task per `key` at a time, identified by `ident`.
@@ -207,6 +214,9 @@ class ActivityPane(Vertical):
 
     def is_processes_active(self) -> bool:
         return self._mode == "instance" and self.TABS["instance"][self._tab] == "Processes"
+
+    def is_stacks_active(self) -> bool:
+        return self._mode == "instance" and self.TABS["instance"][self._tab] == "Stacks"
 
     def has_search(self) -> bool:
         """Logs and Config both render plain text into #acbody with the same
@@ -326,6 +336,11 @@ class ActivityPane(Vertical):
         """True if `name` is one of the current mode's tabs."""
         return name in self.TABS[self._mode]
 
+    def render_stacks(self, workers: list[Worker], workdir: Path) -> bool:
+        """Populate the Stacks tab's tree from a fresh dump (see
+        probes.dump_and_parse_stacks). Returns True if anything was busy."""
+        return render_stacks(self.query_one("#acstacks", Tree), workers, workdir)
+
     def prev_tab(self) -> None:
         self.select_tab(self._tab - 1)
 
@@ -420,6 +435,8 @@ class ActivityPane(Vertical):
             elif active == "Config":
                 self._use("log")
                 self._render_config()
+            elif active == "Stacks":
+                self._use("stacks")
             else:  # Processes
                 self._use("table")
                 self._top_prev = {}
@@ -671,22 +688,52 @@ class ActivityPane(Vertical):
             self._dbtab.rows = rows
             self._show_datatable(rows)
 
+    _BODY_WIDGETS: ClassVar = {
+        "log": ("#acbody", RichLog),
+        "table": ("#actable", DataTable),
+        "raw": ("#acraw", VerticalScroll),
+        "stacks": ("#acstacks", Tree),
+    }
+
     def _use(self, which: str) -> None:
-        """Show the Log, the DataTable, or the raw-json view in the pane body."""
-        self.query_one("#acbody", RichLog).display = which == "log"
-        self.query_one("#actable", DataTable).display = which == "table"
-        self.query_one("#acraw", VerticalScroll).display = which == "raw"
+        """Show the Log, the DataTable, the raw-json view, or the Stacks tree
+        in the pane body."""
+        for name, (selector, widget_type) in self._BODY_WIDGETS.items():
+            self.query_one(selector, widget_type).display = name == which
 
     def _show_datatable(self, rows: list[dict]) -> None:
+        # Unlike Processes (re-rendered every 0.5s poll, so a wrong width
+        # self-corrects within a tick), db tabs render once — reveal the
+        # table first so layout can size it, then measure it, instead of
+        # sizing the wrap column off its pre-layout (e.g. leftover/zero)
+        # width and being stuck that way until an actual terminal resize.
+        self.query_one("#actable", DataTable).clear(columns=True)  # drop stale rows before the reveal
+        self._use("table")
+        self.call_after_refresh(self._populate_datatable, rows)
+
+    def _populate_datatable(self, rows: list[dict]) -> None:
         table = self.query_one("#actable", DataTable)
         table.clear(columns=True)
         columns = table_columns(rows)
-        table.add_columns(*(c.upper() for c in columns))
+
+        # "code" (crons' --include-code) is a blob, not a cell — wrap it into
+        # the table's remaining width instead of stringify's 80-char clip,
+        # same as the Processes tab's COMMAND column.
+        wrap_col = "code" if "code" in columns else None
+        fixed = [c for c in columns if c != wrap_col]
+        table.add_columns(*(c.upper() for c in fixed))
+        if wrap_col:
+            other_width = sum(
+                max(len(c), max((len(stringify(row.get(c, ""))) for row in rows), default=0)) + 2 * table.cell_padding
+                for c in fixed
+            )
+            table.add_column(wrap_col.upper(), width=max(20, (table.size.width or 80) - other_width))
 
         for i, row in enumerate(rows):
-            table.add_row(*(stringify(row.get(c, "")) for c in columns), key=str(i))
-
-        self._use("table")
+            cells: list[str | Text] = [stringify(row.get(c, "")) for c in fixed]
+            if wrap_col:
+                cells.append(Text(str(row.get(wrap_col, "")), no_wrap=False))
+            table.add_row(*cells, key=str(i), height=None)
 
     def _log_body(self, text: str) -> None:
         self._use("log")
