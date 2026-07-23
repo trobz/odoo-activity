@@ -20,11 +20,13 @@ from textual.theme import Theme
 from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 
 from odoo_activity.panes.detail import ActivityPane
+from odoo_activity.panes.stacks import StacksPane
 from odoo_activity.probes import (
     databases_of,
-    dump_all_stacks,
+    dump_and_parse_stacks,
     format_duration,
     instance_action,
+    instance_workdir,
     list_instances,
     procs_of,
     read_cpu_times,
@@ -199,6 +201,7 @@ class OdooActivity(App):
 
             yield ListView(id="instances")
             yield ActivityPane(id="activity")
+            yield StacksPane(id="stacks")
 
         yield Footer()
 
@@ -544,13 +547,16 @@ class OdooActivity(App):
 
     @work(exclusive=True, group="dumpstacks")
     async def _run_dumpstacks(self, inst: dict) -> None:
-        """Trigger a stack dump, then jump to Logs to see it — same pattern
-        as action_quit_process's local SIGQUIT.
-        """
-        out = await asyncio.to_thread(dump_all_stacks, inst)
+        """Trigger a stack dump, parse it into the Stacks panel (the point:
+        surfacing what's actually long-running without the user having to
+        guess which worker first), then jump to Logs so the raw dump is
+        still there too."""
+        error, workers = await asyncio.to_thread(dump_and_parse_stacks, inst)
 
-        if out:
-            self.app.notify(out, timeout=3)
+        if error:
+            self.app.notify(error, timeout=3)
+        elif not self.query_one(StacksPane).show(workers, instance_workdir(inst)):
+            self.app.notify("dump ok — nothing long-running", timeout=3)
         self.query_one(ActivityPane).select_tab_by_name("Logs")
 
 
