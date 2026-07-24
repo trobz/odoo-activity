@@ -22,9 +22,10 @@ from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
     databases_of,
-    dump_all_stacks,
+    dump_and_parse_stacks,
     format_duration,
     instance_action,
+    instance_workdir,
     list_instances,
     procs_of,
     read_cpu_times,
@@ -82,10 +83,13 @@ def _db_label(db: str, port: str | None, name_width: int, uptime_width: int, ind
     return f"{db}{' ' * pad}[dim]{port}[/]"
 
 
-def _bar(pct: float, width: int = 24) -> str:
-    """htop-style bar: green/yellow/red fill by load, dim track."""
+def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50) -> str:
+    """htop-style bar: green/yellow/red fill by load, dim track.
+
+    Swap uses tighter thresholds than CPU/MEM — any swapping at all is a
+    worse sign than the same percentage of CPU/RAM in use."""
     filled = min(width, round(pct / 100 * width))
-    color = "red" if pct >= 80 else "yellow" if pct >= 50 else "green"
+    color = "red" if pct >= red_at else "yellow" if pct >= yellow_at else "green"
     return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
 
 
@@ -251,7 +255,9 @@ class OdooActivity(App):
         self.query_one("#mem-pct", Static).update(f"{mem_pct:4.1f}%")
         self.query_one("#mem-bar", Static).update(_bar(mem_pct, self._get_bar_width("mem-panel")))
         self.query_one("#swap-pct", Static).update(f"{swap_pct:4.1f}%")
-        self.query_one("#swap-bar", Static).update(_bar(swap_pct, self._get_bar_width("swap-panel")))
+        self.query_one("#swap-bar", Static).update(
+            _bar(swap_pct, self._get_bar_width("swap-panel"), red_at=10, yellow_at=1)
+        )
 
         load1, load5, load15 = read_loadavg()
         self.query_one("#uptime-text", Static).update(
@@ -522,7 +528,8 @@ class OdooActivity(App):
 
     def action_quit_process(self) -> None:
         """Send SIGQUIT (kill -3) — the process dumps a traceback to its
-        logfile — then jump to Logs so the dump is visible right away.
+        logfile — then jump to Stacks (the last dump's parsed view; raw text
+        is still one tab over, on Logs).
 
         Odoo rows only: a postgres backend isn't ours to signal directly
         (use the DB tools' own termination, not SIGQUIT/SIGKILL)."""
@@ -531,7 +538,7 @@ class OdooActivity(App):
             return
 
         signal_process(proc["pid"], signal.SIGQUIT)
-        self.query_one(ActivityPane).select_tab_by_name("Logs")
+        self.query_one(ActivityPane).select_tab_by_name("Stacks")
 
     def action_toggle_config_mode(self) -> None:
         self.query_one(ActivityPane).toggle_config_mode()
@@ -540,18 +547,22 @@ class OdooActivity(App):
         inst = self.current_instance()
         if inst is None:
             return
+        self.app.notify(f"Dumping stacks for {inst['name']}…", timeout=2)
         self._run_dumpstacks(inst)
 
     @work(exclusive=True, group="dumpstacks")
     async def _run_dumpstacks(self, inst: dict) -> None:
-        """Trigger a stack dump, then jump to Logs to see it — same pattern
-        as action_quit_process's local SIGQUIT.
-        """
-        out = await asyncio.to_thread(dump_all_stacks, inst)
+        """Trigger a stack dump, parse it into the Stacks tab (the point:
+        surfacing what's actually long-running without the user having to
+        guess which worker first), then jump there."""
+        error, workers = await asyncio.to_thread(dump_and_parse_stacks, inst)
+        activity = self.query_one(ActivityPane)
 
-        if out:
-            self.app.notify(out, timeout=3)
-        self.query_one(ActivityPane).select_tab_by_name("Logs")
+        if error:
+            self.app.notify(error, timeout=3)
+        elif not activity.render_stacks(inst, workers, instance_workdir(inst)):
+            self.app.notify("dump ok — nothing long-running", timeout=3)
+        activity.select_tab_by_name("Stacks")
 
 
 def run() -> None:

@@ -17,6 +17,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from typing import TypedDict
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 
@@ -723,19 +724,114 @@ def signal_process(pid: str, sig: int) -> None:
         os.kill(int(pid), sig)
 
 
-def dump_all_stacks(inst: dict) -> str:
-    """SIGQUIT every worker of `inst` (master + descendants, from
-    `procs_of`) instead of odoo.sh's own `odoosh-dumpstacks` — same effect
-    (each process dumps its traceback to the instance's log) but manager-
-    agnostic, since pids are already local for every manager."""
+# Matches Odoo's standard log header for SIGQUIT dumps to extract worker PIDs:
+# "<date> <time> <pid> <level> <db> odoo.tools.misc: "
+_DUMP_HEADER_RE = re.compile(r"^\S+ \S+ (?P<pid>\d+) \S+ \S+ odoo\.tools\.misc:[ \t]*$", re.MULTILINE)
+_THREAD_RE = re.compile(r"^# Thread: (?P<name>.*)$", re.MULTILINE)
+_FRAME_RE = re.compile(r'^File: "(?P<file>[^"]*)", line (?P<line>\d+), in (?P<func>\S+)$', re.MULTILINE)
+
+# Innermost frame functions that indicate an idle thread (event loops, waits,
+# and faulthandler frames).
+_IDLE_FRAME_FUNCS = {"select", "poll", "sleep", "wait", "dumpstacks", "extract_stack"}
+
+# Vendor-specific path override for Sentry's background thread, which is
+# always present but constantly idle.
+_IDLE_FRAME_PATH_MARKERS = ("/sentry_sdk/",)
+
+
+class Worker(TypedDict):
+    pid: str
+    threads: list[Thread]
+
+
+class Thread(TypedDict):
+    name: str
+    frames: list[Frame]
+    idle: bool
+
+
+class Frame(TypedDict):
+    file: str
+    line: int
+    func: str
+
+
+def parse_stack_dump(text: str) -> list[Worker]:
+    """A slice of log text containing one or more SIGQUIT dumps into
+    `[{"pid": ..., "threads": [{"name", "frames", "idle"}, ...]}, ...]`.
+
+    `frames` is outermost-first (as printed); a thread is `idle` iff its
+    *innermost* (last) frame's function is in `_IDLE_FRAME_FUNCS`.
+    """
+    markers = list(_DUMP_HEADER_RE.finditer(text))
+    workers: list[Worker] = []
+
+    for i, dm in enumerate(markers):
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+        workers.append({"pid": dm["pid"], "threads": _parse_threads(text[dm.end() : end])})
+
+    return workers
+
+
+def _parse_threads(block_text: str) -> list[Thread]:
+    headers = list(_THREAD_RE.finditer(block_text))
+    threads: list[Thread] = []
+
+    for i, m in enumerate(headers):
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(block_text)
+        frames: list[Frame] = [
+            {"file": fm["file"], "line": int(fm["line"]), "func": fm["func"]}
+            for fm in _FRAME_RE.finditer(block_text[m.end() : end])
+        ]
+        idle = bool(frames) and (
+            frames[-1]["func"] in _IDLE_FRAME_FUNCS
+            or any(marker in frames[-1]["file"] for marker in _IDLE_FRAME_PATH_MARKERS)
+        )
+        threads.append({"name": m["name"].strip(), "frames": frames, "idle": idle})
+
+    return threads
+
+
+def dump_and_parse_stacks(inst: dict) -> tuple[str, list[Worker]]:
+    """SIGQUIT all instance processes, read new log output, and parse stack dumps.
+
+    Sends SIGQUIT to master and descendant workers, reading the log file from the
+    pre-signal offset. Polls up to ~2s for all expected PID headers to appear.
+
+    Returns (error, workers); error is non-empty (workers `[]`) only when there's
+    truly nothing to show (no workers, no logfile, or nothing arrived at
+    all)."""
+    path = logfile_of(inst)
+    if path is None or not path.is_file():
+        return "(no logfile configured)", []
+
     procs = procs_of(inst)
     if not procs:
-        return "(no workers alive)"
+        return "(no workers alive)", []
 
+    before = path.stat().st_size
     for proc in procs:
         signal_process(proc["pid"], signal.SIGQUIT)
 
-    return ""
+    expected = {proc["pid"] for proc in procs}
+    text = ""
+
+    for _ in range(20):  # ~2s budget
+        # seek to the pre-signal offset instead of rereading the whole file
+        # each poll — on a multi-GB log that reread alone made the dump take
+        # ages regardless of how small the actual new output was.
+        with path.open("rb") as f:
+            f.seek(before)
+            text = f.read().decode(errors="replace")
+        seen = {m["pid"] for m in _DUMP_HEADER_RE.finditer(text)}
+        if expected <= seen:
+            break
+        time.sleep(0.1)
+
+    if not text.strip():
+        return "(dump did not appear in the log)", []
+
+    return "", parse_stack_dump(text)
 
 
 def instance_version(inst: dict) -> str | None:
@@ -820,9 +916,16 @@ def start_odoo_db(command: str, db: str, port: str | None = None) -> subprocess.
     odoo-config, instead of crashing the app on a host that lacks it).
     """
     env = {**os.environ, "PGPORT": port} if port else None
+
+    cmd = ["odoo-db", "--output-format", "json", command]
+    if command == "crons":
+        # show scheduled actions' code
+        cmd += ["--include-code"]
+    cmd += [db]
+
     try:
         return subprocess.Popen(
-            ["odoo-db", "--output-format", "json", command, db],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
