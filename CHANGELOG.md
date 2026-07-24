@@ -2,6 +2,23 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-07-24)
+
+### Features
+
+- **stacks**: Cache stack dumps per instance when switching
+  ([`712d56c`](https://github.com/trobz/odoo-activity/commit/712d56c4fa374798cf8b258779f7e6391246b168))
+
+- **tui**: Add Stacks pane for parsed dumpstacks output
+  ([`0fb1365`](https://github.com/trobz/odoo-activity/commit/0fb1365ff8cb5ff34a4e8c6d166844439eeda63f))
+
+- **tui**: Show crons' code, wrapped instead of clipped
+  ([`36c142d`](https://github.com/trobz/odoo-activity/commit/36c142d73d73e429b786c73478f112ba391f9c01))
+
+- **tui**: Use tighter color thresholds for the swap bar
+  ([`34aec01`](https://github.com/trobz/odoo-activity/commit/34aec019ee08167f3a33161609ccc40e7fc22c04))
+
+
 ## v0.5.0 (2026-07-20)
 
 ### Documentation
