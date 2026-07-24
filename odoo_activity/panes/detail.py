@@ -159,6 +159,7 @@ class ActivityPane(Vertical):
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
         self._dbtab = _DbTab()
         self._showing_raw = False  # viewing one row's raw json in #acbody
+        self._stacks_cache: dict[str, tuple[list[Worker], Path]] = {}  # instance key -> its last dump
         self.query_one("#acstacks", Tree).show_root = False
         self._render_mode()
 
@@ -315,13 +316,25 @@ class ActivityPane(Vertical):
         self._dbtab.abandon()  # leaving database mode; don't leave a fetch running unseen
         self._mode = "instance"
         self._instance = inst
+        self._restore_stacks(inst)
         self._render_mode()
 
     def show_database(self, inst: dict, db: str) -> None:
         """Switch to database mode for `db`."""
         self._mode = "database"
         self._db = (inst, db)
+        self._restore_stacks(inst)
         self._render_mode()
+
+    def _restore_stacks(self, inst: dict | None) -> None:
+        """Show `inst`'s cached dump (if any), else an empty tree — a stale
+        dump from whatever was highlighted before must not linger."""
+        tree = self.query_one("#acstacks", Tree)
+        cached = self._stacks_cache.get(_inst_key(inst) or "")
+        tree.clear()
+        if cached is not None:
+            workers, workdir = cached
+            render_stacks(tree, workers, workdir)
 
     def select_tab(self, index: int) -> None:
         self._tab = index
@@ -336,10 +349,15 @@ class ActivityPane(Vertical):
         """True if `name` is one of the current mode's tabs."""
         return name in self.TABS[self._mode]
 
-    def render_stacks(self, workers: list[Worker], workdir: Path) -> bool:
-        """Populate the Stacks tab's tree from a fresh dump (see
-        probes.dump_and_parse_stacks). Returns True if anything was busy."""
-        return render_stacks(self.query_one("#acstacks", Tree), workers, workdir)
+    def render_stacks(self, inst: dict, workers: list[Worker], workdir: Path) -> bool:
+        """Cache `inst`'s dump (see probes.dump_and_parse_stacks) and, if
+        `inst` is still the highlighted instance — the dump takes a couple
+        seconds, and the user may have moved on by the time it lands — render
+        it into the Stacks tab now. Returns True if anything was busy."""
+        self._stacks_cache[_inst_key(inst) or ""] = (workers, workdir)
+        if _inst_key(inst) == _inst_key(self._instance):
+            return render_stacks(self.query_one("#acstacks", Tree), workers, workdir)
+        return any(not t["idle"] for w in workers for t in w["threads"])
 
     def prev_tab(self) -> None:
         self.select_tab(self._tab - 1)

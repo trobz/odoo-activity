@@ -817,7 +817,12 @@ def dump_and_parse_stacks(inst: dict) -> tuple[str, list[Worker]]:
     text = ""
 
     for _ in range(20):  # ~2s budget
-        text = path.read_text(errors="replace")[before:]
+        # seek to the pre-signal offset instead of rereading the whole file
+        # each poll — on a multi-GB log that reread alone made the dump take
+        # ages regardless of how small the actual new output was.
+        with path.open("rb") as f:
+            f.seek(before)
+            text = f.read().decode(errors="replace")
         seen = {m["pid"] for m in _DUMP_HEADER_RE.finditer(text)}
         if expected <= seen:
             break

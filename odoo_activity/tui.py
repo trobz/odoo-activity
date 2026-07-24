@@ -547,6 +547,7 @@ class OdooActivity(App):
         inst = self.current_instance()
         if inst is None:
             return
+        self.app.notify(f"Dumping stacks for {inst['name']}…", timeout=2)
         self._run_dumpstacks(inst)
 
     @work(exclusive=True, group="dumpstacks")
@@ -559,7 +560,7 @@ class OdooActivity(App):
 
         if error:
             self.app.notify(error, timeout=3)
-        elif not activity.render_stacks(workers, instance_workdir(inst)):
+        elif not activity.render_stacks(inst, workers, instance_workdir(inst)):
             self.app.notify("dump ok — nothing long-running", timeout=3)
         activity.select_tab_by_name("Stacks")
 
