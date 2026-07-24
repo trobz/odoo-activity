@@ -83,10 +83,13 @@ def _db_label(db: str, port: str | None, name_width: int, uptime_width: int, ind
     return f"{db}{' ' * pad}[dim]{port}[/]"
 
 
-def _bar(pct: float, width: int = 24) -> str:
-    """htop-style bar: green/yellow/red fill by load, dim track."""
+def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50) -> str:
+    """htop-style bar: green/yellow/red fill by load, dim track.
+
+    Swap uses tighter thresholds than CPU/MEM — any swapping at all is a
+    worse sign than the same percentage of CPU/RAM in use."""
     filled = min(width, round(pct / 100 * width))
-    color = "red" if pct >= 80 else "yellow" if pct >= 50 else "green"
+    color = "red" if pct >= red_at else "yellow" if pct >= yellow_at else "green"
     return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
 
 
@@ -252,7 +255,9 @@ class OdooActivity(App):
         self.query_one("#mem-pct", Static).update(f"{mem_pct:4.1f}%")
         self.query_one("#mem-bar", Static).update(_bar(mem_pct, self._get_bar_width("mem-panel")))
         self.query_one("#swap-pct", Static).update(f"{swap_pct:4.1f}%")
-        self.query_one("#swap-bar", Static).update(_bar(swap_pct, self._get_bar_width("swap-panel")))
+        self.query_one("#swap-bar", Static).update(
+            _bar(swap_pct, self._get_bar_width("swap-panel"), red_at=10, yellow_at=1)
+        )
 
         load1, load5, load15 = read_loadavg()
         self.query_one("#uptime-text", Static).update(
