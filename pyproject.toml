@@ -11,6 +11,7 @@ license-files = ["LICENSE"]
 dependencies = [
     "typer>=0.20",
     "textual>=8",
+    "typing-extensions>=4.16",
 ]
 
 [project.urls]

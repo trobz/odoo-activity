@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from odoo_activity import probes, tui
+from odoo_activity.probes import Instance
 
 
 def test_bar_colors_by_htop_thresholds():
@@ -131,18 +132,22 @@ def test_instance_action_odoosh_restarts_both_services(monkeypatch):
     assert probes.instance_action("demo", "start", manager="odoosh") != ""
 
 
+def _inst(status: str) -> Instance:
+    return {"name": "x", "status": status, "uptime": "-", "manager": "systemd"}
+
+
 def test_compute_status_promotes_ambiguous_stopped_but_not_explicit_failure(monkeypatch):
     # a live process promotes an ambiguous "stopped" report to running
     monkeypatch.setattr(tui, "procs_of", lambda _: [{"pid": "1"}])
-    assert tui._compute_status({"status": "stopped"}) == "running"
+    assert tui._compute_status(_inst("stopped")) == "running"
 
     # regression: an explicit failure is authoritative even with a live
     # process matching the same db — procs_of() matches by db name, not
     # manager, so that process may belong to the *other* manager's instance
-    assert tui._compute_status({"status": "failed"}) == "failed"
+    assert tui._compute_status(_inst("failed")) == "failed"
 
     monkeypatch.setattr(tui, "procs_of", lambda _: [])
-    assert tui._compute_status({"status": "stopped"}) == "stopped"
+    assert tui._compute_status(_inst("stopped")) == "stopped"
 
 
 def test_rebuild_instances_sorts_by_status_and_nests_dbs(monkeypatch):
