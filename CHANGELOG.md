@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.7.0 (2026-07-27)
+
+### Features
+
+- **mcp**: Add oa-mcp POC with read-only instance/process tools
+  ([`5621100`](https://github.com/trobz/odoo-activity/commit/56211008cba4e70960ddd36f9f14ba7c197bc0bb))
+
+### Refactoring
+
+- **probes**: Extract status logic to probes module
+  ([`faaacbe`](https://github.com/trobz/odoo-activity/commit/faaacbe86ab337040f7e9464545d8650dc124117))
+
+- **probes**: Type Instance and ProcRow throughout the TUI
+  ([`b142d02`](https://github.com/trobz/odoo-activity/commit/b142d02f7a5853553286dfa177e2f9d0ef9f298d))
+
+
 ## v0.6.0 (2026-07-24)
 
 ### Features
