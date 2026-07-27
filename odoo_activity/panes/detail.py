@@ -25,6 +25,8 @@ from textual.widgets import DataTable, Input, RichLog, Static, Tree
 from odoo_activity.panes.stacks import render_stacks
 from odoo_activity.probes import (
     CLK_TCK,
+    Instance,
+    ProcRow,
     Worker,
     configfile_of,
     db_port_of,
@@ -47,7 +49,16 @@ if TYPE_CHECKING:
     from odoo_activity.tui import OdooActivity
 
 
-def _inst_key(inst: dict | None) -> str | None:
+class ProcDisplayRow(ProcRow):
+    """A `ProcRow` as shown in the Processes tab: odoo vs. postgres, plus
+    the CPU-time/percent computed each refresh from consecutive `ps` polls."""
+
+    kind: str
+    time: str
+    cpu: str
+
+
+def _inst_key(inst: Instance | None) -> str | None:
     return f"{inst['manager']}:{inst['name']}" if inst else None
 
 
@@ -145,15 +156,15 @@ class ActivityPane(Vertical):
         self._mode = "instance"
         self._tabs_mode: str | None = None  # tab set currently built in #actabs
         self._tab = 0
-        self._instance: dict | None = None
-        self._db: tuple[dict, str] | None = None  # (instance, db name) in database mode
+        self._instance: Instance | None = None
+        self._db: tuple[Instance, str] | None = None  # (instance, db name) in database mode
         self._log_path: Path | None = None
         self._config_path: Path | None = None
         self._log_pos = 0
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
         self._log_query: str | None = None
         self._top_prev: dict[str, tuple[int, float]] = {}  # pid -> (ticks, monotonic)
-        self._proc_rows: list[dict] = []  # rows behind #actable in the Processes tab
+        self._proc_rows: list[ProcDisplayRow] = []  # rows behind #actable in the Processes tab
         self._config_mode = self.CONFIG_MODES[0]  # which odoo-config view the Config tab shows
         self._inflight: dict[str, object] = {}  # key -> ident of the run in progress
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
@@ -224,7 +235,7 @@ class ActivityPane(Vertical):
         substring filter (see _render_log)."""
         return self.is_logs_active() or self.is_config_active()
 
-    def selected_process(self) -> dict | None:
+    def selected_process(self) -> ProcDisplayRow | None:
         """The process under the Processes tab's table cursor, if any."""
         if not self.is_processes_active() or not self._proc_rows:
             return None
@@ -311,7 +322,7 @@ class ActivityPane(Vertical):
         self.app.query_one("#instances").focus()
         self._render_log()
 
-    def show_instance(self, inst: dict | None) -> None:
+    def show_instance(self, inst: Instance | None) -> None:
         """Switch to instance mode for `inst`."""
         self._dbtab.abandon()  # leaving database mode; don't leave a fetch running unseen
         self._mode = "instance"
@@ -319,14 +330,14 @@ class ActivityPane(Vertical):
         self._restore_stacks(inst)
         self._render_mode()
 
-    def show_database(self, inst: dict, db: str) -> None:
+    def show_database(self, inst: Instance, db: str) -> None:
         """Switch to database mode for `db`."""
         self._mode = "database"
         self._db = (inst, db)
         self._restore_stacks(inst)
         self._render_mode()
 
-    def _restore_stacks(self, inst: dict | None) -> None:
+    def _restore_stacks(self, inst: Instance | None) -> None:
         """Show `inst`'s cached dump (if any), else an empty tree — a stale
         dump from whatever was highlighted before must not linger."""
         tree = self.query_one("#acstacks", Tree)
@@ -349,7 +360,7 @@ class ActivityPane(Vertical):
         """True if `name` is one of the current mode's tabs."""
         return name in self.TABS[self._mode]
 
-    def render_stacks(self, inst: dict, workers: list[Worker], workdir: Path) -> bool:
+    def render_stacks(self, inst: Instance, workers: list[Worker], workdir: Path) -> bool:
         """Cache `inst`'s dump (see probes.dump_and_parse_stacks) and, if
         `inst` is still the highlighted instance — the dump takes a couple
         seconds, and the user may have moved on by the time it lands — render
@@ -462,10 +473,10 @@ class ActivityPane(Vertical):
         else:
             self._load_db_tab(active)
 
-    def _load_log(self, inst: dict | None) -> None:
+    def _load_log(self, inst: Instance | None) -> None:
         self._coalesce("log", _inst_key(inst), lambda: self._do_load_log(inst))
 
-    async def _do_load_log(self, inst: dict | None) -> None:
+    async def _do_load_log(self, inst: Instance | None) -> None:
         path = await asyncio.to_thread(logfile_of, inst) if inst else None
         text = await asyncio.to_thread(tail, path) if path is not None else None
         self._follow_log(path, text)
@@ -570,12 +581,12 @@ class ActivityPane(Vertical):
         if self._instance is not inst or not self.is_processes_active():
             return  # instance or tab changed while this was fetching; the result is stale
 
-        procs = [{**p, "kind": "odoo"} for p in odoo_procs] + [{**p, "kind": "pg"} for p in pg_procs]
+        procs: list[tuple[ProcRow, str]] = [(p, "odoo") for p in odoo_procs] + [(p, "pg") for p in pg_procs]
         now = time.monotonic()
         prev, self._top_prev = self._top_prev, {}
-        rows = []
+        rows: list[ProcDisplayRow] = []
 
-        for p in procs:
+        for p, kind in procs:
             pid = p["pid"]
             ticks = proc_cpu_ticks(pid)
             cpu = 0.0
@@ -589,14 +600,14 @@ class ActivityPane(Vertical):
                 if pid in prev and (dt := now - prev[pid][1]) > 0:
                     cpu = max(0.0, ticks - prev[pid][0]) / CLK_TCK / dt * 100
 
-            rows.append({**p, "time": time_str, "cpu": f"{cpu:.1f}"})
+            rows.append({**p, "kind": kind, "time": time_str, "cpu": f"{cpu:.1f}"})
 
         # sort by cpu load desc, in order to quickly spot the ones that matters
         rows.sort(key=lambda p: float(p["cpu"]), reverse=True)
         self._proc_rows = rows
         self._show_process_table(rows)
 
-    def _show_process_table(self, rows: list[dict]) -> None:
+    def _show_process_table(self, rows: list[ProcDisplayRow]) -> None:
         """Populate the DataTable, preserving the user's selected PID and
         scroll position across refreshes."""
         table = self.query_one("#actable", DataTable)

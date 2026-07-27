@@ -17,7 +17,10 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import TypedDict
+
+# typing_extensions, not typing: pydantic (via FastMCP, see mcp_server.py)
+# can't build a schema from typing.TypedDict on Python < 3.12.
+from typing_extensions import TypedDict
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 
@@ -97,7 +100,7 @@ def _is_odoo(*text: str) -> bool:
     return "odoo" in blob or "openerp" in blob
 
 
-def list_instances() -> list[dict[str, str]]:
+def list_instances() -> list[Instance]:
     """All local Odoo instances, from systemd --user, supervisor and odoo.sh.
 
     Each row carries its `manager` so actions route to the right controller;
@@ -106,7 +109,25 @@ def list_instances() -> list[dict[str, str]]:
     return systemd_instances() + supervisor_instances() + odoosh_instances()
 
 
-def systemd_instances() -> list[dict[str, str]]:
+def instance_status(inst: Instance) -> str:
+    """The instance's corrected status: `running`, `stopped`, or a manager
+    failure state (`failed`/`exited`/`fatal`).
+
+    A manager may report "stopped" while a bare shell runs it, so a live
+    process promotes an ambiguous *stopped* report to running. An explicit
+    failure (systemd "failed", supervisor "exited"/"fatal") is authoritative
+    even if a process serving the same db is alive — `procs_of` matches by
+    db name, not manager, so that process may belong to the *other*
+    manager's instance of the same name/db (see `list_instances`).
+    """
+    if inst["status"] == "running":
+        return "running"
+    if inst["status"] == "stopped" and procs_of(inst):
+        return "running"
+    return inst["status"]
+
+
+def systemd_instances() -> list[Instance]:
     """Odoo instances from systemd --user units.
 
     Uses list-unit-files (catches stopped units, which list-units hides) then
@@ -147,7 +168,7 @@ def systemd_instances() -> list[dict[str, str]]:
         capture_output=True,
         text=True,
     ).stdout
-    instances = []
+    instances: list[Instance] = []
     # systemd's *TimestampMonotonic properties are CLOCK_MONOTONIC (excludes
     # suspended time) — diffing against CLOCK_BOOTTIME (includes it) would
     # overstate uptime by the machine's total suspend time since boot
@@ -175,7 +196,7 @@ def systemd_instances() -> list[dict[str, str]]:
 SUPERVISOR_CONFD = Path("/opt/openerp/supervisor/conf.d")
 
 
-def supervisor_instances() -> list[dict[str, str]]:
+def supervisor_instances() -> list[Instance]:
     """Odoo instances under supervisor.
 
     Names + `directory`/`command` come from the conf.d programs; running state
@@ -184,7 +205,7 @@ def supervisor_instances() -> list[dict[str, str]]:
     """
     states = _supervisor_states()
     confs = _supervisor_confs()
-    instances = []
+    instances: list[Instance] = []
 
     for name in sorted(set(states) | set(confs)):
         if not _is_odoo(name):
@@ -285,7 +306,7 @@ def _proc_uptime(pid: str) -> float | None:
     return read_uptime() - int(fields[19]) / CLK_TCK
 
 
-def odoosh_instances() -> list[dict[str, str]]:
+def odoosh_instances() -> list[Instance]:
     """The single build this host is running, when this host is odoo.sh.
 
     One SSH-accessible odoo.sh host is one build, not several — "the
@@ -401,7 +422,7 @@ def _systemd_workdir(unit: str) -> Path:
     return Path(m.group(1)) if (m := re.search(r"WorkingDirectory=(\S+)", show)) else Path.cwd()
 
 
-def instance_workdir(inst: dict) -> Path:
+def instance_workdir(inst: Instance) -> Path:
     """The instance's working directory (supervisor `directory=`, the
     systemd unit's WorkingDirectory, or $HOME on odoo.sh)."""
     if inst["manager"] == "supervisor":
@@ -425,7 +446,7 @@ def _config_names(instance_name: str) -> list[str]:
     return ["odoo.conf", "server.conf"]
 
 
-def _config_file(inst: dict) -> Path | None:
+def _config_file(inst: Instance) -> Path | None:
     """The first `<workdir>/config/` file matching `_config_names`, or the
     fixed `~/.config/odoo/odoo.conf` odoo.sh always writes."""
     if inst["manager"] == "odoosh":
@@ -441,14 +462,14 @@ def _config_file(inst: dict) -> Path | None:
     return None
 
 
-def configfile_of(inst: dict) -> Path | None:
+def configfile_of(inst: Instance) -> Path | None:
     """The instance's resolved config file path, for tools (e.g. the
     `odoo-config` CLI) that operate on the file directly rather than its
     parsed values."""
     return _config_file(inst)
 
 
-def instance_config(inst: dict) -> tuple[Path, configparser.RawConfigParser | None]:
+def instance_config(inst: Instance) -> tuple[Path, configparser.RawConfigParser | None]:
     """(workdir, parsed odoo config) — the single source of db + log settings.
 
     The config is the first of `<workdir>/config/` matching `_config_names`;
@@ -472,7 +493,7 @@ def _opt(parser: configparser.RawConfigParser | None, key: str) -> str | None:
     return value if value and value.lower() != "false" else None
 
 
-def logfile_of(inst: dict) -> Path | None:
+def logfile_of(inst: Instance) -> Path | None:
     """The instance's odoo logfile, from the `logfile` key of its config, or
     odoo.sh's fixed `~/logs/odoo.log` (its config is sparse — no `logfile`
     key at all)."""
@@ -489,14 +510,14 @@ def logfile_of(inst: dict) -> Path | None:
     return path if path.is_absolute() else workdir / path
 
 
-def db_port_of(inst: dict) -> str | None:
+def db_port_of(inst: Instance) -> str | None:
     """The instance's postgres port from its odoo config, or None for the
     cluster default (instances may run on different clusters)."""
     _, parser = instance_config(inst)
     return _opt(parser, "db_port")
 
 
-def databases_of(inst: dict) -> tuple[list[str], str | None]:
+def databases_of(inst: Instance) -> tuple[list[str], str | None]:
     """(databases, db_port) for the instance — its authoritative members and
     the postgres port they live on (instances may run on different clusters).
 
@@ -572,7 +593,7 @@ def proc_cpu_ticks(pid: str) -> int | None:
     return int(fields[11]) + int(fields[12])  # utime + stime
 
 
-def instance_pid(inst: dict) -> str | None:
+def instance_pid(inst: Instance) -> str | None:
     """The instance's master pid, straight from its process manager.
 
     Not matched by database name: in multi-db/config-only setups the odoo
@@ -600,7 +621,7 @@ def instance_pid(inst: dict) -> str | None:
     return m.group(1) if m and m.group(1) != "0" else None
 
 
-def procs_of(inst: dict) -> list[dict[str, str]]:
+def procs_of(inst: Instance) -> list[ProcRow]:
     """The instance's master process plus every descendant (prefork
     workers), read purely from ps by walking the ppid tree down from the
     manager-reported master pid."""
@@ -614,14 +635,14 @@ def procs_of(inst: dict) -> list[dict[str, str]]:
         text=True,
     ).stdout.splitlines()[1:]  # drop header
 
-    by_pid: dict[str, dict[str, str]] = {}
+    by_pid: dict[str, ProcRow] = {}
     children: dict[str, list[str]] = {}
     for ln in lines:
         cols = ln.split(maxsplit=4)
         if len(cols) < 5:
             continue
 
-        row = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
+        row: ProcRow = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
         by_pid[row["pid"]] = row
         children.setdefault(row["ppid"], []).append(row["pid"])
 
@@ -637,7 +658,7 @@ def procs_of(inst: dict) -> list[dict[str, str]]:
     return [by_pid[pid] for pid in keep]
 
 
-def instance_procs(inst: dict) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def instance_procs(inst: Instance) -> tuple[list[ProcRow], list[ProcRow]]:
     """(odoo_processes, postgres_backends) from one `ps` call, halving the
     system-wide `ps` fork+parse the Processes tab used to do twice a tick.
 
@@ -653,23 +674,23 @@ def instance_procs(inst: dict) -> tuple[list[dict[str, str]], list[dict[str, str
         text=True,
     ).stdout.splitlines()[1:]
 
-    by_pid: dict[str, dict[str, str]] = {}
+    by_pid: dict[str, ProcRow] = {}
     children: dict[str, list[str]] = {}
-    pg_rows: list[dict[str, str]] = []
+    pg_rows: list[ProcRow] = []
 
     for ln in lines:
         cols = ln.split(maxsplit=4)
         if len(cols) < 5:
             continue
 
-        row = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
+        row: ProcRow = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
         by_pid[row["pid"]] = row
         children.setdefault(row["ppid"], []).append(row["pid"])
 
         if dbs and row["cmd"].startswith("postgres:") and dbs.intersection(row["cmd"].split()):
             pg_rows.append(row)
 
-    odoo_rows: list[dict[str, str]] = []
+    odoo_rows: list[ProcRow] = []
     if master is not None:
         keep: list[str] = []
         stack = [master]
@@ -739,6 +760,31 @@ _IDLE_FRAME_FUNCS = {"select", "poll", "sleep", "wait", "dumpstacks", "extract_s
 _IDLE_FRAME_PATH_MARKERS = ("/sentry_sdk/",)
 
 
+class _InstanceRequired(TypedDict):
+    name: str
+    status: str
+    uptime: str
+    manager: str
+
+
+class Instance(_InstanceRequired, total=False):
+    """`command`/`directory` come from supervisor, `db`/`version` from
+    odoo.sh — each manager only ever sets its own subset."""
+
+    command: str
+    directory: str
+    db: str
+    version: str
+
+
+class ProcRow(TypedDict):
+    pid: str
+    ppid: str
+    user: str
+    mem: str
+    cmd: str
+
+
 class Worker(TypedDict):
     pid: str
     threads: list[Thread]
@@ -792,7 +838,7 @@ def _parse_threads(block_text: str) -> list[Thread]:
     return threads
 
 
-def dump_and_parse_stacks(inst: dict) -> tuple[str, list[Worker]]:
+def dump_and_parse_stacks(inst: Instance) -> tuple[str, list[Worker]]:
     """SIGQUIT all instance processes, read new log output, and parse stack dumps.
 
     Sends SIGQUIT to master and descendant workers, reading the log file from the
@@ -834,7 +880,7 @@ def dump_and_parse_stacks(inst: dict) -> tuple[str, list[Worker]]:
     return "", parse_stack_dump(text)
 
 
-def instance_version(inst: dict) -> str | None:
+def instance_version(inst: Instance) -> str | None:
     """The instance's Odoo version, via the `odoo-addons-path` CLI (layout/
     addons-path detection lives there, not here) — or straight from
     odoo.sh's own `$ODOO_VERSION` env var, captured at discovery time."""

@@ -21,13 +21,14 @@ from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
+    Instance,
     databases_of,
     dump_and_parse_stacks,
     format_duration,
     instance_action,
+    instance_status,
     instance_workdir,
     list_instances,
-    procs_of,
     read_cpu_times,
     read_loadavg,
     read_mem,
@@ -52,21 +53,7 @@ TROBZ_THEME = Theme(
 )
 
 
-def _compute_status(inst: dict) -> str:
-    # a manager may report "stopped" while a bare shell runs it, so a live
-    # process promotes an ambiguous *stopped* report to running. An explicit
-    # failure (systemd "failed", supervisor "exited"/"fatal") is authoritative
-    # even if a process serving the same db is alive — procs_of() matches by
-    # db name, not manager, so that process may belong to the *other*
-    # manager's instance of the same name/db (see list_instances).
-    if inst["status"] == "running":
-        return "running"
-    if inst["status"] == "stopped" and procs_of(inst):
-        return "running"
-    return inst["status"]
-
-
-def _display_name(inst: dict) -> str:
+def _display_name(inst: Instance) -> str:
     """Instance name for display — `.service` is systemd-unit plumbing, not
     part of the name a user recognizes."""
     return inst["name"].removesuffix(".service")
@@ -213,7 +200,7 @@ class OdooActivity(App):
         self.query_one("#instances", ListView).border_title = "Instances"
 
         self._cpu = read_cpu_times()
-        self._instances: dict[str, dict] = {}
+        self._instances: dict[str, Instance] = {}
         self._instance_status: dict[str, str] = {}
         self._row_owner: dict[str, str] = {}  # row key -> owning instance key
         self._row_db: dict[str, str] = {}  # db row key -> db name
@@ -282,7 +269,7 @@ class OdooActivity(App):
         statuses = {}
         for inst in fresh_list:
             key = f"{inst['manager']}:{inst['name']}"
-            statuses[key] = await asyncio.to_thread(_compute_status, inst)
+            statuses[key] = await asyncio.to_thread(instance_status, inst)
 
         # running first, then a failure state, then a clean stop
         fresh_list.sort(key=lambda inst: _STATUS_ORDER.get(statuses[f"{inst['manager']}:{inst['name']}"], 1))
@@ -337,7 +324,7 @@ class OdooActivity(App):
             return 10
         return max(10, max(len(inst["uptime"]) for inst in self._instances.values()))
 
-    def _render_instance_row(self, inst: dict, status: str) -> str:
+    def _render_instance_row(self, inst: Instance, status: str) -> str:
         dot = self._dot(status)
         color = {"running": "green", "stopped": "dim"}.get(status, "red")
         width = self._name_width()
@@ -385,9 +372,9 @@ class OdooActivity(App):
         for item in self.query_one("#instances", ListView).children:
             inst = fresh.get(item.name or "")
             if inst is not None:
-                self._instance_status[item.name or ""] = await asyncio.to_thread(_compute_status, inst)
+                self._instance_status[item.name or ""] = await asyncio.to_thread(instance_status, inst)
 
-    def current_instance(self) -> dict | None:
+    def current_instance(self) -> Instance | None:
         item = self.query_one("#instances", ListView).highlighted_child
         if item is None or item.name is None:
             return None
@@ -395,7 +382,7 @@ class OdooActivity(App):
         owner = self._row_owner.get(item.name)
         return self._instances.get(owner) if owner else None
 
-    def highlighted_db(self) -> tuple[dict, str] | None:
+    def highlighted_db(self) -> tuple[Instance, str] | None:
         """(instance, db name) if a db row is highlighted, else None."""
         item = self.query_one("#instances", ListView).highlighted_child
         if item is None or item.name is None:
@@ -551,7 +538,7 @@ class OdooActivity(App):
         self._run_dumpstacks(inst)
 
     @work(exclusive=True, group="dumpstacks")
-    async def _run_dumpstacks(self, inst: dict) -> None:
+    async def _run_dumpstacks(self, inst: Instance) -> None:
         """Trigger a stack dump, parse it into the Stacks tab (the point:
         surfacing what's actually long-running without the user having to
         guess which worker first), then jump there."""

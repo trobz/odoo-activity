@@ -11,6 +11,8 @@ license-files = ["LICENSE"]
 dependencies = [
     "typer>=0.20",
     "textual>=8",
+    "typing-extensions>=4.16",
+    "mcp[cli]>=1.28.1",
 ]
 
 [project.urls]
@@ -18,6 +20,7 @@ Repository = "https://github.com/trobz/odoo-activity"
 [project.scripts]
 odoo-activity = "odoo_activity.main:app"
 oa = "odoo_activity.main:app"
+oa-mcp = "odoo_activity.mcp_server:app"
 
 [dependency-groups]
 dev = [
@@ -43,6 +46,7 @@ module-root = ""
 
 [project.optional-dependencies]
 build = ["uv ~= 0.7.12"]
+mcp = []
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
