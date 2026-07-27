@@ -136,18 +136,18 @@ def _inst(status: str) -> Instance:
     return {"name": "x", "status": status, "uptime": "-", "manager": "systemd"}
 
 
-def test_compute_status_promotes_ambiguous_stopped_but_not_explicit_failure(monkeypatch):
+def test_instance_status_promotes_ambiguous_stopped_but_not_explicit_failure(monkeypatch):
     # a live process promotes an ambiguous "stopped" report to running
-    monkeypatch.setattr(tui, "procs_of", lambda _: [{"pid": "1"}])
-    assert tui._compute_status(_inst("stopped")) == "running"
+    monkeypatch.setattr(probes, "procs_of", lambda _: [{"pid": "1"}])
+    assert probes.instance_status(_inst("stopped")) == "running"
 
     # regression: an explicit failure is authoritative even with a live
     # process matching the same db — procs_of() matches by db name, not
     # manager, so that process may belong to the *other* manager's instance
-    assert tui._compute_status(_inst("failed")) == "failed"
+    assert probes.instance_status(_inst("failed")) == "failed"
 
-    monkeypatch.setattr(tui, "procs_of", lambda _: [])
-    assert tui._compute_status(_inst("stopped")) == "stopped"
+    monkeypatch.setattr(probes, "procs_of", lambda _: [])
+    assert probes.instance_status(_inst("stopped")) == "stopped"
 
 
 def test_rebuild_instances_sorts_by_status_and_nests_dbs(monkeypatch):
@@ -157,7 +157,7 @@ def test_rebuild_instances_sorts_by_status_and_nests_dbs(monkeypatch):
         {"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"},
     ]
     monkeypatch.setattr(tui, "list_instances", lambda: instances)
-    monkeypatch.setattr(tui, "procs_of", lambda _: [])
+    monkeypatch.setattr(probes, "procs_of", lambda _: [])
     monkeypatch.setattr(
         tui, "databases_of", lambda inst: (["demo"], None) if inst["name"] == "b.service" else ([], None)
     )
@@ -187,7 +187,7 @@ def test_instance_action_waits_for_confirmation(monkeypatch):
         "list_instances",
         lambda: [{"name": "a.service", "status": "running", "uptime": "-", "manager": "systemd"}],
     )
-    monkeypatch.setattr(tui, "procs_of", lambda _: [])
+    monkeypatch.setattr(probes, "procs_of", lambda _: [])
     monkeypatch.setattr(tui, "databases_of", lambda _inst: ([], None))
     monkeypatch.setattr(
         tui, "instance_action", lambda name, action, manager: calls.append((name, action, manager)) or ""

@@ -109,6 +109,24 @@ def list_instances() -> list[Instance]:
     return systemd_instances() + supervisor_instances() + odoosh_instances()
 
 
+def instance_status(inst: Instance) -> str:
+    """The instance's corrected status: `running`, `stopped`, or a manager
+    failure state (`failed`/`exited`/`fatal`).
+
+    A manager may report "stopped" while a bare shell runs it, so a live
+    process promotes an ambiguous *stopped* report to running. An explicit
+    failure (systemd "failed", supervisor "exited"/"fatal") is authoritative
+    even if a process serving the same db is alive — `procs_of` matches by
+    db name, not manager, so that process may belong to the *other*
+    manager's instance of the same name/db (see `list_instances`).
+    """
+    if inst["status"] == "running":
+        return "running"
+    if inst["status"] == "stopped" and procs_of(inst):
+        return "running"
+    return inst["status"]
+
+
 def systemd_instances() -> list[Instance]:
     """Odoo instances from systemd --user units.
 

@@ -26,9 +26,9 @@ from odoo_activity.probes import (
     dump_and_parse_stacks,
     format_duration,
     instance_action,
+    instance_status,
     instance_workdir,
     list_instances,
-    procs_of,
     read_cpu_times,
     read_loadavg,
     read_mem,
@@ -51,20 +51,6 @@ TROBZ_THEME = Theme(
     foreground="#FFFFFF",
     dark=True,
 )
-
-
-def _compute_status(inst: Instance) -> str:
-    # a manager may report "stopped" while a bare shell runs it, so a live
-    # process promotes an ambiguous *stopped* report to running. An explicit
-    # failure (systemd "failed", supervisor "exited"/"fatal") is authoritative
-    # even if a process serving the same db is alive — procs_of() matches by
-    # db name, not manager, so that process may belong to the *other*
-    # manager's instance of the same name/db (see list_instances).
-    if inst["status"] == "running":
-        return "running"
-    if inst["status"] == "stopped" and procs_of(inst):
-        return "running"
-    return inst["status"]
 
 
 def _display_name(inst: Instance) -> str:
@@ -283,7 +269,7 @@ class OdooActivity(App):
         statuses = {}
         for inst in fresh_list:
             key = f"{inst['manager']}:{inst['name']}"
-            statuses[key] = await asyncio.to_thread(_compute_status, inst)
+            statuses[key] = await asyncio.to_thread(instance_status, inst)
 
         # running first, then a failure state, then a clean stop
         fresh_list.sort(key=lambda inst: _STATUS_ORDER.get(statuses[f"{inst['manager']}:{inst['name']}"], 1))
@@ -386,7 +372,7 @@ class OdooActivity(App):
         for item in self.query_one("#instances", ListView).children:
             inst = fresh.get(item.name or "")
             if inst is not None:
-                self._instance_status[item.name or ""] = await asyncio.to_thread(_compute_status, inst)
+                self._instance_status[item.name or ""] = await asyncio.to_thread(instance_status, inst)
 
     def current_instance(self) -> Instance | None:
         item = self.query_one("#instances", ListView).highlighted_child
