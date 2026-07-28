@@ -7,8 +7,8 @@ inline, no popups.
 
 from __future__ import annotations
 
-import asyncio
 import json
+import logging
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -22,12 +22,14 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Input, RichLog, Static, Tree
 
+from odoo_activity.host import Host, to_thread
 from odoo_activity.panes.stacks import render_stacks
 from odoo_activity.probes import (
     CLK_TCK,
     Instance,
     ProcRow,
     Worker,
+    _read_new_bytes,
     configfile_of,
     db_port_of,
     instance_procs,
@@ -37,7 +39,7 @@ from odoo_activity.probes import (
     odoo_pid_for_port,
     parse_odoo_db_output,
     pg_client_port,
-    proc_cpu_ticks,
+    proc_cpu_ticks_many,
     render_config,
     start_odoo_db,
     stringify,
@@ -47,6 +49,8 @@ from odoo_activity.probes import (
 
 if TYPE_CHECKING:
     from odoo_activity.tui import OdooActivity
+
+_log = logging.getLogger("odoo_activity")
 
 
 class ProcDisplayRow(ProcRow):
@@ -159,6 +163,7 @@ class ActivityPane(Vertical):
         self._instance: Instance | None = None
         self._db: tuple[Instance, str] | None = None  # (instance, db name) in database mode
         self._log_path: Path | None = None
+        self._log_proc: subprocess.Popen | None = None  # remote-only: streaming `tail -f`
         self._config_path: Path | None = None
         self._log_pos = 0
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
@@ -173,6 +178,11 @@ class ActivityPane(Vertical):
         self._stacks_cache: dict[str, tuple[list[Worker], Path]] = {}  # instance key -> its last dump
         self.query_one("#acstacks", Tree).show_root = False
         self._render_mode()
+
+    def on_unmount(self) -> None:
+        # an ssh streaming child isn't reaped on drop -- kill it explicitly
+        # so quitting the app doesn't leave a `tail -f` running on the remote.
+        self._stop_log_stream()
 
     def on_resize(self, event: events.Resize) -> None:
         # COMMAND's width is derived from table.size, which is still 0 the
@@ -206,7 +216,9 @@ class ActivityPane(Vertical):
             return
 
         self._inflight[key] = ident
-        self.run_worker(self._run_coalesced(key, factory), group=key, exclusive=True)
+        # not exclusive: _inflight already admits one worker per key, so it
+        # could only ever cancel one that has finished its work
+        self.run_worker(self._run_coalesced(key, factory), group=key)
 
     async def _run_coalesced(self, key: str, factory: Callable[[], Awaitable[None]]) -> None:
         try:
@@ -218,17 +230,27 @@ class ActivityPane(Vertical):
                 ident, next_factory = nxt
                 self._coalesce(key, ident, next_factory)
 
+    def _active_tab(self) -> str:
+        """Name of the tab `_tab` points at.
+
+        Wrapped, because `_tab` outlives a mode switch: database mode has more
+        tabs than instance mode, so an index valid in one can be out of range
+        in the other until `_render_active` normalises it the same way.
+        """
+        tabs = self.TABS[self._mode]
+        return tabs[self._tab % len(tabs)]
+
     def is_logs_active(self) -> bool:
-        return self._mode == "instance" and self.TABS["instance"][self._tab] == "Logs"
+        return self._mode == "instance" and self._active_tab() == "Logs"
 
     def is_config_active(self) -> bool:
-        return self._mode == "instance" and self.TABS["instance"][self._tab] == "Config"
+        return self._mode == "instance" and self._active_tab() == "Config"
 
     def is_processes_active(self) -> bool:
-        return self._mode == "instance" and self.TABS["instance"][self._tab] == "Processes"
+        return self._mode == "instance" and self._active_tab() == "Processes"
 
     def is_stacks_active(self) -> bool:
-        return self._mode == "instance" and self.TABS["instance"][self._tab] == "Stacks"
+        return self._mode == "instance" and self._active_tab() == "Stacks"
 
     def has_search(self) -> bool:
         """Logs and Config both render plain text into #acbody with the same
@@ -296,7 +318,7 @@ class ActivityPane(Vertical):
             return
 
         port = pg_client_port(row["cmd"])
-        target = await asyncio.to_thread(odoo_pid_for_port, port) if port else None
+        target = await to_thread(odoo_pid_for_port, port, self.app.host) if port else None
         row_idx = next((i for i, p in enumerate(self._proc_rows) if p["pid"] == target), None)
 
         if row_idx is None:
@@ -312,6 +334,13 @@ class ActivityPane(Vertical):
         theme = "ansi_dark" if self.app.current_theme.dark else "ansi_light"
         syntax = Syntax(text, "json", theme=theme, background_color="default", word_wrap=True)
         self.query_one("#acraw-body", Static).update(syntax)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # diagnostic-only (see --debug): every value change to the search
+        # box, to tell apart real character loss/reordering from a
+        # display/repaint lag when a keystroke doesn't seem to show up.
+        if event.input.id == "acsearch":
+            _log.debug("acsearch value=%r cursor=%r", event.value, event.input.cursor_position)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "acsearch":
@@ -338,14 +367,35 @@ class ActivityPane(Vertical):
         self._render_mode()
 
     def _restore_stacks(self, inst: Instance | None) -> None:
-        """Show `inst`'s cached dump (if any), else an empty tree — a stale
-        dump from whatever was highlighted before must not linger."""
+        """Show `inst`'s cached dump if the Stacks tab is actually the one
+        visible, else just drop whatever's there — a stale dump from
+        whatever was highlighted before must not linger.
+
+        Populating the tree is O(total frames) (every worker/thread/frame
+        becomes a node up front) — measured at 80-250ms for a realistic
+        multi-worker dump — so doing that unconditionally on every arrow-key
+        instance nav, even with Stacks off screen, stalled the event loop
+        long enough to delay/drop the next keypress. `_render_active`'s
+        Stacks branch calls `_populate_stacks` again once the tab is
+        actually the one being switched to.
+        """
+        if self.is_stacks_active():
+            self._populate_stacks(inst)
+        else:
+            self.query_one("#acstacks", Tree).clear()
+
+    def _populate_stacks(self, inst: Instance | None) -> None:
+        # main-thread widget mutation, O(total frames) -- see the module
+        # docstring on _restore_stacks; timed here so a --debug run can
+        # confirm/rule this out as the source of a felt input stall
+        started = time.monotonic()
         tree = self.query_one("#acstacks", Tree)
         cached = self._stacks_cache.get(_inst_key(inst) or "")
         tree.clear()
         if cached is not None:
             workers, workdir = cached
             render_stacks(tree, workers, workdir)
+        _log.debug("_populate_stacks took %.0fms", (time.monotonic() - started) * 1000)
 
     def select_tab(self, index: int) -> None:
         self._tab = index
@@ -377,15 +427,44 @@ class ActivityPane(Vertical):
         self.select_tab(self._tab + 1)
 
     def tick(self) -> None:
-        """Keep Processes live while it's the active tab. Called on the host
-        refresh timer."""
+        """Keep Processes live while it's the active tab. Rides the host
+        refresh timer, so it inherits that timer's local/remote cadence —
+        CPU% is a rate between two of these samples, so it needs to fire on
+        its own rather than only on `R`."""
         if self.is_processes_active():
             self._render_processes()
+
+    def refresh_active(self) -> None:
+        """Manual re-fetch of whatever the active tab shows — the only way
+        to update Processes on a remote host now that `tick` skips it."""
+        self._render_active()
+
+    def _stop_log_stream(self) -> None:
+        if self._log_proc is not None:
+            self._log_proc.kill()
+            self._log_proc = None
+
+    def _append_log(self, data: str) -> None:
+        self._log_text += data
+        if self._log_query:
+            self._render_log()
+        else:
+            body = self.query_one("#acbody", RichLog)
+            # only follow the tail if the user was already at the bottom —
+            # else a scroll-up to read older lines gets yanked back down
+            # every time new data lands
+            body.write(data, scroll_end=self._at_bottom(body))
 
     def poll(self) -> None:
         """Append newly-written log lines while Logs is the active tab. Called
         on a timer; a no-op whenever another tab is active (``_log_path`` is
         None then)."""
+        if self._log_proc is not None:
+            data = _read_new_bytes(self._log_proc).decode(errors="replace")
+            if data:
+                self._append_log(data)
+            return
+
         if self._log_path is None:
             return
 
@@ -407,15 +486,7 @@ class ActivityPane(Vertical):
         if not data:
             return
 
-        self._log_text += data
-        if self._log_query:
-            self._render_log()
-        else:
-            body = self.query_one("#acbody", RichLog)
-            # only follow the tail if the user was already at the bottom —
-            # else a scroll-up to read older lines gets yanked back down
-            # every time new data lands
-            body.write(data, scroll_end=self._at_bottom(body))
+        self._append_log(data)
 
     def _render_mode(self) -> None:
         tabs = self.TABS[self._mode]
@@ -453,22 +524,45 @@ class ActivityPane(Vertical):
         self.border_title = self._title()
 
         active = tabs[self._tab]
+        self._stop_log_stream()
         self._log_path = None
         self._config_path = None
-        self.query_one("#acsearch", Input).display = False
+        # never while focused: hiding it drops focus to the ListView mid-typing
+        # and the rest is eaten. Reached from more than the tab keys —
+        # ListView.clear() emits Highlighted(None), which lands here too.
+        search = self.query_one("#acsearch", Input)
+        if not search.has_focus:
+            search.display = False
 
         if self._mode == "instance":
             if active == "Logs":
-                self._use("log")
+                # clear whatever the prior tab left in #acbody (e.g.
+                # Processes' "Loading processes…") instead of leaving it
+                # visible until the async tail fetch lands
+                self._log_body("Loading logs…")
                 self._load_log(self._instance)
             elif active == "Config":
                 self._use("log")
                 self._render_config()
             elif active == "Stacks":
+                # deferred here (not on every instance nav — see
+                # _restore_stacks) until the tab a user actually switches to.
+                # Populating is O(total frames) (80-250ms measured for a
+                # realistic multi-worker dump) and mutates the Tree on the
+                # main thread (can't to_thread a widget update) -- push it
+                # past this switch's own repaint so the keypress that
+                # triggered it isn't what stalls.
                 self._use("stacks")
+                self.call_after_refresh(self._populate_stacks, self._instance)
             else:  # Processes
-                self._use("table")
-                self._top_prev = {}
+                # loading text now, table (_do_render_processes flips _use
+                # back once ready) -- a remote fetch is slow enough that an
+                # empty, already-visible table read as "nothing happened"
+                self._log_body("Loading processes…")
+                # _top_prev is not cleared here: it is the baseline CPU% is
+                # derived from, and _do_render_processes rebuilds it from the
+                # live pid set anyway. Dropping it made every tab switch show
+                # 0.0% until a second refresh -- remotely, a second `R`.
                 self._render_processes()
         else:
             self._load_db_tab(active)
@@ -477,11 +571,33 @@ class ActivityPane(Vertical):
         self._coalesce("log", _inst_key(inst), lambda: self._do_load_log(inst))
 
     async def _do_load_log(self, inst: Instance | None) -> None:
-        path = await asyncio.to_thread(logfile_of, inst) if inst else None
-        text = await asyncio.to_thread(tail, path) if path is not None else None
-        self._follow_log(path, text)
+        host = self.app.host
+        path = await to_thread(logfile_of, inst, host) if inst else None
+        text = await to_thread(tail, path, 200, host) if path is not None else None
 
-    def _follow_log(self, path: Path | None, text: str | None) -> None:
+        # both awaits above are ssh round trips -- long enough remotely for
+        # the tab/instance to have changed since; recheck before spawning a
+        # tail -f child or writing into the shared #acbody
+        if self._instance is not inst or not self.is_logs_active():
+            return
+
+        proc = None
+        if path is not None and not host.is_local:
+            # host.popen() forks+execs a new ssh child -- to_thread it, same
+            # as every other host call here, so that fork never shares the
+            # event-loop thread that's also reading keypresses (this is the
+            # one spot that used to run it inline
+            proc = await to_thread(
+                host.popen, ["tail", "-f", "-n", "0", str(path)], stderr=subprocess.DEVNULL, text=False
+            )
+            if self._instance is not inst or not self.is_logs_active():
+                proc.kill()  # superseded while the child was still spawning
+                return
+
+        self._follow_log(path, text, host, proc)
+
+    def _follow_log(self, path: Path | None, text: str | None, host: Host, proc: subprocess.Popen | None) -> None:
+        self._stop_log_stream()
         self._log_path = path
         self._log_query = None
         self.border_title = self._title()
@@ -495,10 +611,14 @@ class ActivityPane(Vertical):
         self._log_text = text or ""
         self._render_log()
 
-        try:
-            self._log_pos = path.stat().st_size
-        except OSError:
-            self._log_pos = 0
+        if host.is_local:
+            try:
+                self._log_pos = path.stat().st_size
+            except OSError:
+                self._log_pos = 0
+            return
+
+        self._log_proc = proc
 
     def _render_log(self) -> None:
         body = self.query_one("#acbody", RichLog)
@@ -548,14 +668,27 @@ class ActivityPane(Vertical):
             self._show_config_text("(no instance)")
             return
 
-        config = await asyncio.to_thread(configfile_of, inst)
+        host = self.app.host
+        config = await to_thread(configfile_of, inst, host)
+
+        # each await above is an ssh round trip -- long enough remotely for
+        # the tab/instance to have changed since; recheck before writing
+        # into the shared #acbody, or a stale completion overwrites
+        # whatever tab (e.g. Logs) is now showing
+        if self._instance is not inst or not self.is_config_active():
+            return
+
         if config is None:
             self._show_config_text("(no config file found)")
             return
 
         self._config_path = config
-        version = await asyncio.to_thread(instance_version, inst)
-        text = await asyncio.to_thread(render_config, config, version, self._config_mode)
+        version = await to_thread(instance_version, inst, host)
+        text = await to_thread(render_config, config, version, self._config_mode, host)
+
+        if self._instance is not inst or not self.is_config_active():
+            return
+
         self._show_config_text(text)
 
     def _show_config_text(self, text: str) -> None:
@@ -573,10 +706,12 @@ class ActivityPane(Vertical):
         inst = self._instance
         if inst is None:
             self._proc_rows = []
+            self._use("table")
             self._show_process_table([])
             return
 
-        odoo_procs, pg_procs = await asyncio.to_thread(instance_procs, inst)
+        host = self.app.host
+        odoo_procs, pg_procs = await to_thread(instance_procs, inst, host)
 
         if self._instance is not inst or not self.is_processes_active():
             return  # instance or tab changed while this was fetching; the result is stale
@@ -584,11 +719,19 @@ class ActivityPane(Vertical):
         procs: list[tuple[ProcRow, str]] = [(p, "odoo") for p in odoo_procs] + [(p, "pg") for p in pg_procs]
         now = time.monotonic()
         prev, self._top_prev = self._top_prev, {}
-        rows: list[ProcDisplayRow] = []
 
+        ticks_by_pid = await to_thread(proc_cpu_ticks_many, [p["pid"] for p, _ in procs], host)
+
+        # one more round trip (batched -- see proc_cpu_ticks_many) since the
+        # guard above; recheck before forcing #actable visible, or a late
+        # completion hijacks whatever tab is now showing
+        if self._instance is not inst or not self.is_processes_active():
+            return
+
+        rows: list[ProcDisplayRow] = []
         for p, kind in procs:
             pid = p["pid"]
-            ticks = proc_cpu_ticks(pid)
+            ticks = ticks_by_pid.get(pid)
             cpu = 0.0
             time_str = "-"
 
@@ -604,10 +747,20 @@ class ActivityPane(Vertical):
 
         # sort by cpu load desc, in order to quickly spot the ones that matters
         rows.sort(key=lambda p: float(p["cpu"]), reverse=True)
+
         self._proc_rows = rows
+        self._use("table")
         self._show_process_table(rows)
 
     def _show_process_table(self, rows: list[ProcDisplayRow]) -> None:
+        # Same reason as _show_datatable: on the switch-away-from-"Loading…"
+        # reveal, the table was hidden until this call, so its post-layout
+        # size isn't known yet — sizing COMMAND off it here wraps narrow for
+        # one frame, then jumps wide once a tick/resize lands. Deferring
+        # sizing until after the reveal's layout pass avoids that flash.
+        self.call_after_refresh(self._populate_process_table, rows)
+
+    def _populate_process_table(self, rows: list[ProcDisplayRow]) -> None:
         """Populate the DataTable, preserving the user's selected PID and
         scroll position across refreshes."""
         table = self.query_one("#actable", DataTable)
@@ -669,20 +822,22 @@ class ActivityPane(Vertical):
         self.run_worker(self._fetch_db_tab(category, db, ident), group="dbtab")
 
     async def _fetch_db_tab(self, category: str, db: str, ident: tuple[str, str]) -> None:
-        port = db_port_of(self._db[0]) if self._db else None
+        host = self.app.host
+        port = await to_thread(db_port_of, self._db[0], host) if self._db else None
 
         if category == "Queries":
             # see `long_queries`
-            rows = await asyncio.to_thread(long_queries, db, port)
+            rows = await to_thread(long_queries, db, port, host)
             if ident != self._dbtab.ident:
                 return
 
             self._handle_rows(rows)
             return
 
-        proc = await asyncio.to_thread(start_odoo_db, category.lower(), db, port)
+        proc = await to_thread(start_odoo_db, category.lower(), db, port, host)
         if proc is None:
-            self._log_body("(odoo-db not found on PATH)")
+            if ident == self._dbtab.ident:
+                self._log_body("(odoo-db not found on PATH)")
             return
 
         self._dbtab.proc = proc
@@ -694,7 +849,7 @@ class ActivityPane(Vertical):
                 proc.kill()
                 return None
 
-        result = await asyncio.to_thread(_wait)
+        result = await to_thread(_wait)
 
         if ident != self._dbtab.ident:
             return  # superseded by a newer tab selection; this result is stale

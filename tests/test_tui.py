@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from odoo_activity import probes, tui
+from odoo_activity.host import Host
 from odoo_activity.probes import Instance
 
 
@@ -50,6 +51,31 @@ def test_parse_odoo_db_output_falls_back_to_raw_for_non_json():
 def test_parse_odoo_db_output_wraps_a_single_json_object():
     rows, _raw = probes.parse_odoo_db_output('{"db": "demo"}', "")
     assert rows == [{"db": "demo"}]
+
+
+def test_proc_cpu_ticks_many_batches_a_remote_host_into_one_call(monkeypatch):
+    # regression: this used to be one ssh round trip per pid (proc_cpu_ticks
+    # in a loop) -- slow enough with more than a couple of processes that
+    # the Processes tab sat on "Loading processes..." for real seconds.
+    calls = []
+
+    def fake_run(self, argv, **_):
+        calls.append(argv)
+        # pid "2" is gone -- cat's stderr is redirected, stdout for it is empty
+        out = (
+            "\x1e1\n1 (odoo) S 0 1 1 0 -1 0 0 0 0 0 111 222 0 0 20 0 1 0 1 0 0 0 0\n"
+            "\x1e2\n"
+            "\x1e3\n3 (postgres) S 0 1 1 0 -1 0 0 0 0 0 5 5 0 0 20 0 1 0 1 0 0 0 0\n"
+        )
+        return SimpleNamespace(stdout=out)
+
+    monkeypatch.setattr(Host, "run", fake_run)
+    host = Host(alias="x")
+
+    result = probes.proc_cpu_ticks_many(["1", "2", "3"], host)
+
+    assert result == {"1": 111 + 222, "2": None, "3": 5 + 5}
+    assert len(calls) == 1  # one round trip, not three
 
 
 def test_supervisor_instances_maps_status_vocab_and_uptime(monkeypatch, tmp_path):
@@ -138,7 +164,7 @@ def _inst(status: str) -> Instance:
 
 def test_instance_status_promotes_ambiguous_stopped_but_not_explicit_failure(monkeypatch):
     # a live process promotes an ambiguous "stopped" report to running
-    monkeypatch.setattr(probes, "procs_of", lambda _: [{"pid": "1"}])
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [{"pid": "1"}])
     assert probes.instance_status(_inst("stopped")) == "running"
 
     # regression: an explicit failure is authoritative even with a live
@@ -146,7 +172,7 @@ def test_instance_status_promotes_ambiguous_stopped_but_not_explicit_failure(mon
     # manager, so that process may belong to the *other* manager's instance
     assert probes.instance_status(_inst("failed")) == "failed"
 
-    monkeypatch.setattr(probes, "procs_of", lambda _: [])
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     assert probes.instance_status(_inst("stopped")) == "stopped"
 
 
@@ -156,10 +182,10 @@ def test_rebuild_instances_sorts_by_status_and_nests_dbs(monkeypatch):
         {"name": "a.service", "status": "failed", "uptime": "-", "manager": "systemd"},
         {"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"},
     ]
-    monkeypatch.setattr(tui, "list_instances", lambda: instances)
-    monkeypatch.setattr(probes, "procs_of", lambda _: [])
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     monkeypatch.setattr(
-        tui, "databases_of", lambda inst: (["demo"], None) if inst["name"] == "b.service" else ([], None)
+        tui, "databases_of", lambda inst, *_: (["demo"], None) if inst["name"] == "b.service" else ([], None)
     )
 
     async def go():
@@ -185,12 +211,12 @@ def test_instance_action_waits_for_confirmation(monkeypatch):
     monkeypatch.setattr(
         tui,
         "list_instances",
-        lambda: [{"name": "a.service", "status": "running", "uptime": "-", "manager": "systemd"}],
+        lambda *_: [{"name": "a.service", "status": "running", "uptime": "-", "manager": "systemd"}],
     )
-    monkeypatch.setattr(probes, "procs_of", lambda _: [])
-    monkeypatch.setattr(tui, "databases_of", lambda _inst: ([], None))
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda _inst, *_: ([], None))
     monkeypatch.setattr(
-        tui, "instance_action", lambda name, action, manager: calls.append((name, action, manager)) or ""
+        tui, "instance_action", lambda name, action, manager, *_: calls.append((name, action, manager)) or ""
     )
 
     async def go():
@@ -207,5 +233,34 @@ def test_instance_action_waits_for_confirmation(monkeypatch):
             await pilot.app.workers.wait_for_complete()
             await pilot.pause()
             assert calls == [("a.service", "stop", "systemd")]
+
+    asyncio.run(go())
+
+
+def test_leaving_a_late_db_tab_for_an_instance_row(monkeypatch):
+    # regression guard: database mode has more tabs than instance mode, so
+    # navigating off one of the extra ones (Crons) back up to an instance row
+    # left _tab pointing past the end of the instance tabs
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda *_: (["demo"], None))
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            await pilot.press("down")  # onto the nested db row -> database mode
+            await pilot.pause()
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Crons")
+            await pilot.pause()
+
+            await pilot.press("up")  # back to the instance row
+            await pilot.pause()
+
+            assert pane._mode == "instance"
+            assert pane._active_tab() in pane.TABS["instance"]
 
     asyncio.run(go())
