@@ -7,6 +7,7 @@ odoo-activity is on, or a remote one over ssh, without knowing which.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob as _glob
 import os
 import shlex
@@ -150,3 +151,23 @@ class Host:
 
 LOCAL = Host()  # the common case, as a singleton default arg (Host() itself is fine as a
 # default per ruff/B008 since it's frozen, but a shared instance avoids the churn)
+
+
+def close_control_master(host: Host) -> None:
+    """Tear down this run's ssh ControlMaster on a graceful quit, instead of
+    leaving it (and its socket file) around for the full ControlPersist=600
+    window. Best-effort and silent: a hard `kill -9` never reaches this at
+    all (no code runs), so it's the common-case cleanup, not the only one.
+    """
+    if host.alias is None:
+        return
+
+    port_opts = ["-p", str(host.port)] if host.port else []
+    with contextlib.suppress(subprocess.SubprocessError, OSError):
+        subprocess.run(
+            ["ssh", "-O", "exit", "-o", f"ControlPath={_CONTROL_PATH}", *port_opts, host.alias],
+            stdin=_NO_STDIN,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )

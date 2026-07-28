@@ -7,7 +7,7 @@ from pathlib import Path
 
 import typer
 
-from odoo_activity.host import Host
+from odoo_activity.host import Host, close_control_master
 from odoo_activity.tui import OdooActivity
 
 app = typer.Typer(add_completion=False)
@@ -39,12 +39,17 @@ def main(
     if debug:
         _setup_debug_logging()
 
+    target = Host(alias=host, port=port)
     code = 0
     try:
-        OdooActivity(host=Host(alias=host, port=port)).run()
+        OdooActivity(host=target).run()
     except BaseException:
         traceback.print_exc()
         code = 1
+
+    # graceful-quit-only: a hard kill never runs this, ControlPersist=600
+    # reaps that case on its own past its 10min idle window.
+    close_control_master(target)
 
     # concurrent.futures' atexit joins probe threads, so an in-flight ssh call
     # holds the process open with the terminal already restored. os._exit skips

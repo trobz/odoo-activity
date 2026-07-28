@@ -223,9 +223,13 @@ class OdooActivity(App):
         self._pulse_on = True
         self._instances_ready = False  # first _rebuild_instances has finished mounting rows
 
+        # spinner over the initial (possibly slow, over ssh) discovery only --
+        # _rebuild_instances clears this once it lands and focuses the list
+        # (a loading widget can't take focus -- see Widget._check_disabled);
+        # membership-change rebuilds later never set loading, so they don't
+        # blank already-shown rows or steal focus back
+        self.query_one("#instances", ListView).loading = True
         self.refresh_instances()
-
-        self.query_one("#instances", ListView).focus()
 
         # also paces the Processes tab, which rides this tick (ActivityPane.tick)
         self.set_interval(1.0 if self.host.is_local else 5.0, self.refresh_host)
@@ -303,6 +307,7 @@ class OdooActivity(App):
     @work(exclusive=True, group="instances")
     async def _rebuild_instances(self) -> None:
         lv = self.query_one("#instances", ListView)
+        first_load = not self._instances_ready
         keep = lv.highlighted_child.name if lv.highlighted_child else None
         await lv.clear()
 
@@ -344,6 +349,11 @@ class OdooActivity(App):
             lv.index = keys.index(keep) if keep in keys else 0
 
         self._instances_ready = True
+        lv.loading = False
+        if first_load:
+            # a loading widget can't take focus (Widget._check_disabled), so
+            # the on_mount focus() call landed while this was still disabled
+            lv.focus()
         self._load_databases(self._highlighted_owner())
 
     def _db_items(self, key: str, name_width: int, uptime_width: int) -> list[ListItem]:
