@@ -278,6 +278,11 @@ class OdooActivity(App):
         if stats is None:
             return  # a bad remote round trip -- try again next tick, not fatal
 
+        if not self.is_running:
+            # this tick's worker got scheduled before quit/teardown started
+            # and only ran after -- the widgets below are already gone
+            return
+
         (total, idle), (mem_pct, swap_pct), (load1, load5, load15), uptime = stats
         d_total = total - self._cpu[0]
         d_idle = idle - self._cpu[1]
