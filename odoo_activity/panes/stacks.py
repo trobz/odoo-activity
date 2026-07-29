@@ -11,7 +11,7 @@ from pathlib import Path
 from textual.widgets import Tree
 from textual.widgets.tree import TreeNode
 
-from odoo_activity.probes import Thread, Worker
+from odoo_activity.probes import Thread, Worker, stacks_by_activity
 
 
 def _short(path: str, workdir: Path) -> str:
@@ -36,10 +36,8 @@ def render_stacks(tree: Tree, workers: list[Worker], workdir: Path) -> bool:
     tree.clear()
     busy_any = False
 
-    by_busy_count = sorted(workers, key=lambda w: sum(not t["idle"] for t in w["threads"]), reverse=True)
-
-    for worker in by_busy_count:
-        threads = sorted(worker["threads"], key=lambda t: t["idle"])
+    for worker in stacks_by_activity(workers):
+        threads = worker["threads"]
         busy = sum(not t["idle"] for t in threads)
         busy_any = busy_any or busy > 0
         pid_node = tree.root.add(
@@ -55,11 +53,13 @@ def render_stacks(tree: Tree, workers: list[Worker], workdir: Path) -> bool:
 
 def _add_thread(parent: TreeNode, thread: Thread, workdir: Path) -> None:
     tag = "[b red]busy[/]" if not thread["idle"] else "[dim]idle[/]"
-    innermost = thread["frames"][-1] if thread["frames"] else None
+    innermost = thread["frames"][0] if thread["frames"] else None
     where = f" — {innermost['func']} ({_short(innermost['file'], workdir)}:{innermost['line']})" if innermost else ""
-    node = parent.add(f"{tag} {thread['name']}{where}", expand=not thread["idle"])
-    # frames come outermost-first (as kill -3 prints them); py-spy prints
-    # innermost first so the concerning frame is the one you see without
-    # scrolling — match that order here rather than the raw dump's.
-    for frame in reversed(thread["frames"]):
+    # db is only set while the thread is mid-request; qt/pt (see probes.py's
+    # _THREAD_RE comment) show where a stuck request is actually spending
+    # time — in SQL (qt) or outside it (pt).
+    request = f" (db:{thread['db']} qt:{thread['query_time']} pt:{thread['python_time']})" if thread["db"] else ""
+    node = parent.add(f"{tag} {thread['name']}{request}{where}", expand=not thread["idle"])
+    # frames already innermost-first -- see probes.stacks_by_activity
+    for frame in thread["frames"]:
         node.add_leaf(f"{_short(frame['file'], workdir)}:{frame['line']} in {frame['func']}")

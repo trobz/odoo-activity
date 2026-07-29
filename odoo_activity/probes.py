@@ -849,7 +849,19 @@ def signal_process(pid: str, sig: int, host: Host = LOCAL) -> None:
 # Matches Odoo's standard log header for SIGQUIT dumps to extract worker PIDs:
 # "<date> <time> <pid> <level> <db> odoo.tools.misc: "
 _DUMP_HEADER_RE = re.compile(r"^\S+ \S+ (?P<pid>\d+) \S+ \S+ odoo\.tools\.misc:[ \t]*$", re.MULTILINE)
-_THREAD_RE = re.compile(r"^# Thread: (?P<name>.*)$", re.MULTILINE)
+# Odoo's dumpstacks() (odoo/tools/misc.py) emits this shape for every thread,
+# request or not — db/uid/url/qc/qt/pt are "n/a" when the thread isn't
+# mid-request. qt = query_time (SQL time so far); pt = python_time, Odoo's
+# own name for wall-clock-since-request-start minus qt (time spent outside
+# the DB) — not a running total SIGQUIT accumulates, just what's true at
+# this one signal. db/uid/url predate qc/qt/pt, which only exist from Odoo
+# 17+; that trailing group is optional so pre-17 dumps still parse, just
+# without query-count/time context.
+_THREAD_RE = re.compile(
+    r"^# Thread: (?P<name>.*?) \(db:(?P<db>[^)]*)\) \(uid:(?P<uid>[^)]*)\) \(url:(?P<url>[^)]*)\)"
+    r"(?: \(qc:(?P<qc>\S*) qt:(?P<qt>\S*) pt:(?P<pt>\S*)\))?$",
+    re.MULTILINE,
+)
 _FRAME_RE = re.compile(r'^File: "(?P<file>[^"]*)", line (?P<line>\d+), in (?P<func>\S+)$', re.MULTILINE)
 
 # Innermost frame functions that indicate an idle thread (event loops, waits,
@@ -893,6 +905,12 @@ class Worker(TypedDict):
 
 class Thread(TypedDict):
     name: str
+    db: str | None
+    uid: str | None
+    url: str | None
+    query_count: int | None
+    query_time: float | None
+    python_time: float | None
     frames: list[Frame]
     idle: bool
 
@@ -905,10 +923,13 @@ class Frame(TypedDict):
 
 def parse_stack_dump(text: str) -> list[Worker]:
     """A slice of log text containing one or more SIGQUIT dumps into
-    `[{"pid": ..., "threads": [{"name", "frames", "idle"}, ...]}, ...]`.
+    `[{"pid": ..., "threads": [Thread, ...]}, ...]`.
 
-    `frames` is outermost-first (as printed); a thread is `idle` iff its
-    *innermost* (last) frame's function is in `_IDLE_FRAME_FUNCS`.
+    Each `Thread` carries its request context (`db`/`uid`/`url`/`query_count`/
+    `query_time`/`python_time`) when Odoo attached one — see `Thread` and the
+    `_THREAD_RE` comment for what `query_time`/`python_time` mean. `frames` is
+    outermost-first (as printed); a thread is `idle` iff its *innermost*
+    (last) frame's function is in `_IDLE_FRAME_FUNCS`.
     """
     markers = list(_DUMP_HEADER_RE.finditer(text))
     workers: list[Worker] = []
@@ -934,9 +955,39 @@ def _parse_threads(block_text: str) -> list[Thread]:
             frames[-1]["func"] in _IDLE_FRAME_FUNCS
             or any(marker in frames[-1]["file"] for marker in _IDLE_FRAME_PATH_MARKERS)
         )
-        threads.append({"name": m["name"].strip(), "frames": frames, "idle": idle})
+        threads.append({
+            "name": m["name"].strip(),
+            "db": _na(m["db"]),
+            "uid": _na(m["uid"]),
+            "url": _na(m["url"]),
+            "query_count": _opt_int(m["qc"]),
+            "query_time": _opt_float(m["qt"]),
+            "python_time": _opt_float(m["pt"]),
+            "frames": frames,
+            "idle": idle,
+        })
 
     return threads
+
+
+def _na(value: str | None) -> str | None:
+    """Odoo prints "n/a" for a thread attribute that isn't set (not
+    mid-request); normalize that to None. `value` is also None outright on
+    pre-17 dumps, where `_THREAD_RE`'s qc/qt/pt group didn't match at all."""
+    return None if value in (None, "n/a") else value
+
+
+def _opt_int(value: str | None) -> int | None:
+    return int(value) if value is not None and value.isdigit() else None
+
+
+def _opt_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _read_new_bytes(proc: subprocess.Popen) -> bytes:
@@ -945,6 +996,24 @@ def _read_new_bytes(proc: subprocess.Popen) -> bytes:
     if proc.stdout is None or not select.select([proc.stdout], [], [], 0)[0]:
         return b""
     return os.read(proc.stdout.fileno(), 65536)
+
+
+def stacks_by_activity(workers: list[Worker]) -> list[Worker]:
+    """`workers` reordered busy-first for display: workers by busy-thread
+    count descending, threads within each busy-before-idle, and each
+    thread's `frames` reversed to innermost-first -- py-spy's order, so the
+    concerning frame is the one a reader (human or agent) sees first rather
+    than last."""
+    by_busy = sorted(workers, key=lambda w: sum(not t["idle"] for t in w["threads"]), reverse=True)
+    return [
+        {
+            **w,
+            "threads": [
+                {**t, "frames": list(reversed(t["frames"]))} for t in sorted(w["threads"], key=lambda t: t["idle"])
+            ],
+        }
+        for w in by_busy
+    ]
 
 
 def dump_and_parse_stacks(inst: Instance, host: Host = LOCAL) -> tuple[str, list[Worker]]:
