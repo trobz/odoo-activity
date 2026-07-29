@@ -2,8 +2,10 @@
 
 POC. Every tool is a thin wrapper over :mod:`odoo_activity.probes` — no
 logic lives here (see that module for the actual system probes, shared with
-the TUI). The server itself always runs locally; each tool takes the host to
-probe, so one server answers for this box and any ssh target.
+the TUI). The server itself always runs locally. `oa-mcp [host]` pins every
+tool call to that one target (local if omitted) -- the counterpart to `oa
+[host]`. `oa-mcp-multi` instead leaves the target per-call, gated by
+--host-filter.
 """
 
 from __future__ import annotations
@@ -25,11 +27,15 @@ app = typer.Typer(add_completion=False)
 app_multi = typer.Typer(add_completion=False)
 
 
-# oa-mcp and oa-mcp-multi are "normal vs risky" split is just whether
-# --host-filter is passed at launch, not separate code paths.
+# oa-mcp and oa-mcp-multi are "pinned vs multi" -- oa-mcp locks every tool
+# to whatever host it was launched against (_pinned_target set), the
+# counterpart to `oa host`; oa-mcp-multi leaves _pinned_target unset and
+# gates per-call host with --host-filter instead.
 _DEFAULT_HOST_FILE = Path.home() / ".ssh" / "config"
+_WILDCARD = re.compile(r"[*?]")
 _host_filter: re.Pattern[str] | None = None
 _host_file: Path = _DEFAULT_HOST_FILE
+_pinned_target: Host | None = None
 
 
 def _allowed(alias: str | None) -> bool:
@@ -46,7 +52,15 @@ def _check_host(alias: str | None) -> None:
         raise ValueError(msg)
 
 
-_WILDCARD = re.compile(r"[*?]")
+def _resolve_host(host: str | None, ssh_port: int | None) -> Host:
+    if _pinned_target is not None:
+        if host is not None and host != _pinned_target.alias:
+            msg = f"host {host!r} rejected: this server is pinned to {_pinned_target.alias!r}"
+            raise ValueError(msg)
+        return _pinned_target
+
+    _check_host(host)
+    return Host(alias=host, port=ssh_port)
 
 
 def _ssh_config_aliases(path: Path) -> list[str]:
@@ -100,8 +114,7 @@ def list_instances(host: str | None = None, ssh_port: int | None = None) -> list
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
     """
-    _check_host(host)
-    target = Host(alias=host, port=ssh_port)
+    target = _resolve_host(host, ssh_port)
     return [_with_status(inst, target) for inst in _instances(target)]
 
 
@@ -116,8 +129,7 @@ def get_instance(name: str, host: str | None = None, ssh_port: int | None = None
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
     """
-    _check_host(host)
-    target = Host(alias=host, port=ssh_port)
+    target = _resolve_host(host, ssh_port)
     inst = next((i for i in _instances(target) if i["name"] == name), None)
     return _with_status(inst, target) if inst else None
 
@@ -133,8 +145,7 @@ def list_processes(name: str, host: str | None = None, ssh_port: int | None = No
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
     """
-    _check_host(host)
-    target = Host(alias=host, port=ssh_port)
+    target = _resolve_host(host, ssh_port)
     inst = next((i for i in _instances(target) if i["name"] == name), None)
     return probes.procs_of(inst, target) if inst else []
 
@@ -144,42 +155,49 @@ def list_hosts() -> list[str]:
     """Host aliases available for the `host` argument of the other tools:
     literal `Host` entries from --host-file (default ~/.ssh/config, wildcard
     and negated patterns skipped), narrowed by --host-filter."""
+    if _pinned_target is not None:
+        return [_pinned_target.alias] if _pinned_target.alias else []
+
     return [alias for alias in _ssh_config_aliases(_host_file) if _allowed(alias)]
 
 
-@app.callback(invoke_without_command=True)
+@app.command()
 def main(
+    host: str | None = typer.Argument(
+        None, help="[user@]host to pin this server to, e.g. openerp@demo. Omit for local."
+    ),
+    port: int | None = typer.Option(None, "--port", "-p", help="ssh port, for a non-default one."),
     transport: Literal["stdio", "streamable-http"] = typer.Option(
         "stdio", "--transport", help="stdio (spawned by the client) or streamable-http (network server)"
     ),
-    host: str = typer.Option("127.0.0.1", "--host", help="streamable-http only"),
-    port: int = typer.Option(8000, "--port", help="streamable-http only"),
+    bind_host: str = typer.Option("127.0.0.1", "--bind-host", help="streamable-http only"),
+    bind_port: int = typer.Option(8000, "--bind-port", help="streamable-http only"),
 ) -> None:
-    """oa-mcp — MCP server exposing odoo-activity's read-only capacities.
+    """oa-mcp — MCP server exposing odoo-activity's read-only capacities,
+    pinned to a single host: the counterpart to `oa host`, so a human on
+    `oa host` and their agent on `oa-mcp host` are always looking at the
+    same target. Omit `host` to pin to local, matching bare `oa`."""
+    global _pinned_target
+    _pinned_target = Host(alias=host, port=port)
 
-    Single-host, every tool still takes its own `host` per call, unrestricted."""
     if transport == "streamable-http":
-        mcp.settings.host = host
-        mcp.settings.port = port
+        mcp.settings.host = bind_host
+        mcp.settings.port = bind_port
 
     mcp.run(transport=transport)
 
 
 @app_multi.callback(invoke_without_command=True)
 def main_multi(
-    transport: Annotated[
-        Literal["stdio", "streamable-http"],
-        typer.Option("--transport", help="stdio (spawned by the client) or streamable-http (network server)"),
-    ] = "stdio",
-    host: Annotated[str, typer.Option("--host", help="streamable-http only")] = "127.0.0.1",
-    port: Annotated[int, typer.Option("--port", help="streamable-http only")] = 8000,
-    host_filter: Annotated[
-        str | None,
-        typer.Option(
-            "--host-filter",
-            help="regex (odoo dbfilter-style); only ssh targets it fullmatches are reachable. Unset: no restriction.",
-        ),
-    ] = None,
+    transport: Literal["stdio", "streamable-http"] = typer.Option(
+        "stdio", "--transport", help="stdio (spawned by the client) or streamable-http (network server)"
+    ),
+    bind_host: str = typer.Option("127.0.0.1", "--bind-host", help="streamable-http only"),
+    bind_port: int = typer.Option(8000, "--bind-port", help="streamable-http only"),
+    host_filter: str = typer.Option(
+        "--host-filter",
+        help="regex (odoo dbfilter-style); only ssh targets it fullmatches are reachable. Unset: no restriction.",
+    ),
     host_file: Annotated[
         Path,
         typer.Option("--host-file", help="ssh config to read literal Host aliases from, for list_hosts()."),
@@ -188,8 +206,8 @@ def main_multi(
     """oa-mcp-multi — same tools as oa-mcp, capped by --host-filter."""
     global _host_filter, _host_file
     if transport == "streamable-http":
-        mcp.settings.host = host
-        mcp.settings.port = port
+        mcp.settings.host = bind_host
+        mcp.settings.port = bind_port
 
     _host_filter = re.compile(host_filter) if host_filter else None
     _host_file = host_file
