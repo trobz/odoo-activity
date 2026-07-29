@@ -21,6 +21,7 @@ Repository = "https://github.com/trobz/odoo-activity"
 odoo-activity = "odoo_activity.main:app"
 oa = "odoo_activity.main:app"
 oa-mcp = "odoo_activity.mcp_server:app"
+oa-mcp-multi = "odoo_activity.mcp_server:app_multi"
 
 [dependency-groups]
 dev = [

@@ -1,8 +1,9 @@
 # odoo-activity
 
-A terminal UI for local Odoo instances. One screen: host cpu/mem/uptime, every
-Odoo instance (`systemd --user` or `supervisor`) with its databases nested
-underneath, and a detail pane for process/log/db inspection.
+A terminal UI for Odoo instances, on this machine or on a remote host over
+ssh. One screen: host cpu/mem/uptime, every Odoo instance (`systemd --user`
+or `supervisor`) with its databases nested underneath, and a detail pane for
+process/log/db inspection.
 
 ## Installation
 
@@ -13,7 +14,9 @@ uv tool install odoo-activity
 ## Usage
 
 ```bash
-odoo-activity  # or: oa
+odoo-activity                    # or: oa — this machine
+oa openerp@somehost              # a remote host over ssh
+oa openerp@somehost -p 10113     # ...on a non-default ssh port
 ```
 
 Discovers Odoo instances under `systemd --user`, `supervisor`, and odoo.sh
@@ -35,7 +38,36 @@ one supports.
 | `D` | dump stacks of all workers, then jump to Logs (Processes tab) |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
 | `/` | search (Logs and Config tabs) |
+| `R` | refresh the active tab now |
 | `q` | quit |
+
+### Remote hosts
+
+The target is any ssh destination — `[user@]host` or a `~/.ssh/config`
+alias. Only the tools already required locally are needed, but on the
+remote host. Connections are multiplexed, so the first call opens the
+session and the rest reuse it.
+
+Everything still refreshes on its own against a remote host, just on a
+slower tick — host stats and Processes every 5s, the instance list every
+15s. `R` refreshes the active tab immediately, plus the instance list and
+the highlighted instance's databases.
+
+## MCP server
+
+`oa-mcp [host]` exposes the same read-only data as an MCP server, for an
+agent to work an investigation alongside a human on `oa [host]` — both
+looking at the same target. Every tool call is pinned to `host` (local if
+omitted); a `host`/`ssh_port` argument on a tool call must match the pin
+or is rejected.
+
+`oa-mcp-multi` instead leaves the target per-call, capped by
+`--host-filter` (an odoo dbfilter-style regex; unset means unrestricted)
+and `--host-file` (which `~/.ssh/config`-style file reads aliases from).
+
+Both default to the `stdio` transport (spawned by the MCP client); add
+`--transport streamable-http --bind-host ... --bind-port ...` to run as a
+network server instead.
 
 ## Managers
 
@@ -68,11 +100,15 @@ its name).
 
 ```
 odoo_activity/
+├── host.py           # local vs ssh command dispatch
 ├── probes.py         # all system data: no Textual import
 ├── panes/detail.py   # ActivityPane: the one stateful rendering widget
 └── tui.py            # app shell: layout, list, timers, actions
 ```
 
+- **`host.py`** — a `Host` is this machine or an ssh destination. Every probe
+  takes one and runs the same way against either, so nothing above this
+  layer knows whether it is local or remote.
 - **`probes.py`** — pure functions, no UI. Every `systemctl`/`supervisorctl`/
   `ps`/`psql` call and `/proc` read lives here, returning plain dicts/lists
   so it's testable without spinning up a screen. An instance's databases,

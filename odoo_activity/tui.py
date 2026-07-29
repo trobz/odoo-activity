@@ -8,8 +8,9 @@ the mode-switched instance-mode and db-mode tabs are in
 
 from __future__ import annotations
 
-import asyncio
+import logging
 import signal
+import time
 from typing import ClassVar
 
 from textual import events, work
@@ -19,6 +20,7 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 
+from odoo_activity.host import Host, to_thread
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
     Instance,
@@ -30,15 +32,19 @@ from odoo_activity.probes import (
     instance_workdir,
     list_instances,
     read_cpu_times,
-    read_loadavg,
-    read_mem,
-    read_uptime,
+    read_host_stats,
     signal_process,
 )
 
 # sort priority for the instances list: running first, then a failure state
 # (systemd "failed", supervisor "exited"/"fatal"), then a clean "stopped"
 _STATUS_ORDER = {"running": 0, "stopped": 2}
+
+# --debug (see main.py) points this at a file. Silent (NullHandler-equivalent,
+# nothing configured) otherwise, so normal runs pay nothing for this.
+_log = logging.getLogger("odoo_activity")
+
+_LAG_INTERVAL = 0.25  # how often the watchdog below ticks
 
 # Trobz brand palette (see trobz brand-guidelines skill)
 TROBZ_THEME = Theme(
@@ -162,7 +168,12 @@ class OdooActivity(App):
         ("D", "dumpstacks", "Dump stacks"),
         ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
         ("f", "toggle_maximize", "Maximize"),
+        ("R", "refresh", "Refresh"),
     ]
+
+    def __init__(self, host: Host | None = None) -> None:
+        super().__init__()
+        self.host = host or Host()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="body"):
@@ -199,22 +210,49 @@ class OdooActivity(App):
 
         self.query_one("#instances", ListView).border_title = "Instances"
 
-        self._cpu = read_cpu_times()
+        # cheap synchronous seed -- instant locally; for a remote host the
+        # real numbers land on the first refresh_host tick (see below),
+        # this just avoids blocking the app's first paint on an ssh call
+        self._cpu = read_cpu_times() if self.host.is_local else (0, 0)
         self._instances: dict[str, Instance] = {}
         self._instance_status: dict[str, str] = {}
         self._row_owner: dict[str, str] = {}  # row key -> owning instance key
         self._row_db: dict[str, str] = {}  # db row key -> db name
+        self._db_cache: dict[str, tuple[list[str], str | None]] = {}  # instance key -> its (dbs, port)
         self._shown_key: str | None = None  # highlighted row driving the activity pane
         self._pulse_on = True
+        self._instances_ready = False  # first _rebuild_instances has finished mounting rows
 
+        # spinner over the initial (possibly slow, over ssh) discovery only --
+        # _rebuild_instances clears this once it lands and focuses the list
+        # (a loading widget can't take focus -- see Widget._check_disabled);
+        # membership-change rebuilds later never set loading, so they don't
+        # blank already-shown rows or steal focus back
+        self.query_one("#instances", ListView).loading = True
         self.refresh_instances()
 
-        self.query_one("#instances", ListView).focus()
-
-        self.set_interval(1.0, self.refresh_host)
+        # also paces the Processes tab, which rides this tick (ActivityPane.tick)
+        self.set_interval(1.0 if self.host.is_local else 5.0, self.refresh_host)
         self.set_interval(0.5, self.query_one(ActivityPane).poll)
-        self.set_interval(5.0, self.poll_instances)
+        # slower remotely (a tick is one ssh round trip per instance), but not
+        # off: an externally started/stopped instance has to show up on its own
+        self.set_interval(5.0 if self.host.is_local else 15.0, self.poll_instances)
         self.set_interval(0.7, self._pulse_running)
+
+        self._lag_tick = time.monotonic()
+        self.set_interval(_LAG_INTERVAL, self._check_loop_lag)
+
+    def _check_loop_lag(self) -> None:
+        """Diagnostic-only: a `set_interval` timer fires late by exactly how
+        long *something else* held the event loop synchronously in the
+        meantime (a blocking widget mutation, a call that should've been
+        `to_thread`d but wasn't) -- this is what makes keypresses feel
+        dropped/delayed. Logs nothing unless --debug wired up a handler."""
+        now = time.monotonic()
+        drift = now - self._lag_tick - _LAG_INTERVAL
+        self._lag_tick = now
+        if drift > 0.05:
+            _log.warning("event loop lag: %.0fms", drift * 1000)
 
     def on_show(self) -> None:
         """Run after layout is complete and app is shown."""
@@ -229,13 +267,28 @@ class OdooActivity(App):
             return 24
 
     def refresh_host(self) -> None:
-        total, idle = read_cpu_times()
+        self._refresh_host()
+
+    @work(exclusive=True, group="host-stats")
+    async def _refresh_host(self) -> None:
+        # local reads are a handful of /proc opens (microseconds) -- only
+        # the remote branch needs a thread, so the once-a-second tick isn't
+        # queuing on Python's shared, bounded to_thread executor for nothing
+        stats = read_host_stats(self.host) if self.host.is_local else await to_thread(read_host_stats, self.host)
+        if stats is None:
+            return  # a bad remote round trip -- try again next tick, not fatal
+
+        if not self.is_running:
+            # this tick's worker got scheduled before quit/teardown started
+            # and only ran after -- the widgets below are already gone
+            return
+
+        (total, idle), (mem_pct, swap_pct), (load1, load5, load15), uptime = stats
         d_total = total - self._cpu[0]
         d_idle = idle - self._cpu[1]
         self._cpu = (total, idle)
 
         cpu_pct = (1 - d_idle / d_total) * 100 if d_total else 0.0
-        mem_pct, swap_pct = read_mem()
 
         self.query_one("#cpu-pct", Static).update(f"{cpu_pct:4.1f}%")
         self.query_one("#cpu-bar", Static).update(_bar(cpu_pct, self._get_bar_width("cpu-panel")))
@@ -246,9 +299,8 @@ class OdooActivity(App):
             _bar(swap_pct, self._get_bar_width("swap-panel"), red_at=10, yellow_at=1)
         )
 
-        load1, load5, load15 = read_loadavg()
         self.query_one("#uptime-text", Static).update(
-            f"uptime     {format_duration(read_uptime())}\nload avg   {load1:.2f} {load5:.2f} {load15:.2f}"
+            f"uptime     {format_duration(uptime)}\nload avg   {load1:.2f} {load5:.2f} {load15:.2f}"
         )
 
         self.query_one(ActivityPane).tick()
@@ -260,16 +312,17 @@ class OdooActivity(App):
     @work(exclusive=True, group="instances")
     async def _rebuild_instances(self) -> None:
         lv = self.query_one("#instances", ListView)
+        first_load = not self._instances_ready
         keep = lv.highlighted_child.name if lv.highlighted_child else None
         await lv.clear()
 
-        fresh_list = await asyncio.to_thread(list_instances)
+        fresh_list = await to_thread(list_instances, self.host)
 
         # key by manager:name — the same name can exist under both managers
         statuses = {}
         for inst in fresh_list:
             key = f"{inst['manager']}:{inst['name']}"
-            statuses[key] = await asyncio.to_thread(instance_status, inst)
+            statuses[key] = await to_thread(instance_status, inst, self.host)
 
         # running first, then a failure state, then a clean stop
         fresh_list.sort(key=lambda inst: _STATUS_ORDER.get(statuses[f"{inst['manager']}:{inst['name']}"], 1))
@@ -288,22 +341,83 @@ class OdooActivity(App):
             items.append(ListItem(Label(self._render_instance_row(inst, statuses[key])), name=key))
             keys.append(key)
 
-            # every instance's dbs are shown nested under it, not just the
-            # highlighted one, so this fetches them all upfront
-            names, port = await asyncio.to_thread(databases_of, inst)
-            for db in names:
-                db_key = f"{key}::db::{db}"
-                self._row_owner[db_key] = key
-                self._row_db[db_key] = db
-                label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}"
-                items.append(ListItem(Label(label), name=db_key))
-                keys.append(db_key)
+            # only replayed from cache here — an uncached instance's dbs are
+            # fetched when its row is highlighted (see _load_databases)
+            for item in self._db_items(key, name_width, uptime_width):
+                items.append(item)
+                keys.append(item.name or "")
 
         if items:
             # await the mounts, else setting index races the append and the
             # highlight bar lands on nothing
             await lv.extend(items)
             lv.index = keys.index(keep) if keep in keys else 0
+
+        self._instances_ready = True
+        lv.loading = False
+        if first_load:
+            # a loading widget can't take focus (Widget._check_disabled), so
+            # the on_mount focus() call landed while this was still disabled
+            lv.focus()
+        self._load_databases(self._highlighted_owner())
+
+    def _db_items(self, key: str, name_width: int, uptime_width: int) -> list[ListItem]:
+        """`key`'s db rows, built off `_db_cache` and registering their row
+        mapping. Empty until that instance's dbs have actually been fetched."""
+        cached = self._db_cache.get(key)
+        if cached is None:
+            return []
+
+        names, port = cached
+        items = []
+
+        for db in names:
+            db_key = f"{key}::db::{db}"
+            self._row_owner[db_key] = key
+            self._row_db[db_key] = db
+            label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}"
+            items.append(ListItem(Label(label), name=db_key))
+
+        return items
+
+    def _highlighted_owner(self) -> str | None:
+        item = self.query_one("#instances", ListView).highlighted_child
+        return self._row_owner.get(item.name) if item is not None and item.name else None
+
+    @work(exclusive=True, group="databases")
+    async def _load_databases(self, key: str | None) -> None:
+        """Fetch one instance's dbs and mount them under its row.
+
+        On highlight, not for every instance up front: `databases_of` is ~3-4
+        ssh round trips each, and the list is cleared before the rebuild, so
+        remotely the pane stayed empty for the sum of all of them. `exclusive`
+        means arrowing fast only fetches what you land on.
+        """
+        if key is None or key in self._db_cache:
+            return
+
+        inst = self._instances.get(key)
+        if inst is None:
+            return
+
+        self._db_cache[key] = await to_thread(databases_of, inst, self.host)
+        await self._mount_databases(key)
+
+    async def _mount_databases(self, key: str) -> None:
+        """Replace `key`'s db rows in place with what `_db_cache` now holds."""
+        lv = self.query_one("#instances", ListView)
+        rows = [(i, item.name or "") for i, item in enumerate(lv.children)]
+
+        row = next((i for i, name in rows if name == key), None)
+        if row is None:
+            return  # rebuilt out from under the fetch; the rebuild replays the cache itself
+
+        stale = [i for i, name in rows if name != key and self._row_owner.get(name) == key]
+        if stale:
+            await lv.remove_items(stale)
+            row -= sum(1 for i in stale if i < row)
+
+        await lv.insert(row + 1, self._db_items(key, self._name_width(), self._uptime_width()))
 
     def _name_width(self) -> int:
         """Name column width, sized to the longest instance currently shown
@@ -357,12 +471,22 @@ class OdooActivity(App):
         Rebuilds the list only when the set of instances changes — otherwise it
         just re-labels, leaving selection, the db rows and the log/top views
         untouched.
+
+        A no-op until the first `_rebuild_instances` has finished: it shares
+        this worker's exclusive group, so firing before that finishes would
+        cancel it mid-build (before anything ever mounts) and immediately
+        re-trigger another rebuild that's just as likely to run past this
+        timer's own next tick — a livelock, most visible over a slow ssh
+        round trip where the initial build can genuinely take longer than
+        the 5s interval.
         """
+        if not self._instances_ready:
+            return
         self._poll_instances()
 
     @work(exclusive=True, group="instances")
     async def _poll_instances(self) -> None:
-        fresh_list = await asyncio.to_thread(list_instances)
+        fresh_list = await to_thread(list_instances, self.host)
         fresh = {f"{i['manager']}:{i['name']}": i for i in fresh_list}
         if set(fresh) != set(self._instances):
             self.refresh_instances()
@@ -372,7 +496,7 @@ class OdooActivity(App):
         for item in self.query_one("#instances", ListView).children:
             inst = fresh.get(item.name or "")
             if inst is not None:
-                self._instance_status[item.name or ""] = await asyncio.to_thread(instance_status, inst)
+                self._instance_status[item.name or ""] = await to_thread(instance_status, inst, self.host)
 
     def current_instance(self) -> Instance | None:
         item = self.query_one("#instances", ListView).highlighted_child
@@ -401,6 +525,7 @@ class OdooActivity(App):
 
         if key != self._shown_key:
             self._shown_key = key
+            self._load_databases(self._row_owner.get(key) if key else None)
             hit = self.highlighted_db()
 
             if hit is not None:
@@ -415,6 +540,16 @@ class OdooActivity(App):
         # start/stop/restart only make sense on the instances pane, so their
         # footer entries appear/disappear as focus moves (see check_action)
         self.refresh_bindings()
+
+    async def on_event(self, event: events.Event) -> None:
+        # Logged here, not in on_key: keys bubble up from the focused widget
+        # and Input.stop()s every printable one, so on_key can't see typing at
+        # all. Count these against the acsearch value length to tell a key
+        # that never arrived from one the app dropped.
+        if isinstance(event, events.Key) and not event.is_forwarded:
+            _log.debug("key %r focused=%r", event.key, self.focused)
+
+        await super().on_event(event)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         # False hides the footer key entirely (None just dims it — Textual's
@@ -497,9 +632,17 @@ class OdooActivity(App):
             return
 
         name, manager = inst["name"], inst["manager"]
-        error = await asyncio.to_thread(instance_action, name, action, manager)
+
+        # a remote systemctl takes seconds and nothing changes on screen until
+        # the re-label below, so the confirmation reads as not having registered
+        self.app.notify(f"{action} {name}…", timeout=2)
+
+        error = await to_thread(instance_action, name, action, manager, self.host)
         if error:
             self.app.notify(error, severity="warning", timeout=3)
+        else:
+            self.app.notify(f"{action} {name}: done", timeout=2)
+
         self.poll_instances()  # re-label in place; keeps selection, no flicker
 
     def action_kill_process(self) -> None:
@@ -507,13 +650,13 @@ class OdooActivity(App):
         if proc is None or proc.get("kind") == "pg":
             return
 
-        def on_confirm(confirmed: bool | None) -> None:
+        async def on_confirm(confirmed: bool | None) -> None:
             if confirmed:
-                signal_process(proc["pid"], signal.SIGKILL)
+                await to_thread(signal_process, proc["pid"], signal.SIGKILL, self.host)
 
         self.push_screen(ConfirmScreen(f"Kill PID {proc['pid']}?"), on_confirm)
 
-    def action_quit_process(self) -> None:
+    async def action_quit_process(self) -> None:
         """Send SIGQUIT (kill -3) — the process dumps a traceback to its
         logfile — then jump to Stacks (the last dump's parsed view; raw text
         is still one tab over, on Logs).
@@ -524,11 +667,25 @@ class OdooActivity(App):
         if proc is None or proc.get("kind") == "pg":
             return
 
-        signal_process(proc["pid"], signal.SIGQUIT)
+        await to_thread(signal_process, proc["pid"], signal.SIGQUIT, self.host)
         self.query_one(ActivityPane).select_tab_by_name("Stacks")
 
     def action_toggle_config_mode(self) -> None:
         self.query_one(ActivityPane).toggle_config_mode()
+
+    def action_refresh(self) -> None:
+        """Refresh the active tab now, rather than waiting out its timer.
+
+        Remotely it also re-polls the instance list, on a slower tick there,
+        and refetches the highlighted instance's dbs, which are cached until
+        asked."""
+        if not self.host.is_local:
+            self.poll_instances()
+            key = self._highlighted_owner()
+            self._db_cache.pop(key or "", None)
+            self._load_databases(key)
+
+        self.query_one(ActivityPane).refresh_active()
 
     def action_dumpstacks(self) -> None:
         inst = self.current_instance()
@@ -542,12 +699,13 @@ class OdooActivity(App):
         """Trigger a stack dump, parse it into the Stacks tab (the point:
         surfacing what's actually long-running without the user having to
         guess which worker first), then jump there."""
-        error, workers = await asyncio.to_thread(dump_and_parse_stacks, inst)
+        error, workers = await to_thread(dump_and_parse_stacks, inst, self.host)
         activity = self.query_one(ActivityPane)
 
+        workdir = await to_thread(instance_workdir, inst, self.host)
         if error:
             self.app.notify(error, timeout=3)
-        elif not activity.render_stacks(inst, workers, instance_workdir(inst)):
+        elif not activity.render_stacks(inst, workers, workdir):
             self.app.notify("dump ok — nothing long-running", timeout=3)
         activity.select_tab_by_name("Stacks")
 

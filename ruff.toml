@@ -45,6 +45,8 @@ extend-safe-fixes = ["UP008"]
 "tests/*" = ["S101"]
 # fixed-argv calls to systemctl/supervisorctl/ps/psql/odoo-db, not untrusted input
 "odoo_activity/probes.py" = ["S603", "S607"]
+# dispatches argv built by probes.py's own fixed-argv calls (see above), plus `ssh`
+"odoo_activity/host.py" = ["S603", "S607"]
 
 [format]
 preview = true
