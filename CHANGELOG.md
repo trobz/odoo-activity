@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.9.0 (2026-07-29)
+
+### Bug Fixes
+
+- **tui**: Show request context in stack-dump thread display
+  ([`3d98012`](https://github.com/trobz/odoo-activity/commit/3d98012ca38c86008a5bd515d82686df9c410801))
+
+### Features
+
+- **mcp**: Add read-only diagnostic tools
+  ([`093caad`](https://github.com/trobz/odoo-activity/commit/093caada2e38f84b1ee8d1e872cb199989f252ab))
+
+
 ## v0.8.0 (2026-07-29)
 
 ### Bug Fixes
