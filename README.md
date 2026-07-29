@@ -53,6 +53,22 @@ slower tick — host stats and Processes every 5s, the instance list every
 15s. `R` refreshes the active tab immediately, plus the instance list and
 the highlighted instance's databases.
 
+## MCP server
+
+`oa-mcp [host]` exposes the same read-only data as an MCP server, for an
+agent to work an investigation alongside a human on `oa [host]` — both
+looking at the same target. Every tool call is pinned to `host` (local if
+omitted); a `host`/`ssh_port` argument on a tool call must match the pin
+or is rejected.
+
+`oa-mcp-multi` instead leaves the target per-call, capped by
+`--host-filter` (an odoo dbfilter-style regex; unset means unrestricted)
+and `--host-file` (which `~/.ssh/config`-style file reads aliases from).
+
+Both default to the `stdio` transport (spawned by the MCP client); add
+`--transport streamable-http --bind-host ... --bind-port ...` to run as a
+network server instead.
+
 ## Managers
 
 An instance's `manager` — `systemd`, `supervisor`, or `odoosh` — is
