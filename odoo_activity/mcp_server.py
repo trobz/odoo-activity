@@ -10,17 +10,21 @@ tool call to that one target (local if omitted) -- the counterpart to `oa
 
 from __future__ import annotations
 
+import functools
+import inspect
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Annotated, Literal
 
 import typer
 from mcp.server.fastmcp import FastMCP
+from typing_extensions import TypedDict
 
 from odoo_activity import probes
 from odoo_activity.host import Host
-from odoo_activity.probes import Instance, ProcRow
+from odoo_activity.probes import Instance, ProcRow, Worker
 
 mcp = FastMCP("odoo-activity")
 app = typer.Typer(add_completion=False)
@@ -63,6 +67,25 @@ def _resolve_host(host: str | None, ssh_port: int | None) -> Host:
     return Host(alias=host, port=ssh_port)
 
 
+def _pinned_host(fn):
+    """Resolve host/ssh_port into `target` for `fn`. `fn` takes `target: Host`
+    keyword-only; rebuilds the public signature so FastMCP's schema still shows
+    host/ssh_port."""
+    sig = inspect.signature(fn, eval_str=True)
+    params = [p for name, p in sig.parameters.items() if name != "target"]
+    params += [
+        inspect.Parameter("host", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=str | None),
+        inspect.Parameter("ssh_port", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=int | None),
+    ]
+
+    @functools.wraps(fn)
+    def wrapper(*args, host=None, ssh_port=None, **kwargs):
+        return fn(*args, target=_resolve_host(host, ssh_port), **kwargs)
+
+    setattr(wrapper, "__signature__", sig.replace(parameters=params))  # noqa: B010
+    return wrapper
+
+
 def _ssh_config_aliases(path: Path) -> list[str]:
     """Literal (non-wildcard, non-negated) aliases from `Host` entries in an
     ssh config file. No `Include` following -- point --host-file at the
@@ -79,6 +102,31 @@ def _ssh_config_aliases(path: Path) -> list[str]:
         aliases.extend(p for p in parts[1:] if not p.startswith("!") and not _WILDCARD.search(p))
 
     return aliases
+
+
+class HostStats(TypedDict):
+    mem_pct: float
+    swap_pct: float
+    load_avg: tuple[float, float, float]
+    uptime: float
+
+
+class InstanceDatabases(TypedDict):
+    databases: list[str]
+    db_port: str | None
+
+
+class InstanceProcesses(TypedDict):
+    odoo: list[ProcRow]
+    postgres: list[ProcRow]
+
+
+class StackDump(TypedDict):
+    error: str
+    workers: list[Worker]
+
+
+DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks"]
 
 
 # Discovery is 8 ssh round trips (~620ms remote) behind every tool. Only the
@@ -103,8 +151,15 @@ def _with_status(inst: Instance, host: Host) -> Instance:
     return {**inst, "status": probes.instance_status(inst, host)}
 
 
+def _find(name: str, host: Host) -> Instance | None:
+    """The instance named `name` on `host`, or None — the lookup every
+    per-instance tool below starts with."""
+    return next((i for i in _instances(host) if i["name"] == name), None)
+
+
 @mcp.tool()
-def list_instances(host: str | None = None, ssh_port: int | None = None) -> list[Instance]:
+@_pinned_host
+def list_instances(*, target: Host) -> list[Instance]:
     """Every Odoo instance on `host` (systemd --user, supervisor, odoo.sh),
     with each instance's status corrected for a live process behind an
     ambiguous manager-reported "stopped".
@@ -114,12 +169,12 @@ def list_instances(host: str | None = None, ssh_port: int | None = None) -> list
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
     """
-    target = _resolve_host(host, ssh_port)
     return [_with_status(inst, target) for inst in _instances(target)]
 
 
 @mcp.tool()
-def get_instance(name: str, host: str | None = None, ssh_port: int | None = None) -> Instance | None:
+@_pinned_host
+def get_instance(name: str, *, target: Host) -> Instance | None:
     """A single instance by name (as reported by `list_instances`), or None
     if no instance with that name is currently known.
 
@@ -129,13 +184,13 @@ def get_instance(name: str, host: str | None = None, ssh_port: int | None = None
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
     """
-    target = _resolve_host(host, ssh_port)
-    inst = next((i for i in _instances(target) if i["name"] == name), None)
+    inst = _find(name, target)
     return _with_status(inst, target) if inst else None
 
 
 @mcp.tool()
-def list_processes(name: str, host: str | None = None, ssh_port: int | None = None) -> list[ProcRow]:
+@_pinned_host
+def list_processes(name: str, *, target: Host) -> list[ProcRow]:
     """The instance's master process plus every descendant worker, or an
     empty list if the instance isn't found or has no live process.
 
@@ -145,8 +200,7 @@ def list_processes(name: str, host: str | None = None, ssh_port: int | None = No
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
     """
-    target = _resolve_host(host, ssh_port)
-    inst = next((i for i in _instances(target) if i["name"] == name), None)
+    inst = _find(name, target)
     return probes.procs_of(inst, target) if inst else []
 
 
@@ -159,6 +213,229 @@ def list_hosts() -> list[str]:
         return [_pinned_target.alias] if _pinned_target.alias else []
 
     return [alias for alias in _ssh_config_aliases(_host_file) if _allowed(alias)]
+
+
+@mcp.tool()
+@_pinned_host
+def host_stats(*, target: Host) -> HostStats | None:
+    """Memory/swap/load/uptime for `host` itself, or None on a failed remote
+    probe (a bad connection, not a parse bug — just skip this call).
+
+    Args:
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    stats = probes.read_host_stats(target)
+    if stats is None:
+        return None
+
+    _cpu_times, (mem_pct, swap_pct), load_avg, uptime = stats
+    return {"mem_pct": mem_pct, "swap_pct": swap_pct, "load_avg": load_avg, "uptime": uptime}
+
+
+@mcp.tool()
+@_pinned_host
+def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
+    """The instance's databases and the postgres port they live on, or None
+    if the instance isn't found.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return None
+
+    databases, db_port = probes.databases_of(inst, target)
+    return {"databases": databases, "db_port": db_port}
+
+
+@mcp.tool()
+@_pinned_host
+def instance_processes(name: str, *, target: Host) -> InstanceProcesses | None:
+    """The instance's odoo processes and its postgres backends, or None if
+    the instance isn't found. Additive to `list_processes`, which stays
+    odoo-only.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return None
+
+    odoo, postgres = probes.instance_procs(inst, target)
+    return {"odoo": odoo, "postgres": postgres}
+
+
+@mcp.tool()
+@_pinned_host
+def instance_version(name: str, *, target: Host) -> str | None:
+    """The instance's Odoo version, or None if it's not found or the version
+    can't be determined.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    return probes.instance_version(inst, target) if inst else None
+
+
+@mcp.tool()
+@_pinned_host
+def instance_config(
+    name: str,
+    mode: Literal["compact", "expand"] = "compact",
+    *,
+    target: Host,
+) -> str:
+    """The instance's rendered odoo config: `compact` (only keys differing
+    from odoo's default) or `expand` (every valid option filled in).
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        mode: `compact` or `expand`.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return "(no such instance)"
+
+    path = probes.configfile_of(inst, target)
+    if path is None:
+        return "(no config file found)"
+
+    version = probes.instance_version(inst, target)
+    return probes.render_config(path, version, mode, target)
+
+
+@mcp.tool()
+@_pinned_host
+def instance_log_tail(name: str, lines: int = 200, *, target: Host) -> str:
+    """The last `lines` of the instance's odoo logfile.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        lines: number of trailing lines to return.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return "(no such instance)"
+
+    path = probes.logfile_of(inst, target)
+    if path is None:
+        return "(no logfile configured)"
+
+    return probes.tail(path, lines, target)
+
+
+@mcp.tool()
+@_pinned_host
+def instance_dump_stacks(name: str, *, target: Host) -> StackDump:
+    """SIGQUIT every process of the instance and parse the resulting stack
+    dumps out of its log — a live thread/frame snapshot for diagnosing a
+    stuck or spinning worker. `error` is non-empty (`workers` empty) only
+    when there's nothing to show at all (no logfile, no workers, or nothing
+    arrived).
+
+    Each thread carries db/uid/url plus, on Odoo 17+, qc/qt/pt — a live
+    snapshot at signal time, not an accumulator:
+      qc = query_count, number of SQL queries so far this request.
+      qt = query_time, SQL time so far this request, in seconds.
+      pt = python_time, Odoo's own name for wall-clock-since-request-start
+        minus qt — time spent outside the DB. Not "processing time".
+    All are None when the thread isn't mid-request, or on pre-17 instances
+    where qc/qt/pt were never reported.
+
+    Check `idle` before reading qc/qt/pt: Odoo never clears a thread's
+    request fields when it goes idle, so a thread back in its accept/wait
+    loop (`idle: true` — innermost frame is a select/poll/sleep/wait) still
+    shows its *last* request's numbers, not a live one. A large `pt` only
+    means something on a non-idle thread.
+
+    `workers`/`threads` are sorted busy-first (idle ones last), and each
+    thread's `frames` are innermost-first — read frames[0], not frames[-1],
+    for what a thread is doing right now.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    # idle detection: probes._IDLE_FRAME_FUNCS / _IDLE_FRAME_PATH_MARKERS
+    inst = _find(name, target)
+    if inst is None:
+        return {"error": "(no such instance)", "workers": []}
+
+    error, workers = probes.dump_and_parse_stacks(inst, target)
+    return {"error": error, "workers": probes.stacks_by_activity(workers)}
+
+
+@mcp.tool()
+@_pinned_host
+def long_queries(db: str, port: str | None = None, *, target: Host) -> list[dict]:
+    """Non-idle queries on `db`, longest-running first.
+
+    Args:
+        db: database name.
+        port: postgres port, if the instance's cluster isn't the default one.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    return probes.long_queries(db, port, target)
+
+
+@mcp.tool()
+@_pinned_host
+def db_query(
+    db: str,
+    command: DbQueryCommand,
+    port: str | None = None,
+    *,
+    target: Host,
+) -> list[dict] | str:
+    """Run an `odoo-db` diagnostic command against `db` — a scoped subset:
+    modules, crons, jobs, users, locks. Stats/bloat/attachments/studio and
+    the audit-oriented commands (they write a `$db.json` file to disk) are
+    out of scope here.
+
+    Args:
+        db: database name.
+        command: modules, crons, jobs, users, or locks.
+        port: postgres port, if the instance's cluster isn't the default one.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    proc = probes.start_odoo_db(command, db, port, target)
+    if proc is None:
+        return "(odoo-db not found on PATH)"
+
+    try:
+        result = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "(odoo-db timed out after 90s)"
+
+    rows, raw = probes.parse_odoo_db_output(*result)
+    return rows if rows is not None else raw
 
 
 @app.command()
