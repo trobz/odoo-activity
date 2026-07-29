@@ -2,6 +2,39 @@
 
 <!-- version list -->
 
+## v0.8.0 (2026-07-29)
+
+### Bug Fixes
+
+- **ssh**: Graceful cleanup of ControlMaster on quit + UI focus fix
+  ([`8436d12`](https://github.com/trobz/odoo-activity/commit/8436d12795dec983684ae99373b659e21cd9168c))
+
+- **tui**: Guard host-stats refresh against teardown race
+  ([`dd512e2`](https://github.com/trobz/odoo-activity/commit/dd512e29d19d015b8ec6af5461be9364df91ea18))
+
+### Documentation
+
+- Cover MCP server (oa-mcp and oa-mcp-multi)
+  ([`5298916`](https://github.com/trobz/odoo-activity/commit/5298916b740a380eb406ba96e2eba78c5b06e392))
+
+- Cover ssh remote mode
+  ([`3e29bfe`](https://github.com/trobz/odoo-activity/commit/3e29bfe5497aea8ec7d315b6f5229b6f218fc3c2))
+
+### Features
+
+- **mcp**: Add oa-mcp-multi with host-filter and list_hosts
+  ([`c714bd8`](https://github.com/trobz/odoo-activity/commit/c714bd888a6df6ec81a32967048c61bd99c07300))
+
+- **mcp**: Pin oa-mcp to a single host like oa [host]
+  ([`12e5c13`](https://github.com/trobz/odoo-activity/commit/12e5c13524305e3b67125c88d3fc5039509a222a))
+
+- **mcp**: Probe a remote host from the mcp tools
+  ([`cc29dcc`](https://github.com/trobz/odoo-activity/commit/cc29dccd13fdb6331570ab9d44feb6dc31125caf))
+
+- **ssh**: Watch a remote host over ssh
+  ([`cab391c`](https://github.com/trobz/odoo-activity/commit/cab391c7794bbfd6ca75586d1e04a13aa3c50ade))
+
+
 ## v0.7.0 (2026-07-27)
 
 ### Features
