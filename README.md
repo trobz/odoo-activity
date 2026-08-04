@@ -31,12 +31,13 @@ one supports.
 | `s` / `r` | start/stop toggle / restart (confirm popup) |
 | `[` / `]` | switch tab in the detail pane |
 | `f` | maximize/minimize the focused pane |
-| `p` / `l` / `c` | Processes / Logs / Config |
+| `p` / `l` / `c` / `t` | Processes / Logs / Config / Toolbox |
 | `u` / `l` / `j` / `c` | Users / Locks / Jobs / Crons |
 | `K` | kill -9 the selected process (Processes tab, confirm popup) |
 | `L` | kill -3 the selected process, then jump to Logs (Processes tab) |
 | `D` | dump stacks of all workers, then jump to Logs (Processes tab) |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
+| enter | run the selected tool (Toolbox tab, confirm popup) |
 | `/` | search (Logs and Config tabs) |
 | `R` | refresh the active tab now |
 | `q` | quit |
@@ -118,8 +119,10 @@ odoo_activity/
   tab strip over a Log/DataTable, mode-switched by whatever's highlighted
   (see Modes below) — not a separate popup screen.
 - **`tui.py`** — the shell only: `compose()` layout, the nested instances+dbs
-  `ListView`, focus/highlight wiring, refresh timers, start/stop/restart +
-  `ConfirmScreen`. Delegates rendering to `ActivityPane`, data to `probes.py`.
+  `ListView`, focus/highlight wiring, refresh timers, start/stop/restart.
+  Delegates rendering to `ActivityPane`, data to `probes.py`,
+  confirm popups to `panes/confirm.py`'s `ConfirmScreen` (shared with
+  `ActivityPane`, which also confirms mutating actions like Toolbox).
 
 ### Modes
 

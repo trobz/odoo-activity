@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -23,6 +24,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Input, RichLog, Static, Tree
 
 from odoo_activity.host import Host, to_thread
+from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.stacks import render_stacks
 from odoo_activity.probes import (
     CLK_TCK,
@@ -32,6 +34,7 @@ from odoo_activity.probes import (
     _read_new_bytes,
     configfile_of,
     db_port_of,
+    instance_pid,
     instance_procs,
     instance_version,
     logfile_of,
@@ -41,6 +44,7 @@ from odoo_activity.probes import (
     pg_client_port,
     proc_cpu_ticks_many,
     render_config,
+    signal_process,
     start_odoo_db,
     stringify,
     table_columns,
@@ -135,9 +139,16 @@ class ActivityPane(Vertical):
     CONFIG_MODES: ClassVar = ["compact", "explain", "expand", "clean"]
 
     TABS: ClassVar = {
-        "instance": ["Processes", "Stacks", "Logs", "Config"],
+        "instance": ["Processes", "Stacks", "Logs", "Config", "Toolbox"],
         "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules"],
     }
+
+    # (label, signal) -- enter on a Toolbox row sends `signal` to the
+    # instance's master pid, growing/shrinking the worker pool by one.
+    TOOLBOX_TOOLS: ClassVar = [
+        ("Spin up worker (SIGTTIN)", signal.SIGTTIN),
+        ("Spin down worker (SIGTTOU)", signal.SIGTTOU),
+    ]
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
 
     if TYPE_CHECKING:
@@ -254,6 +265,9 @@ class ActivityPane(Vertical):
     def is_stacks_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Stacks"
 
+    def is_toolbox_active(self) -> bool:
+        return self._mode == "instance" and self._active_tab() == "Toolbox"
+
     def has_search(self) -> bool:
         """Logs and Config both render plain text into #acbody with the same
         substring filter (see _render_log)."""
@@ -295,6 +309,10 @@ class ActivityPane(Vertical):
 
         idx = int(event.row_key.value)
 
+        if self.is_toolbox_active():
+            self.run_worker(self._run_toolbox_tool(idx))
+            return
+
         if self.is_processes_active():
             self.run_worker(self._jump_from_process_row(idx))
             return
@@ -305,6 +323,27 @@ class ActivityPane(Vertical):
 
         if idx < len(self._dbtab.rows):
             self._show_raw(self._dbtab.rows[idx])
+
+    async def _run_toolbox_tool(self, idx: int) -> None:
+        """Confirm, then send the selected row's signal to the master pid."""
+        if self._instance is None or not (0 <= idx < len(self.TOOLBOX_TOOLS)):
+            return
+
+        label, sig = self.TOOLBOX_TOOLS[idx]
+        inst = self._instance
+        host = self.app.host
+
+        confirmed = await self.app.push_screen_wait(ConfirmScreen(f"{label} — {inst['name']}?"))
+        if not confirmed:
+            return
+
+        pid = await to_thread(instance_pid, inst, host)
+        if pid is None:
+            self.app.notify(f"{inst['name']}: no master pid found", severity="warning", timeout=3)
+            return
+
+        await to_thread(signal_process, pid, sig, host)
+        self.app.notify(f"{label} sent to {inst['name']} (pid {pid})", timeout=2)
 
     async def _jump_from_process_row(self, idx: int) -> None:
         """`enter` on a postgres row moves the cursor to the Odoo worker
@@ -568,6 +607,8 @@ class ActivityPane(Vertical):
                 # triggered it isn't what stalls.
                 self._use("stacks")
                 self.call_after_refresh(self._populate_stacks, self._instance)
+            elif active == "Toolbox":
+                self._render_toolbox()
             else:  # Processes
                 # loading text now, table (_do_render_processes flips _use
                 # back once ready) -- a remote fetch is slow enough that an
@@ -898,6 +939,14 @@ class ActivityPane(Vertical):
         in the pane body."""
         for name, (selector, widget_type) in self._BODY_WIDGETS.items():
             self.query_one(selector, widget_type).display = name == which
+
+    def _render_toolbox(self) -> None:
+        table = self.query_one("#actable", DataTable)
+        table.clear(columns=True)
+        self._use("table")
+        table.add_column("TOOL")
+        for i, (label, _sig) in enumerate(self.TOOLBOX_TOOLS):
+            table.add_row(label, key=str(i))
 
     def _show_datatable(self, rows: list[dict]) -> None:
         # Unlike Processes (re-rendered every 0.5s poll, so a wrong width
