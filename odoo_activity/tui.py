@@ -16,11 +16,11 @@ from typing import ClassVar
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
+from textual.widgets import Footer, Label, ListItem, ListView, Static
 
 from odoo_activity.host import Host, to_thread
+from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
     Instance,
@@ -86,41 +86,6 @@ def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50)
     return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
 
 
-class ConfirmScreen(ModalScreen[bool]):
-    """Yes/No popup. Dismisses with the chosen bool."""
-
-    DEFAULT_CSS = """
-    ConfirmScreen { align: center middle; }
-    #confirm-box {
-        width: 50; height: auto;
-        border: round $accent; background: $surface;
-        padding: 1;
-    }
-    #confirm-msg { margin-bottom: 1; text-align: center; }
-    #confirm-buttons { height: 3; align: center middle; }
-    #confirm-buttons Button { margin: 0 1; }
-    """
-
-    BINDINGS: ClassVar = [("escape", "cancel", "Cancel")]
-
-    def __init__(self, message: str) -> None:
-        super().__init__()
-        self._message = message
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="confirm-box"):
-            yield Static(self._message, id="confirm-msg")
-            with Horizontal(id="confirm-buttons"):
-                yield Button("Yes", id="confirm-yes", variant="error")
-                yield Button("No", id="confirm-no", variant="primary")
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "confirm-yes")
-
-
 class OdooActivity(App):
     CSS = """
     #body { height: 1fr; }
@@ -160,6 +125,7 @@ class OdooActivity(App):
         ("l", "select_tab('Locks')", "Locks"),
         ("c", "select_tab('Config')", "Config"),
         ("c", "select_tab('Crons')", "Crons"),
+        ("t", "select_tab('Toolbox')", "Toolbox"),
         ("u", "select_tab('Users')", "Users"),
         ("j", "select_tab('Jobs')", "Jobs"),
         ("slash", "search", "Search"),
@@ -580,15 +546,21 @@ class OdooActivity(App):
         return True
 
     def action_prev_tab(self) -> None:
-        self.query_one(ActivityPane).prev_tab()
+        pane = self.query_one(ActivityPane)
+        pane.prev_tab()
+        pane.focus_active()
         self.refresh_bindings()
 
     def action_next_tab(self) -> None:
-        self.query_one(ActivityPane).next_tab()
+        pane = self.query_one(ActivityPane)
+        pane.next_tab()
+        pane.focus_active()
         self.refresh_bindings()
 
     def action_select_tab(self, name: str) -> None:
-        self.query_one(ActivityPane).select_tab_by_name(name)
+        pane = self.query_one(ActivityPane)
+        pane.select_tab_by_name(name)
+        pane.focus_active()
         self.refresh_bindings()
 
     def action_search(self) -> None:
@@ -668,7 +640,9 @@ class OdooActivity(App):
             return
 
         await to_thread(signal_process, proc["pid"], signal.SIGQUIT, self.host)
-        self.query_one(ActivityPane).select_tab_by_name("Stacks")
+        pane = self.query_one(ActivityPane)
+        pane.select_tab_by_name("Stacks")
+        pane.focus_active()
 
     def action_toggle_config_mode(self) -> None:
         self.query_one(ActivityPane).toggle_config_mode()
@@ -708,6 +682,7 @@ class OdooActivity(App):
         elif not activity.render_stacks(inst, workers, workdir):
             self.app.notify("dump ok — nothing long-running", timeout=3)
         activity.select_tab_by_name("Stacks")
+        activity.focus_active()
 
 
 def run() -> None:
