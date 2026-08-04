@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.10.0 (2026-08-04)
+
+### Bug Fixes
+
+- **activity-pane**: Focus the active tab body on every tab switch
+  ([`0e729ec`](https://github.com/trobz/odoo-activity/commit/0e729ec09fe41cf2abab3edb105efb974c4a51a6))
+
+### Features
+
+- **activity-pane**: Add Toolbox tab for worker scaling
+  ([`7aa774a`](https://github.com/trobz/odoo-activity/commit/7aa774a6d5d6ed74707e6cbbb60fd3ddc47fb1cd))
+
+
 ## v0.9.0 (2026-07-29)
 
 ### Bug Fixes
