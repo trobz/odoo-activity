@@ -97,7 +97,9 @@ class ActivityTab(Static):
         self.set_class(active, "-active")
 
     def on_click(self) -> None:
-        self.app.query_one(ActivityPane).select_tab(self.index)
+        pane = self.app.query_one(ActivityPane)
+        pane.select_tab(self.index)
+        pane.focus_active()
 
 
 class _RawScroll(VerticalScroll):
@@ -278,7 +280,7 @@ class ActivityPane(Vertical):
         box = self.query_one("#acsearch", Input)
         if event.key == "escape" and box.has_focus:
             box.display = False
-            self.app.query_one("#instances").focus()
+            self.focus_active()
             event.stop()
             return
 
@@ -348,7 +350,7 @@ class ActivityPane(Vertical):
 
         self._log_query = event.value.strip() or None
         event.input.display = False
-        self.app.query_one("#instances").focus()
+        self.focus_active()
         self._render_log()
 
     def show_instance(self, inst: Instance | None) -> None:
@@ -409,6 +411,18 @@ class ActivityPane(Vertical):
     def has_tab(self, name: str) -> bool:
         """True if `name` is one of the current mode's tabs."""
         return name in self.TABS[self._mode]
+
+    def focus_active(self) -> None:
+        """Move keyboard focus onto whichever body widget the active tab is
+        currently showing, so arrow keys scroll/navigate it and `f` maximizes
+        it -- called by the app on an explicit tab-switch keybinding, never
+        from highlight-driven re-renders (that would fight #instances for
+        focus on every arrow-key move)."""
+        for selector, widget_type in self._BODY_WIDGETS.values():
+            widget = self.query_one(selector, widget_type)
+            if widget.display:
+                widget.focus()
+                return
 
     def render_stacks(self, inst: Instance, workers: list[Worker], workdir: Path) -> bool:
         """Cache `inst`'s dump (see probes.dump_and_parse_stacks) and, if

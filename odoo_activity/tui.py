@@ -580,15 +580,21 @@ class OdooActivity(App):
         return True
 
     def action_prev_tab(self) -> None:
-        self.query_one(ActivityPane).prev_tab()
+        pane = self.query_one(ActivityPane)
+        pane.prev_tab()
+        pane.focus_active()
         self.refresh_bindings()
 
     def action_next_tab(self) -> None:
-        self.query_one(ActivityPane).next_tab()
+        pane = self.query_one(ActivityPane)
+        pane.next_tab()
+        pane.focus_active()
         self.refresh_bindings()
 
     def action_select_tab(self, name: str) -> None:
-        self.query_one(ActivityPane).select_tab_by_name(name)
+        pane = self.query_one(ActivityPane)
+        pane.select_tab_by_name(name)
+        pane.focus_active()
         self.refresh_bindings()
 
     def action_search(self) -> None:
@@ -668,7 +674,9 @@ class OdooActivity(App):
             return
 
         await to_thread(signal_process, proc["pid"], signal.SIGQUIT, self.host)
-        self.query_one(ActivityPane).select_tab_by_name("Stacks")
+        pane = self.query_one(ActivityPane)
+        pane.select_tab_by_name("Stacks")
+        pane.focus_active()
 
     def action_toggle_config_mode(self) -> None:
         self.query_one(ActivityPane).toggle_config_mode()
@@ -708,6 +716,7 @@ class OdooActivity(App):
         elif not activity.render_stacks(inst, workers, workdir):
             self.app.notify("dump ok — nothing long-running", timeout=3)
         activity.select_tab_by_name("Stacks")
+        activity.focus_active()
 
 
 def run() -> None:
