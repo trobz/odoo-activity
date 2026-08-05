@@ -26,6 +26,7 @@ from textual.widgets import DataTable, Input, RichLog, Static, Tree
 from odoo_activity.host import Host, to_thread
 from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.stacks import render_stacks
+from odoo_activity.panes.summary import render_summary
 from odoo_activity.probes import (
     CLK_TCK,
     Instance,
@@ -37,6 +38,7 @@ from odoo_activity.probes import (
     instance_pid,
     instance_procs,
     instance_version,
+    instance_workers,
     logfile_of,
     long_queries,
     odoo_pid_for_port,
@@ -130,6 +132,7 @@ class ActivityPane(Vertical):
     #acsearch { margin-bottom: 1; }
     #acraw { background: transparent; display: none; }
     #acstacks { background: transparent; display: none; }
+    #acsummary { background: transparent; display: none; }
     """
 
     # ALLOW_MAXIMIZE makes maximizing a focused child (DataTable/Log/Input)
@@ -139,7 +142,7 @@ class ActivityPane(Vertical):
     CONFIG_MODES: ClassVar = ["compact", "explain", "expand", "clean"]
 
     TABS: ClassVar = {
-        "instance": ["Processes", "Stacks", "Logs", "Config", "Toolbox"],
+        "instance": ["Processes", "Summary", "Stacks", "Logs", "Config", "Toolbox"],
         "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules"],
     }
 
@@ -168,6 +171,7 @@ class ActivityPane(Vertical):
         with _RawScroll(id="acraw"):
             yield Static(id="acraw-body")
         yield Tree("stacks", id="acstacks")
+        yield Tree("summary", id="acsummary")
 
     def on_mount(self) -> None:
         self._mode = "instance"
@@ -190,6 +194,7 @@ class ActivityPane(Vertical):
         self._showing_raw = False  # viewing one row's raw json in #acbody
         self._stacks_cache: dict[str, tuple[list[Worker], Path]] = {}  # instance key -> its last dump
         self.query_one("#acstacks", Tree).show_root = False
+        self.query_one("#acsummary", Tree).show_root = False
         self._render_mode()
 
     def on_unmount(self) -> None:
@@ -261,6 +266,9 @@ class ActivityPane(Vertical):
 
     def is_processes_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Processes"
+
+    def is_summary_active(self) -> bool:
+        return self._mode == "instance" and self._active_tab() == "Summary"
 
     def is_stacks_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Stacks"
@@ -597,6 +605,12 @@ class ActivityPane(Vertical):
             elif active == "Config":
                 self._use("log")
                 self._render_config()
+            elif active == "Summary":
+                self._use("summary")
+                tree = self.query_one("#acsummary", Tree)
+                tree.clear()
+                tree.root.add_leaf("Loading…")
+                self._render_summary()
             elif active == "Stacks":
                 # deferred here (not on every instance nav — see
                 # _restore_stacks) until the tab a user actually switches to.
@@ -753,6 +767,23 @@ class ActivityPane(Vertical):
         self._log_text = text
         self.border_title = self._title()
         self._render_log()
+
+    def _render_summary(self) -> None:
+        self._coalesce("summary", _inst_key(self._instance), self._do_render_summary)
+
+    async def _do_render_summary(self) -> None:
+        inst = self._instance
+        if inst is None:
+            self.query_one("#acsummary", Tree).clear()
+            return
+
+        host = self.app.host
+        master, rows = await to_thread(instance_workers, inst, host)
+
+        if self._instance is not inst or not self.is_summary_active():
+            return  # instance or tab changed while this was fetching; the result is stale
+
+        render_summary(self.query_one("#acsummary", Tree), rows, master)
 
     def _render_processes(self) -> None:
         self._coalesce("processes", _inst_key(self._instance), self._do_render_processes)
@@ -932,11 +963,12 @@ class ActivityPane(Vertical):
         "table": ("#actable", DataTable),
         "raw": ("#acraw", VerticalScroll),
         "stacks": ("#acstacks", Tree),
+        "summary": ("#acsummary", Tree),
     }
 
     def _use(self, which: str) -> None:
-        """Show the Log, the DataTable, the raw-json view, or the Stacks tree
-        in the pane body."""
+        """Show the Log, the DataTable, the raw-json view, the Stacks tree,
+        or the Summary tree in the pane body."""
         for name, (selector, widget_type) in self._BODY_WIDGETS.items():
             self.query_one(selector, widget_type).display = name == which
 

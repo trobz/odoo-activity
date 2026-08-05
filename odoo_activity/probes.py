@@ -730,29 +730,36 @@ def instance_pid(inst: Instance, host: Host = LOCAL) -> str | None:
     return m.group(1) if m and m.group(1) != "0" else None
 
 
-def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
-    """The instance's master process plus every descendant (prefork
-    workers), read purely from ps by walking the ppid tree down from the
-    manager-reported master pid."""
-    master = instance_pid(inst, host)
-    if master is None:
-        return []
-
-    lines = host.run(["ps", "-eo", "pid,ppid,user,%mem,args"]).stdout.splitlines()[1:]  # drop header
+def _ps_snapshot(host: Host) -> tuple[dict[str, ProcRow], dict[str, list[str]]]:
+    """One `ps -eo` call, indexed by pid and by ppid -> children -- shared by
+    every walker below that needs the descendant tree of a known root pid."""
+    lines = host.run(["ps", "-eo", "pid,ppid,user,%mem,nice,args"]).stdout.splitlines()[1:]  # drop header
 
     by_pid: dict[str, ProcRow] = {}
     children: dict[str, list[str]] = {}
     for ln in lines:
-        cols = ln.split(maxsplit=4)
-        if len(cols) < 5:
+        cols = ln.split(maxsplit=5)
+        if len(cols) < 6:
             continue
 
-        row: ProcRow = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
+        row: ProcRow = {
+            "pid": cols[0],
+            "ppid": cols[1],
+            "user": cols[2],
+            "mem": cols[3],
+            "nice": cols[4],
+            "cmd": cols[5],
+        }
         by_pid[row["pid"]] = row
         children.setdefault(row["ppid"], []).append(row["pid"])
 
+    return by_pid, children
+
+
+def _descendants(root: str, by_pid: dict[str, ProcRow], children: dict[str, list[str]]) -> list[ProcRow]:
+    """`root` plus every pid reachable from it through `children`."""
     keep: list[str] = []
-    stack = [master]
+    stack = [root]
     while stack:
         pid = stack.pop()
         if pid in keep or pid not in by_pid:
@@ -761,6 +768,18 @@ def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
         stack.extend(children.get(pid, []))
 
     return [by_pid[pid] for pid in keep]
+
+
+def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
+    """The instance's master process plus every descendant (prefork
+    workers), read purely from ps by walking the ppid tree down from the
+    manager-reported master pid."""
+    master = instance_pid(inst, host)
+    if master is None:
+        return []
+
+    by_pid, children = _ps_snapshot(host)
+    return _descendants(master, by_pid, children)
 
 
 def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], list[ProcRow]]:
@@ -773,37 +792,27 @@ def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], l
     master = instance_pid(inst, host)
     dbs = set(databases_of(inst, host)[0])
 
-    lines = host.run(["ps", "-eo", "pid,ppid,user,%mem,args"]).stdout.splitlines()[1:]
-
-    by_pid: dict[str, ProcRow] = {}
-    children: dict[str, list[str]] = {}
-    pg_rows: list[ProcRow] = []
-
-    for ln in lines:
-        cols = ln.split(maxsplit=4)
-        if len(cols) < 5:
-            continue
-
-        row: ProcRow = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
-        by_pid[row["pid"]] = row
-        children.setdefault(row["ppid"], []).append(row["pid"])
-
-        if dbs and row["cmd"].startswith("postgres:") and dbs.intersection(row["cmd"].split()):
-            pg_rows.append(row)
-
-    odoo_rows: list[ProcRow] = []
-    if master is not None:
-        keep: list[str] = []
-        stack = [master]
-        while stack:
-            pid = stack.pop()
-            if pid in keep or pid not in by_pid:
-                continue
-            keep.append(pid)
-            stack.extend(children.get(pid, []))
-        odoo_rows = [by_pid[pid] for pid in keep]
+    by_pid, children = _ps_snapshot(host)
+    pg_rows = [
+        row
+        for row in by_pid.values()
+        if dbs and row["cmd"].startswith("postgres:") and dbs.intersection(row["cmd"].split())
+    ]
+    odoo_rows = _descendants(master, by_pid, children) if master is not None else []
 
     return odoo_rows, pg_rows
+
+
+def instance_workers(inst: Instance, host: Host = LOCAL) -> tuple[str | None, list[ProcRow]]:
+    """(master_pid, odoo_processes) for the Summary tab's worker tree --
+    same ppid-walk as instance_procs' odoo side, without paying for its
+    postgres-backend matching (unused here)."""
+    master = instance_pid(inst, host)
+    if master is None:
+        return None, []
+
+    by_pid, children = _ps_snapshot(host)
+    return master, _descendants(master, by_pid, children)
 
 
 _PG_CLIENT_PORT_RE = re.compile(r"\((\d+)\)")
@@ -895,6 +904,7 @@ class ProcRow(TypedDict):
     ppid: str
     user: str
     mem: str
+    nice: str
     cmd: str
 
 
