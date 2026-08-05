@@ -20,6 +20,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pyperclip
+
 # typing_extensions, not typing: pydantic (via FastMCP, see mcp_server.py)
 # can't build a schema from typing.TypedDict on Python < 3.12.
 from typing_extensions import TypedDict
@@ -604,6 +606,38 @@ def db_port_of(inst: Instance, host: Host = LOCAL) -> str | None:
     return _opt(parser, "db_port")
 
 
+def data_dir_of(inst: Instance, host: Host = LOCAL) -> str | None:
+    """The instance's `data_dir`, from its odoo config, or odoo.sh's fixed
+    `~/data` (its config has no `data_dir` key -- same reasoning as
+    `logfile_of`'s odoosh case)."""
+    if inst["manager"] == "odoosh":
+        return str(instance_workdir(inst, host) / "data")
+
+    _, parser = instance_config(inst, host)
+    return _opt(parser, "data_dir")
+
+
+def session_dir_of(inst: Instance, host: Host = LOCAL) -> str | None:
+    """The instance's filesystem session store dir (`<data_dir>/sessions`,
+    matching Odoo's own `Config.session_dir`), or None if `data_dir` is
+    unset."""
+    data_dir = data_dir_of(inst, host)
+    return f"{data_dir}/sessions" if data_dir else None
+
+
+def session_count(session_dir: str, host: Host = LOCAL) -> int:
+    """Number of stored sessions -- one file per session, sharded as
+    `<session_dir>/<2-char-prefix>/<sid>` (Odoo's own
+    `FilesystemSessionStore.get_session_filename`; its `vacuum()` scans the
+    same `*/*` glob). The 2-char shard dirs themselves are a fixed ~4096-slot
+    bucket scheme, not one session each, so they aren't what gets counted.
+
+    A real directory listing (one `ls` round trip, remotely) -- the caller
+    should keep this off any timer/auto-refresh path and gate it behind an
+    explicit, confirmed action."""
+    return len(host.glob(f"{session_dir}/*/*"))
+
+
 def databases_of(inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | None]:
     """(databases, db_port) for the instance — its authoritative members and
     the postgres port they live on (instances may run on different clusters).
@@ -768,6 +802,49 @@ def _descendants(root: str, by_pid: dict[str, ProcRow], children: dict[str, list
         stack.extend(children.get(pid, []))
 
     return [by_pid[pid] for pid in keep]
+
+
+def shell_command(inst: Instance, host: Host = LOCAL) -> str | None:
+    """The instance's `odoo-bin shell --no-http` command, e.g.
+    `/path/to/venv/bin/python3 /path/to/odoo-bin shell --no-http -c ...`,
+    or None if it isn't running. Built by inserting `shell --no-http` into
+    the live process's own argv (`procs_of`), so the python/odoo-bin paths
+    are already absolute, reused as launched. `--no-http` skips binding
+    the port the running instance already holds (EADDRINUSE otherwise)."""
+    procs = procs_of(inst, host)
+    if not procs:
+        return None
+
+    tokens = procs[0]["cmd"].split()
+    split_at = next((i for i, tok in enumerate(tokens) if tok.startswith("-")), len(tokens))
+
+    return " ".join([*tokens[:split_at], "shell", "--no-http", *tokens[split_at:]])
+
+
+def try_local_clipboard(text: str) -> bool:
+    """Copy `text` to the clipboard of the machine this process runs on.
+
+    Only meaningful for a local run -- over SSH this would write to the
+    remote host's clipboard, invisible to the user, so it's skipped whenever
+    the standard `SSH_TTY`/`SSH_CONNECTION` env vars mark this odoo-activity
+    process itself as running inside an ssh session (the caller should use
+    `App.copy_to_clipboard`'s OSC 52 instead, which does survive SSH). False
+    on any failure (no clipboard mechanism installed, SSH session, etc.) so
+    the caller can fall back.
+
+    Independent of the `--host` target: this is about the terminal
+    odoo-activity itself is drawn in, not which host `shell_command` was
+    read from -- see `Host.shell_invocation` for that side.
+    """
+    if os.environ.get("SSH_TTY") or os.environ.get("SSH_CONNECTION"):
+        return False
+
+    try:
+        pyperclip.copy(text)
+    except pyperclip.PyperclipException:
+        return False
+    else:
+        return True
 
 
 def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:

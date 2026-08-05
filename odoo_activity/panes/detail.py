@@ -46,11 +46,13 @@ from odoo_activity.probes import (
     pg_client_port,
     proc_cpu_ticks_many,
     render_config,
+    shell_command,
     signal_process,
     start_odoo_db,
     stringify,
     table_columns,
     tail,
+    try_local_clipboard,
 )
 
 if TYPE_CHECKING:
@@ -148,9 +150,12 @@ class ActivityPane(Vertical):
 
     # (label, signal) -- enter on a Toolbox row sends `signal` to the
     # instance's master pid, growing/shrinking the worker pool by one.
+    # `signal is None` (Open shell) is the one non-signal tool: it copies
+    # the instance's shell launch command instead -- see _run_toolbox_tool.
     TOOLBOX_TOOLS: ClassVar = [
         ("Spin up worker (SIGTTIN)", signal.SIGTTIN),
         ("Spin down worker (SIGTTOU)", signal.SIGTTOU),
+        ("Open shell (copy command)", None),
     ]
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
 
@@ -333,13 +338,20 @@ class ActivityPane(Vertical):
             self._show_raw(self._dbtab.rows[idx])
 
     async def _run_toolbox_tool(self, idx: int) -> None:
-        """Confirm, then send the selected row's signal to the master pid."""
+        """Send the selected row's signal to the master pid (confirmed
+        first, since it changes the running instance), or -- Open shell,
+        `sig is None` -- copy its shell launch command (read-only, no
+        confirm needed)."""
         if self._instance is None or not (0 <= idx < len(self.TOOLBOX_TOOLS)):
             return
 
         label, sig = self.TOOLBOX_TOOLS[idx]
         inst = self._instance
         host = self.app.host
+
+        if sig is None:
+            await self.copy_shell_command(inst, host)
+            return
 
         confirmed = await self.app.push_screen_wait(ConfirmScreen(f"{label} — {inst['name']}?"))
         if not confirmed:
@@ -352,6 +364,24 @@ class ActivityPane(Vertical):
 
         await to_thread(signal_process, pid, sig, host)
         self.app.notify(f"{label} sent to {inst['name']} (pid {pid})", timeout=2)
+
+    async def copy_shell_command(self, inst: Instance, host: Host) -> None:
+        """Copy `inst`'s `odoo shell` launch command -- ssh-wrapped first if
+        `host` isn't local, since the command's own paths (venv, odoo-bin,
+        config) only exist on `host`, not necessarily on the machine
+        odoo-activity itself is running on. Called from the Toolbox row and
+        the app's own `S` shortcut alike."""
+        cmd = await to_thread(shell_command, inst, host)
+        if cmd is None:
+            self.app.notify(f"{inst['name']} isn't running — no shell command to copy", severity="warning", timeout=3)
+            return
+
+        text = host.shell_invocation(cmd)
+        # local run -> pyperclip (this machine's clipboard); SSH -> OSC 52 (the
+        # one that survives the tunnel back to the user's own machine)
+        if not await to_thread(try_local_clipboard, text):
+            self.app.copy_to_clipboard(text)
+        self.app.notify("Shell command copied to clipboard", timeout=3)
 
     async def _jump_from_process_row(self, idx: int) -> None:
         """`enter` on a postgres row moves the cursor to the Odoo worker

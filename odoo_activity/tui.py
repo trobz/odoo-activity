@@ -33,6 +33,8 @@ from odoo_activity.probes import (
     list_instances,
     read_cpu_times,
     read_host_stats,
+    session_count,
+    session_dir_of,
     signal_process,
 )
 
@@ -132,6 +134,8 @@ class OdooActivity(App):
         ("K", "kill_process", "Kill -9"),
         ("L", "quit_process", "Log dump -3"),
         ("D", "dumpstacks", "Dump stacks"),
+        ("S", "copy_shell_command", "Copy shell cmd"),
+        ("C", "count_sessions", "Count sessions"),
         ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
         ("f", "toggle_maximize", "Maximize"),
         ("R", "refresh", "Refresh"),
@@ -537,7 +541,7 @@ class OdooActivity(App):
         if action in ("kill_process", "quit_process"):
             return self.query_one(ActivityPane).is_processes_active()
 
-        if action == "dumpstacks":
+        if action in ("dumpstacks", "copy_shell_command", "count_sessions"):
             return self.current_instance() is not None
 
         if action == "toggle_config_mode":
@@ -683,6 +687,40 @@ class OdooActivity(App):
             self.app.notify("dump ok — nothing long-running", timeout=3)
         activity.select_tab_by_name("Stacks")
         activity.focus_active()
+
+    def action_copy_shell_command(self) -> None:
+        inst = self.current_instance()
+        if inst is None:
+            return
+        self._copy_shell_command(inst)
+
+    @work(exclusive=True, group="shell-command")
+    async def _copy_shell_command(self, inst: Instance) -> None:
+        await self.query_one(ActivityPane).copy_shell_command(inst, self.host)
+
+    def action_count_sessions(self) -> None:
+        inst = self.current_instance()
+        if inst is None:
+            return
+
+        def on_confirm(confirmed: bool | None) -> None:
+            if confirmed:
+                self._count_sessions(inst)
+
+        self.push_screen(
+            ConfirmScreen(f"Count sessions for {inst['name']}? (walks the session dir, may be slow)"),
+            on_confirm,
+        )
+
+    @work(exclusive=True, group="session-count")
+    async def _count_sessions(self, inst: Instance) -> None:
+        session_dir = await to_thread(session_dir_of, inst, self.host)
+        if session_dir is None:
+            self.app.notify(f"{inst['name']}: no data_dir configured", severity="warning", timeout=3)
+            return
+
+        count = await to_thread(session_count, session_dir, self.host)
+        self.app.notify(f"{count} sessions in {session_dir}", timeout=5)
 
 
 def run() -> None:
