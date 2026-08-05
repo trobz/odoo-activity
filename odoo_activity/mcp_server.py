@@ -346,6 +346,31 @@ def instance_log_tail(name: str, lines: int = 200, *, target: Host) -> str:
 
 @mcp.tool()
 @_pinned_host
+def instance_shell_command(name: str, *, target: Host) -> str | None:
+    """The command to open an interactive `odoo shell` for the instance,
+    reusing its live process's own venv/config -- to run yourself or
+    suggest to the user as a next step. None if the instance isn't found
+    or isn't running.
+
+    ssh-wrapped when `host` is remote, so it's runnable as returned rather
+    than needing `host` prefixed onto it by hand.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return None
+
+    cmd = probes.shell_command(inst, target)
+    return target.shell_invocation(cmd) if cmd else None
+
+
+@mcp.tool()
+@_pinned_host
 def instance_dump_stacks(name: str, *, target: Host) -> StackDump:
     """SIGQUIT every process of the instance and parse the resulting stack
     dumps out of its log — a live thread/frame snapshot for diagnosing a
