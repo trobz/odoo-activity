@@ -28,6 +28,15 @@ release-stable: ## Prepare project for stable 1.0.0 release (disables 0.x.x vers
 	@echo "   2. git commit -m 'chore: prepare for stable 1.0.0 release'"
 	@echo "   3. Push to main - the next feat/fix commit will trigger 1.0.0"
 
+.PHONY: docs-check
+docs-check: ## Show TUI/MCP surface changes since README.md was last updated
+	@last=$$(git log -1 --format=%H -- README.md); \
+	echo "📚 README.md last touched at $$last"; \
+	git diff --stat $$last..HEAD -- \
+	    odoo_activity/tui.py \
+	    odoo_activity/panes/detail.py \
+	    odoo_activity/mcp_server.py
+
 .PHONY: test
 test: ## Test the code with pytest
 	@echo "🚀 Testing code: Running pytest"
