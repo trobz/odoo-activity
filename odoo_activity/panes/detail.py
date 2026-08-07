@@ -46,6 +46,8 @@ from odoo_activity.probes import (
     pg_client_port,
     proc_cpu_ticks_many,
     render_config,
+    session_count,
+    session_dir_of,
     shell_command,
     signal_process,
     start_odoo_db,
@@ -148,14 +150,13 @@ class ActivityPane(Vertical):
         "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules"],
     }
 
-    # (label, signal) -- enter on a Toolbox row sends `signal` to the
-    # instance's master pid, growing/shrinking the worker pool by one.
-    # `signal is None` (Open shell) is the one non-signal tool: it copies
-    # the instance's shell launch command instead -- see _run_toolbox_tool.
+    # (label, signal) -- an int sends that signal to the instance's master
+    # pid; None/"count_sessions" are special-cased -- see _run_toolbox_tool.
     TOOLBOX_TOOLS: ClassVar = [
         ("Spin up worker (SIGTTIN)", signal.SIGTTIN),
         ("Spin down worker (SIGTTOU)", signal.SIGTTOU),
         ("Open shell (copy command)", None),
+        ("Count sessions", "count_sessions"),
     ]
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
 
@@ -338,10 +339,9 @@ class ActivityPane(Vertical):
             self._show_raw(self._dbtab.rows[idx])
 
     async def _run_toolbox_tool(self, idx: int) -> None:
-        """Send the selected row's signal to the master pid (confirmed
-        first, since it changes the running instance), or -- Open shell,
-        `sig is None` -- copy its shell launch command (read-only, no
-        confirm needed)."""
+        """Run the selected Toolbox row -- signals go to the master pid
+        (confirmed first); non-signal entries dispatch to their own
+        handler below."""
         if self._instance is None or not (0 <= idx < len(self.TOOLBOX_TOOLS)):
             return
 
@@ -351,6 +351,10 @@ class ActivityPane(Vertical):
 
         if sig is None:
             await self.copy_shell_command(inst, host)
+            return
+
+        if sig == "count_sessions":
+            await self._count_sessions(inst, host)
             return
 
         confirmed = await self.app.push_screen_wait(ConfirmScreen(f"{label} — {inst['name']}?"))
@@ -382,6 +386,21 @@ class ActivityPane(Vertical):
         if not await to_thread(try_local_clipboard, text):
             self.app.copy_to_clipboard(text)
         self.app.notify("Shell command copied to clipboard", timeout=3)
+
+    async def _count_sessions(self, inst: Instance, host: Host) -> None:
+        confirmed = await self.app.push_screen_wait(
+            ConfirmScreen(f"Count sessions for {inst['name']}? (walks the session dir, may be slow)")
+        )
+        if not confirmed:
+            return
+
+        session_dir = await to_thread(session_dir_of, inst, host)
+        if session_dir is None:
+            self.app.notify(f"{inst['name']}: no data_dir configured", severity="warning", timeout=3)
+            return
+
+        count = await to_thread(session_count, session_dir, host)
+        self.app.notify(f"{count} sessions in {session_dir}", timeout=5)
 
     async def _jump_from_process_row(self, idx: int) -> None:
         """`enter` on a postgres row moves the cursor to the Odoo worker

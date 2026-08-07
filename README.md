@@ -37,7 +37,6 @@ one supports.
 | `L` | kill -3 the selected process, then jump to Stacks (Top tab) |
 | `D` | dump stacks of all workers, then jump to Stacks |
 | `S` | copy the instance's `odoo shell` launch command to the clipboard |
-| `C` | count sessions under the instance's data dir (confirm popup, may be slow) |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
 | enter | run the selected tool (Toolbox tab, confirm popup) / open a row's raw json (db tabs) |
 | `/` | search (Logs and Config tabs) |
@@ -46,9 +45,14 @@ one supports.
 
 Two tabs on each side have no letter shortcut — cycle to them with
 `[`/`]` or click: **Processes** and **Stacks** (instance mode), **Queries**
-and **Modules** (database mode). Toolbox (`t`) offers three tools: spin
-a worker up (`SIGTTIN`) or down (`SIGTTOU`), and open shell — which
-copies the launch command instead of signaling, so it needs no confirm.
+and **Modules** (database mode).
+
+Toolbox (`t`) offers four tools:
+- Spin a worker up (`SIGTTIN`) or down (`SIGTTOU`).
+- Open shell — which copies the launch command instead of signaling, so it needs
+  no confirm.
+- Count sessions under the instance's data dir (walks the filesystem, may be
+  slow).
 
 ### Remote hosts
 
