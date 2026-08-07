@@ -804,18 +804,37 @@ def _descendants(root: str, by_pid: dict[str, ProcRow], children: dict[str, list
     return [by_pid[pid] for pid in keep]
 
 
+def _exe_of(pid: str, host: Host) -> str | None:
+    """Absolute path of `pid`'s running executable, via `/proc/<pid>/exe` --
+    unlike argv[0], never a bare `python3` left over from a `PATH` lookup
+    at launch. None on any failure (permission denied, pid gone, ...)."""
+    if host.is_local:
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return None
+
+    out = host.run(["readlink", "-f", f"/proc/{pid}/exe"]).stdout.strip()
+    return out or None
+
+
 def shell_command(inst: Instance, host: Host = LOCAL) -> str | None:
     """The instance's `odoo-bin shell --no-http` command, e.g.
     `/path/to/venv/bin/python3 /path/to/odoo-bin shell --no-http -c ...`,
-    or None if it isn't running. Built by inserting `shell --no-http` into
-    the live process's own argv (`procs_of`), so the python/odoo-bin paths
-    are already absolute, reused as launched. `--no-http` skips binding
-    the port the running instance already holds (EADDRINUSE otherwise)."""
+    or None if it isn't running. Built from the live process's own argv
+    (`procs_of`), with argv[0] upgraded via `_exe_of` when possible --
+    otherwise this could copy a `python3` that only resolves inside the
+    process's own launch context, not wherever it gets pasted.
+    `--no-http` skips binding the port the running instance already holds
+    (EADDRINUSE otherwise)."""
     procs = procs_of(inst, host)
     if not procs:
         return None
 
     tokens = procs[0]["cmd"].split()
+    if exe := _exe_of(procs[0]["pid"], host):
+        tokens[0] = exe
+
     split_at = next((i for i, tok in enumerate(tokens) if tok.startswith("-")), len(tokens))
 
     return " ".join([*tokens[:split_at], "shell", "--no-http", *tokens[split_at:]])

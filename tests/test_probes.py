@@ -22,6 +22,7 @@ def test_copy_shell_command_local(monkeypatch):
     """Local host: the raw `odoo shell` command is copied as-is."""
     _no_ssh_tty(monkeypatch)
     monkeypatch.setattr(probes, "procs_of", _fake_procs("/venv/bin/python3 /opt/odoo/odoo-bin -c /etc/odoo.conf"))
+    monkeypatch.setattr(probes, "_exe_of", lambda *_: None)
     copied = {}
     monkeypatch.setattr(pyperclip, "copy", lambda text: copied.setdefault("text", text))
 
@@ -41,6 +42,7 @@ def test_copy_shell_command_remote(monkeypatch):
     bare remote command, which would just fail to run locally."""
     _no_ssh_tty(monkeypatch)
     monkeypatch.setattr(probes, "procs_of", _fake_procs("/venv/bin/python3 /opt/odoo/odoo-bin -c /etc/odoo.conf"))
+    monkeypatch.setattr(probes, "_exe_of", lambda *_: None)
     copied = {}
     monkeypatch.setattr(pyperclip, "copy", lambda text: copied.setdefault("text", text))
 
@@ -53,3 +55,12 @@ def test_copy_shell_command_remote(monkeypatch):
     assert (
         copied["text"] == "ssh -t -p 2222 prod '/venv/bin/python3 /opt/odoo/odoo-bin shell --no-http -c /etc/odoo.conf'"
     )
+
+
+def test_shell_command_resolves_bare_interpreter(monkeypatch):
+    """A bare `python3` argv[0] gets upgraded to `_exe_of`'s resolved path."""
+    monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin -c /etc/odoo.conf"))
+    monkeypatch.setattr(probes, "_exe_of", lambda pid, host: "/venv/bin/python3" if pid == "1" else None)
+
+    cmd = probes.shell_command(_INSTANCE, Host())
+    assert cmd == "/venv/bin/python3 /opt/odoo/odoo-bin shell --no-http -c /etc/odoo.conf"
