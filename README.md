@@ -45,7 +45,7 @@ one supports.
 | `q` | quit |
 
 Two tabs on each side have no letter shortcut — cycle to them with
-`[`/`]` or click: **Summary** and **Stacks** (instance mode), **Queries**
+`[`/`]` or click: **Processes** and **Stacks** (instance mode), **Queries**
 and **Modules** (database mode). Toolbox (`t`) offers three tools: spin
 a worker up (`SIGTTIN`) or down (`SIGTTOU`), and open shell — which
 copies the launch command instead of signaling, so it needs no confirm.
@@ -113,7 +113,7 @@ odoo_activity/
 ├── probes.py          # all system data: no Textual import, shared by the TUI and MCP server
 ├── mcp_server.py      # oa-mcp / oa-mcp-multi: probes.py as a read-only MCP tool API
 ├── panes/detail.py    # ActivityPane: the one stateful rendering widget
-├── panes/summary.py   # Summary tab: workers grouped by role
+├── panes/processes.py   # Processes tab: workers grouped by role
 ├── panes/stacks.py    # Stacks tab: parsed dumpstacks, busy-first
 └── tui.py             # app shell: layout, list, timers, actions
 ```
@@ -132,7 +132,7 @@ odoo_activity/
 - **`panes/detail.py`** — `ActivityPane`, the one stateful render widget: a
   tab strip over a Log/DataTable/Tree, mode-switched by whatever's
   highlighted (see Modes below) — not a separate popup screen. Delegates
-  the Summary and Stacks tab bodies to `panes/summary.py`/`panes/stacks.py`.
+  the Processes and Stacks tab bodies to `panes/processes.py`/`panes/stacks.py`.
 - **`tui.py`** — the shell only: `compose()` layout, the nested instances+dbs
   `ListView`, focus/highlight wiring, refresh timers, start/stop/restart.
   Delegates rendering to `ActivityPane`, data to `probes.py`,
@@ -144,7 +144,7 @@ odoo_activity/
 `ActivityPane` mode-switches on whatever's highlighted in the instances list:
 
 - **Instance mode** — an instance row is highlighted. Tabs: Top,
-  Summary, Stacks, Logs, Config, Toolbox.
+  Processes, Stacks, Logs, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
   Queries, Users, Locks, Jobs, Crons, Modules.
 

@@ -881,7 +881,7 @@ def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], l
 
 
 def instance_workers(inst: Instance, host: Host = LOCAL) -> tuple[str | None, list[ProcRow]]:
-    """(master_pid, odoo_top) for the Summary tab's worker tree --
+    """(master_pid, odoo_top) for the Processes tab's worker tree --
     same ppid-walk as instance_procs' odoo side, without paying for its
     postgres-backend matching (unused here)."""
     master = instance_pid(inst, host)

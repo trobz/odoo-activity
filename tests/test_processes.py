@@ -1,4 +1,4 @@
-from odoo_activity.panes.summary import _role
+from odoo_activity.panes.processes import _role
 from odoo_activity.probes import ProcRow
 
 

@@ -1,7 +1,7 @@
-"""Summary tab body — populates a Tree with a frozen snapshot of the
+"""Processes tab body — populates a Tree with a frozen snapshot of the
 instance's top grouped by role. Unlike Top (re-rendered
 every tick, sorted by live CPU%), this is only refreshed when the tab is
-(re)opened -- see ActivityPane._render_active's Summary branch.
+(re)opened -- see ActivityPane._render_active's Processes branch.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def _role(row: ProcRow, master: str | None) -> str:
     return "http"
 
 
-def render_summary(tree: Tree, rows: list[ProcRow], master: str | None) -> None:
+def render_processes(tree: Tree, rows: list[ProcRow], master: str | None) -> None:
     """Populate `tree` with `rows` (instance_workers' odoo process list)
     grouped by role."""
     tree.clear()
