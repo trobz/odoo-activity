@@ -120,7 +120,7 @@ class OdooActivity(App):
         ("r", "restart", "Restart"),
         ("[", "prev_tab", "Prev tab"),
         ("]", "next_tab", "Next tab"),
-        ("p", "select_tab('Processes')", "Processes"),
+        ("p", "select_tab('Top')", "Top"),
         ("l", "select_tab('Logs')", "Logs"),
         ("l", "select_tab('Locks')", "Locks"),
         ("c", "select_tab('Config')", "Config"),
@@ -132,6 +132,7 @@ class OdooActivity(App):
         ("K", "kill_process", "Kill -9"),
         ("L", "quit_process", "Log dump -3"),
         ("D", "dumpstacks", "Dump stacks"),
+        ("S", "copy_shell_command", "Copy shell cmd"),
         ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
         ("f", "toggle_maximize", "Maximize"),
         ("R", "refresh", "Refresh"),
@@ -197,7 +198,7 @@ class OdooActivity(App):
         self.query_one("#instances", ListView).loading = True
         self.refresh_instances()
 
-        # also paces the Processes tab, which rides this tick (ActivityPane.tick)
+        # also paces the Top tab, which rides this tick (ActivityPane.tick)
         self.set_interval(1.0 if self.host.is_local else 5.0, self.refresh_host)
         self.set_interval(0.5, self.query_one(ActivityPane).poll)
         # slower remotely (a tick is one ssh round trip per instance), but not
@@ -535,9 +536,9 @@ class OdooActivity(App):
             return self.query_one(ActivityPane).has_search()
 
         if action in ("kill_process", "quit_process"):
-            return self.query_one(ActivityPane).is_processes_active()
+            return self.query_one(ActivityPane).is_top_active()
 
-        if action == "dumpstacks":
+        if action in ("dumpstacks", "copy_shell_command"):
             return self.current_instance() is not None
 
         if action == "toggle_config_mode":
@@ -683,6 +684,16 @@ class OdooActivity(App):
             self.app.notify("dump ok — nothing long-running", timeout=3)
         activity.select_tab_by_name("Stacks")
         activity.focus_active()
+
+    def action_copy_shell_command(self) -> None:
+        inst = self.current_instance()
+        if inst is None:
+            return
+        self._copy_shell_command(inst)
+
+    @work(exclusive=True, group="shell-command")
+    async def _copy_shell_command(self, inst: Instance) -> None:
+        await self.query_one(ActivityPane).copy_shell_command(inst, self.host)
 
 
 def run() -> None:

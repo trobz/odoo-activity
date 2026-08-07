@@ -91,6 +91,20 @@ class Host:
         port_opts = ["-p", str(self.port)] if self.port else []
         return ["ssh", *_SSH_OPTS, *port_opts, self.alias, shlex.join(argv)]
 
+    def shell_invocation(self, cmd: str) -> str:
+        """`cmd` as the user should paste it into their own terminal to
+        reach an interactive shell: unchanged when local, or the ssh
+        command that lands them in one over an allocated pty when remote.
+
+        Deliberately skips our own `_SSH_OPTS` -- `BatchMode=yes` is right
+        for a headless probe, wrong for a session the user is about to sit
+        in front of and possibly type a password into.
+        """
+        if self.alias is None:
+            return cmd
+        port_opts = ["-p", str(self.port)] if self.port else []
+        return shlex.join(["ssh", "-t", *port_opts, self.alias, cmd])
+
     def run(self, argv: list[str], input_text: str | None = None) -> subprocess.CompletedProcess[str]:
         """Like subprocess.run(capture_output=True, text=True), local or over ssh.
 

@@ -20,6 +20,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pyperclip
+
 # typing_extensions, not typing: pydantic (via FastMCP, see mcp_server.py)
 # can't build a schema from typing.TypedDict on Python < 3.12.
 from typing_extensions import TypedDict
@@ -382,7 +384,7 @@ def _proc_uptime(pid: str, host: Host = LOCAL) -> float | None:
     /proc/uptime: both are boot-relative, so they're only consistent if they
     share the same boot reference — true on a bare host, but odoo.sh's
     /proc/uptime reflects the shared build node's uptime (weeks/months),
-    while a container's own processes can start ticks-since-boot counting
+    while a container's own top can start ticks-since-boot counting
     from a much more recent point, so the subtraction came out as the node's
     uptime, not the worker's. Same divergence class as the systemd
     ActiveEnterTimestamp/CLOCK_BOOTTIME fix noted in host.py's history —
@@ -604,6 +606,38 @@ def db_port_of(inst: Instance, host: Host = LOCAL) -> str | None:
     return _opt(parser, "db_port")
 
 
+def data_dir_of(inst: Instance, host: Host = LOCAL) -> str | None:
+    """The instance's `data_dir`, from its odoo config, or odoo.sh's fixed
+    `~/data` (its config has no `data_dir` key -- same reasoning as
+    `logfile_of`'s odoosh case)."""
+    if inst["manager"] == "odoosh":
+        return str(instance_workdir(inst, host) / "data")
+
+    _, parser = instance_config(inst, host)
+    return _opt(parser, "data_dir")
+
+
+def session_dir_of(inst: Instance, host: Host = LOCAL) -> str | None:
+    """The instance's filesystem session store dir (`<data_dir>/sessions`,
+    matching Odoo's own `Config.session_dir`), or None if `data_dir` is
+    unset."""
+    data_dir = data_dir_of(inst, host)
+    return f"{data_dir}/sessions" if data_dir else None
+
+
+def session_count(session_dir: str, host: Host = LOCAL) -> int:
+    """Number of stored sessions -- one file per session, sharded as
+    `<session_dir>/<2-char-prefix>/<sid>` (Odoo's own
+    `FilesystemSessionStore.get_session_filename`; its `vacuum()` scans the
+    same `*/*` glob). The 2-char shard dirs themselves are a fixed ~4096-slot
+    bucket scheme, not one session each, so they aren't what gets counted.
+
+    A real directory listing (one `ls` round trip, remotely) -- the caller
+    should keep this off any timer/auto-refresh path and gate it behind an
+    explicit, confirmed action."""
+    return len(host.glob(f"{session_dir}/*/*"))
+
+
 def databases_of(inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | None]:
     """(databases, db_port) for the instance — its authoritative members and
     the postgres port they live on (instances may run on different clusters).
@@ -693,9 +727,9 @@ def proc_cpu_ticks(pid: str, host: Host = LOCAL) -> int | None:
 def proc_cpu_ticks_many(pids: list[str], host: Host = LOCAL) -> dict[str, int | None]:
     """Batched `proc_cpu_ticks` -- local stays one read per pid (microseconds
     each, no need to batch), but remote becomes one ssh round trip for every
-    pid instead of one round trip per pid: the Processes tab was sitting on
-    "Loading processes..." for several real seconds against a host with more
-    than a couple of processes, one sequential round trip at a time."""
+    pid instead of one round trip per pid: the Top tab was sitting on
+    "Loading top..." for several real seconds against a host with more
+    than a couple of top, one sequential round trip at a time."""
     if host.is_local or not pids:
         return {pid: proc_cpu_ticks(pid, host) for pid in pids}
 
@@ -730,29 +764,36 @@ def instance_pid(inst: Instance, host: Host = LOCAL) -> str | None:
     return m.group(1) if m and m.group(1) != "0" else None
 
 
-def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
-    """The instance's master process plus every descendant (prefork
-    workers), read purely from ps by walking the ppid tree down from the
-    manager-reported master pid."""
-    master = instance_pid(inst, host)
-    if master is None:
-        return []
-
-    lines = host.run(["ps", "-eo", "pid,ppid,user,%mem,args"]).stdout.splitlines()[1:]  # drop header
+def _ps_snapshot(host: Host) -> tuple[dict[str, ProcRow], dict[str, list[str]]]:
+    """One `ps -eo` call, indexed by pid and by ppid -> children -- shared by
+    every walker below that needs the descendant tree of a known root pid."""
+    lines = host.run(["ps", "-eo", "pid,ppid,user,%mem,nice,args"]).stdout.splitlines()[1:]  # drop header
 
     by_pid: dict[str, ProcRow] = {}
     children: dict[str, list[str]] = {}
     for ln in lines:
-        cols = ln.split(maxsplit=4)
-        if len(cols) < 5:
+        cols = ln.split(maxsplit=5)
+        if len(cols) < 6:
             continue
 
-        row: ProcRow = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
+        row: ProcRow = {
+            "pid": cols[0],
+            "ppid": cols[1],
+            "user": cols[2],
+            "mem": cols[3],
+            "nice": cols[4],
+            "cmd": cols[5],
+        }
         by_pid[row["pid"]] = row
         children.setdefault(row["ppid"], []).append(row["pid"])
 
+    return by_pid, children
+
+
+def _descendants(root: str, by_pid: dict[str, ProcRow], children: dict[str, list[str]]) -> list[ProcRow]:
+    """`root` plus every pid reachable from it through `children`."""
     keep: list[str] = []
-    stack = [master]
+    stack = [root]
     while stack:
         pid = stack.pop()
         if pid in keep or pid not in by_pid:
@@ -763,9 +804,83 @@ def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
     return [by_pid[pid] for pid in keep]
 
 
+def _exe_of(pid: str, host: Host) -> str | None:
+    """Absolute path of `pid`'s running executable, via `/proc/<pid>/exe` --
+    unlike argv[0], never a bare `python3` left over from a `PATH` lookup
+    at launch. None on any failure (permission denied, pid gone, ...)."""
+    if host.is_local:
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return None
+
+    out = host.run(["readlink", "-f", f"/proc/{pid}/exe"]).stdout.strip()
+    return out or None
+
+
+def shell_command(inst: Instance, host: Host = LOCAL) -> str | None:
+    """The instance's `odoo-bin shell --no-http` command, e.g.
+    `/path/to/venv/bin/python3 /path/to/odoo-bin shell --no-http -c ...`,
+    or None if it isn't running. Built from the live process's own argv
+    (`procs_of`), with argv[0] upgraded via `_exe_of` when possible --
+    otherwise this could copy a `python3` that only resolves inside the
+    process's own launch context, not wherever it gets pasted.
+    `--no-http` skips binding the port the running instance already holds
+    (EADDRINUSE otherwise)."""
+    procs = procs_of(inst, host)
+    if not procs:
+        return None
+
+    tokens = procs[0]["cmd"].split()
+    if exe := _exe_of(procs[0]["pid"], host):
+        tokens[0] = exe
+
+    split_at = next((i for i, tok in enumerate(tokens) if tok.startswith("-")), len(tokens))
+
+    return " ".join([*tokens[:split_at], "shell", "--no-http", *tokens[split_at:]])
+
+
+def try_local_clipboard(text: str) -> bool:
+    """Copy `text` to the clipboard of the machine this process runs on.
+
+    Only meaningful for a local run -- over SSH this would write to the
+    remote host's clipboard, invisible to the user, so it's skipped whenever
+    the standard `SSH_TTY`/`SSH_CONNECTION` env vars mark this odoo-activity
+    process itself as running inside an ssh session (the caller should use
+    `App.copy_to_clipboard`'s OSC 52 instead, which does survive SSH). False
+    on any failure (no clipboard mechanism installed, SSH session, etc.) so
+    the caller can fall back.
+
+    Independent of the `--host` target: this is about the terminal
+    odoo-activity itself is drawn in, not which host `shell_command` was
+    read from -- see `Host.shell_invocation` for that side.
+    """
+    if os.environ.get("SSH_TTY") or os.environ.get("SSH_CONNECTION"):
+        return False
+
+    try:
+        pyperclip.copy(text)
+    except pyperclip.PyperclipException:
+        return False
+    else:
+        return True
+
+
+def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
+    """The instance's master process plus every descendant (prefork
+    workers), read purely from ps by walking the ppid tree down from the
+    manager-reported master pid."""
+    master = instance_pid(inst, host)
+    if master is None:
+        return []
+
+    by_pid, children = _ps_snapshot(host)
+    return _descendants(master, by_pid, children)
+
+
 def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], list[ProcRow]]:
-    """(odoo_processes, postgres_backends) from one `ps` call, halving the
-    system-wide `ps` fork+parse the Processes tab used to do twice a tick.
+    """(odoo_top, postgres_backends) from one `ps` call, halving the
+    system-wide `ps` fork+parse the Top tab used to do twice a tick.
 
     Postgres process titles vary by cluster configuration, so backends are
     matched by db-name membership rather than a fixed token position.
@@ -773,37 +888,27 @@ def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], l
     master = instance_pid(inst, host)
     dbs = set(databases_of(inst, host)[0])
 
-    lines = host.run(["ps", "-eo", "pid,ppid,user,%mem,args"]).stdout.splitlines()[1:]
-
-    by_pid: dict[str, ProcRow] = {}
-    children: dict[str, list[str]] = {}
-    pg_rows: list[ProcRow] = []
-
-    for ln in lines:
-        cols = ln.split(maxsplit=4)
-        if len(cols) < 5:
-            continue
-
-        row: ProcRow = {"pid": cols[0], "ppid": cols[1], "user": cols[2], "mem": cols[3], "cmd": cols[4]}
-        by_pid[row["pid"]] = row
-        children.setdefault(row["ppid"], []).append(row["pid"])
-
-        if dbs and row["cmd"].startswith("postgres:") and dbs.intersection(row["cmd"].split()):
-            pg_rows.append(row)
-
-    odoo_rows: list[ProcRow] = []
-    if master is not None:
-        keep: list[str] = []
-        stack = [master]
-        while stack:
-            pid = stack.pop()
-            if pid in keep or pid not in by_pid:
-                continue
-            keep.append(pid)
-            stack.extend(children.get(pid, []))
-        odoo_rows = [by_pid[pid] for pid in keep]
+    by_pid, children = _ps_snapshot(host)
+    pg_rows = [
+        row
+        for row in by_pid.values()
+        if dbs and row["cmd"].startswith("postgres:") and dbs.intersection(row["cmd"].split())
+    ]
+    odoo_rows = _descendants(master, by_pid, children) if master is not None else []
 
     return odoo_rows, pg_rows
+
+
+def instance_workers(inst: Instance, host: Host = LOCAL) -> tuple[str | None, list[ProcRow]]:
+    """(master_pid, odoo_top) for the Processes tab's worker tree --
+    same ppid-walk as instance_procs' odoo side, without paying for its
+    postgres-backend matching (unused here)."""
+    master = instance_pid(inst, host)
+    if master is None:
+        return None, []
+
+    by_pid, children = _ps_snapshot(host)
+    return master, _descendants(master, by_pid, children)
 
 
 _PG_CLIENT_PORT_RE = re.compile(r"\((\d+)\)")
@@ -895,6 +1000,7 @@ class ProcRow(TypedDict):
     ppid: str
     user: str
     mem: str
+    nice: str
     cmd: str
 
 
@@ -1017,7 +1123,7 @@ def stacks_by_activity(workers: list[Worker]) -> list[Worker]:
 
 
 def dump_and_parse_stacks(inst: Instance, host: Host = LOCAL) -> tuple[str, list[Worker]]:
-    """SIGQUIT all instance processes, read new log output, and parse stack dumps.
+    """SIGQUIT all instance top, read new log output, and parse stack dumps.
 
     Sends SIGQUIT to master and descendant workers, reading the log file from the
     pre-signal offset. Polls up to ~2s for all expected PID headers to appear.

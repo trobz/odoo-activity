@@ -31,16 +31,28 @@ one supports.
 | `s` / `r` | start/stop toggle / restart (confirm popup) |
 | `[` / `]` | switch tab in the detail pane |
 | `f` | maximize/minimize the focused pane |
-| `p` / `l` / `c` / `t` | Processes / Logs / Config / Toolbox |
+| `p` / `l` / `c` / `t` | Top / Logs / Config / Toolbox |
 | `u` / `l` / `j` / `c` | Users / Locks / Jobs / Crons |
-| `K` | kill -9 the selected process (Processes tab, confirm popup) |
-| `L` | kill -3 the selected process, then jump to Logs (Processes tab) |
-| `D` | dump stacks of all workers, then jump to Logs (Processes tab) |
+| `K` | kill -9 the selected process (Top tab, confirm popup) |
+| `L` | kill -3 the selected process, then jump to Stacks (Top tab) |
+| `D` | dump stacks of all workers, then jump to Stacks |
+| `S` | copy the instance's `odoo shell` launch command to the clipboard |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
-| enter | run the selected tool (Toolbox tab, confirm popup) |
+| enter | run the selected tool (Toolbox tab, confirm popup) / open a row's raw json (db tabs) |
 | `/` | search (Logs and Config tabs) |
 | `R` | refresh the active tab now |
 | `q` | quit |
+
+Two tabs on each side have no letter shortcut — cycle to them with
+`[`/`]` or click: **Processes** and **Stacks** (instance mode), **Queries**
+and **Modules** (database mode).
+
+Toolbox (`t`) offers four tools:
+- Spin a worker up (`SIGTTIN`) or down (`SIGTTOU`).
+- Open shell — which copies the launch command instead of signaling, so it needs
+  no confirm.
+- Count sessions under the instance's data dir (walks the filesystem, may be
+  slow).
 
 ### Remote hosts
 
@@ -50,7 +62,7 @@ remote host. Connections are multiplexed, so the first call opens the
 session and the rest reuse it.
 
 Everything still refreshes on its own against a remote host, just on a
-slower tick — host stats and Processes every 5s, the instance list every
+slower tick — host stats and Top every 5s, the instance list every
 15s. `R` refreshes the active tab immediately, plus the instance list and
 the highlighted instance's databases.
 
@@ -101,10 +113,13 @@ its name).
 
 ```
 odoo_activity/
-├── host.py           # local vs ssh command dispatch
-├── probes.py         # all system data: no Textual import
-├── panes/detail.py   # ActivityPane: the one stateful rendering widget
-└── tui.py            # app shell: layout, list, timers, actions
+├── host.py            # local vs ssh command dispatch
+├── probes.py          # all system data: no Textual import, shared by the TUI and MCP server
+├── mcp_server.py      # oa-mcp / oa-mcp-multi: probes.py as a read-only MCP tool API
+├── panes/detail.py    # ActivityPane: the one stateful rendering widget
+├── panes/processes.py   # Processes tab: workers grouped by role
+├── panes/stacks.py    # Stacks tab: parsed dumpstacks, busy-first
+└── tui.py             # app shell: layout, list, timers, actions
 ```
 
 - **`host.py`** — a `Host` is this machine or an ssh destination. Every probe
@@ -113,11 +128,15 @@ odoo_activity/
 - **`probes.py`** — pure functions, no UI. Every `systemctl`/`supervisorctl`/
   `ps`/`psql` call and `/proc` read lives here, returning plain dicts/lists
   so it's testable without spinning up a screen. An instance's databases,
-  logfile and processes all resolve from **one config**: its
+  logfile and top all resolve from **one config**: its
   `<workdir>/config/{odoo.conf,server.conf}`.
+- **`mcp_server.py`** — thin `@mcp.tool()` wrappers over `probes.py`, no
+  logic of its own; the same data the TUI shows, for an agent instead of a
+  human (see [MCP server](#mcp-server)).
 - **`panes/detail.py`** — `ActivityPane`, the one stateful render widget: a
-  tab strip over a Log/DataTable, mode-switched by whatever's highlighted
-  (see Modes below) — not a separate popup screen.
+  tab strip over a Log/DataTable/Tree, mode-switched by whatever's
+  highlighted (see Modes below) — not a separate popup screen. Delegates
+  the Processes and Stacks tab bodies to `panes/processes.py`/`panes/stacks.py`.
 - **`tui.py`** — the shell only: `compose()` layout, the nested instances+dbs
   `ListView`, focus/highlight wiring, refresh timers, start/stop/restart.
   Delegates rendering to `ActivityPane`, data to `probes.py`,
@@ -128,10 +147,10 @@ odoo_activity/
 
 `ActivityPane` mode-switches on whatever's highlighted in the instances list:
 
-- **Instance mode** — an instance row is highlighted. Tabs: Processes, Logs,
-  Config.
+- **Instance mode** — an instance row is highlighted. Tabs: Top,
+  Processes, Stacks, Logs, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
-  Users, Locks, Jobs, Crons, Modules, Stats.
+  Queries, Users, Locks, Jobs, Crons, Modules.
 
 Both modes share the same tab strip and Log/DataTable widgets (just a
 `_mode` flag), and several letter-key shortcuts are reused across them for
@@ -145,7 +164,7 @@ in database mode).
 - **Databases** — each instance's `<workdir>/config/{odoo.conf,server.conf}`
   gives a db role (or `ODOO_ACTIVITY_DB_ROLE`); `psql` lists the databases owned
   by that role.
-- **Processes** — the manager gives the instance's master pid (`systemctl ...
+- **Top** — the manager gives the instance's master pid (`systemctl ...
   -p MainPID` / `supervisorctl pid`); `ps -eo pid,ppid,user,%mem,args` is then
   walked down the ppid tree from there to find every worker.
 - **Logs** — the same config gives `logfile`, tailed by reading backward in

@@ -34,3 +34,12 @@ make test      # Run pytest
 - `ruff.toml` — Linter/formatter rules
 
 - `tests/` — Test suite (pytest)
+
+## Docs
+
+`README.md`'s keybindings table documents `odoo_activity/tui.py`'s
+`BINDINGS` and `odoo_activity/panes/detail.py`'s `TABS`/`TOOLBOX_TOOLS`;
+its MCP section documents `odoo_activity/mcp_server.py`'s `@mcp.tool`
+defs. Before merging a PR that changes any of those, run
+`make docs-check` (advisory — diffs the surface files since `README.md`
+was last touched) and fold real changes into `README.md`.

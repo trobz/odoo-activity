@@ -1,8 +1,8 @@
 """ActivityPane — Tabbed view for the selected row.
 
-Switches dynamically based on selection: Instance mode shows
-Processes/Logs/Config, while Database mode shows db-specific tabs. Mode-switched
-inline, no popups.
+Switches dynamically based on selection: Instance mode shows instance-specific
+tabs, while Database mode shows db-specific tabs. Mode-switched inline, no
+popups.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from textual.widgets import DataTable, Input, RichLog, Static, Tree
 
 from odoo_activity.host import Host, to_thread
 from odoo_activity.panes.confirm import ConfirmScreen
+from odoo_activity.panes.processes import render_processes
 from odoo_activity.panes.stacks import render_stacks
 from odoo_activity.probes import (
     CLK_TCK,
@@ -37,6 +38,7 @@ from odoo_activity.probes import (
     instance_pid,
     instance_procs,
     instance_version,
+    instance_workers,
     logfile_of,
     long_queries,
     odoo_pid_for_port,
@@ -44,11 +46,15 @@ from odoo_activity.probes import (
     pg_client_port,
     proc_cpu_ticks_many,
     render_config,
+    session_count,
+    session_dir_of,
+    shell_command,
     signal_process,
     start_odoo_db,
     stringify,
     table_columns,
     tail,
+    try_local_clipboard,
 )
 
 if TYPE_CHECKING:
@@ -58,7 +64,7 @@ _log = logging.getLogger("odoo_activity")
 
 
 class ProcDisplayRow(ProcRow):
-    """A `ProcRow` as shown in the Processes tab: odoo vs. postgres, plus
+    """A `ProcRow` as shown in the Top tab: odoo vs. postgres, plus
     the CPU-time/percent computed each refresh from consecutive `ps` polls."""
 
     kind: str
@@ -130,6 +136,7 @@ class ActivityPane(Vertical):
     #acsearch { margin-bottom: 1; }
     #acraw { background: transparent; display: none; }
     #acstacks { background: transparent; display: none; }
+    #acprocesses { background: transparent; display: none; }
     """
 
     # ALLOW_MAXIMIZE makes maximizing a focused child (DataTable/Log/Input)
@@ -139,15 +146,17 @@ class ActivityPane(Vertical):
     CONFIG_MODES: ClassVar = ["compact", "explain", "expand", "clean"]
 
     TABS: ClassVar = {
-        "instance": ["Processes", "Stacks", "Logs", "Config", "Toolbox"],
+        "instance": ["Top", "Processes", "Stacks", "Logs", "Config", "Toolbox"],
         "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules"],
     }
 
-    # (label, signal) -- enter on a Toolbox row sends `signal` to the
-    # instance's master pid, growing/shrinking the worker pool by one.
+    # (label, signal) -- an int sends that signal to the instance's master
+    # pid; None/"count_sessions" are special-cased -- see _run_toolbox_tool.
     TOOLBOX_TOOLS: ClassVar = [
         ("Spin up worker (SIGTTIN)", signal.SIGTTIN),
         ("Spin down worker (SIGTTOU)", signal.SIGTTOU),
+        ("Open shell (copy command)", None),
+        ("Count sessions", "count_sessions"),
     ]
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
 
@@ -168,6 +177,7 @@ class ActivityPane(Vertical):
         with _RawScroll(id="acraw"):
             yield Static(id="acraw-body")
         yield Tree("stacks", id="acstacks")
+        yield Tree("processes", id="acprocesses")
 
     def on_mount(self) -> None:
         self._mode = "instance"
@@ -182,7 +192,7 @@ class ActivityPane(Vertical):
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
         self._log_query: str | None = None
         self._top_prev: dict[str, tuple[int, float]] = {}  # pid -> (ticks, monotonic)
-        self._proc_rows: list[ProcDisplayRow] = []  # rows behind #actable in the Processes tab
+        self._proc_rows: list[ProcDisplayRow] = []  # rows behind #actable in the Top tab
         self._config_mode = self.CONFIG_MODES[0]  # which odoo-config view the Config tab shows
         self._inflight: dict[str, object] = {}  # key -> ident of the run in progress
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
@@ -190,6 +200,7 @@ class ActivityPane(Vertical):
         self._showing_raw = False  # viewing one row's raw json in #acbody
         self._stacks_cache: dict[str, tuple[list[Worker], Path]] = {}  # instance key -> its last dump
         self.query_one("#acstacks", Tree).show_root = False
+        self.query_one("#acprocesses", Tree).show_root = False
         self._render_mode()
 
     def on_unmount(self) -> None:
@@ -199,10 +210,10 @@ class ActivityPane(Vertical):
 
     def on_resize(self, event: events.Resize) -> None:
         # COMMAND's width is derived from table.size, which is still 0 the
-        # first time _render_processes runs (on_mount fires before layout
+        # first time _render_top runs (on_mount fires before layout
         # has sized anything) — redraw once the real size lands instead of
         # leaving it wrapped narrow until the next 1s poll tick.
-        if self.is_processes_active():
+        if self.is_top_active():
             self._show_process_table(self._proc_rows)
         elif self._dbtab.rows and not self._showing_raw:
             self._populate_datatable(self._dbtab.rows)
@@ -259,6 +270,9 @@ class ActivityPane(Vertical):
     def is_config_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Config"
 
+    def is_top_active(self) -> bool:
+        return self._mode == "instance" and self._active_tab() == "Top"
+
     def is_processes_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Processes"
 
@@ -274,8 +288,8 @@ class ActivityPane(Vertical):
         return self.is_logs_active() or self.is_config_active()
 
     def selected_process(self) -> ProcDisplayRow | None:
-        """The process under the Processes tab's table cursor, if any."""
-        if not self.is_processes_active() or not self._proc_rows:
+        """The process under the Top tab's table cursor, if any."""
+        if not self.is_top_active() or not self._proc_rows:
             return None
 
         idx = self.query_one("#actable", DataTable).cursor_row
@@ -313,7 +327,7 @@ class ActivityPane(Vertical):
             self.run_worker(self._run_toolbox_tool(idx))
             return
 
-        if self.is_processes_active():
+        if self.is_top_active():
             self.run_worker(self._jump_from_process_row(idx))
             return
 
@@ -325,13 +339,23 @@ class ActivityPane(Vertical):
             self._show_raw(self._dbtab.rows[idx])
 
     async def _run_toolbox_tool(self, idx: int) -> None:
-        """Confirm, then send the selected row's signal to the master pid."""
+        """Run the selected Toolbox row -- signals go to the master pid
+        (confirmed first); non-signal entries dispatch to their own
+        handler below."""
         if self._instance is None or not (0 <= idx < len(self.TOOLBOX_TOOLS)):
             return
 
         label, sig = self.TOOLBOX_TOOLS[idx]
         inst = self._instance
         host = self.app.host
+
+        if sig is None:
+            await self.copy_shell_command(inst, host)
+            return
+
+        if sig == "count_sessions":
+            await self._count_sessions(inst, host)
+            return
 
         confirmed = await self.app.push_screen_wait(ConfirmScreen(f"{label} — {inst['name']}?"))
         if not confirmed:
@@ -344,6 +368,39 @@ class ActivityPane(Vertical):
 
         await to_thread(signal_process, pid, sig, host)
         self.app.notify(f"{label} sent to {inst['name']} (pid {pid})", timeout=2)
+
+    async def copy_shell_command(self, inst: Instance, host: Host) -> None:
+        """Copy `inst`'s `odoo shell` launch command -- ssh-wrapped first if
+        `host` isn't local, since the command's own paths (venv, odoo-bin,
+        config) only exist on `host`, not necessarily on the machine
+        odoo-activity itself is running on. Called from the Toolbox row and
+        the app's own `S` shortcut alike."""
+        cmd = await to_thread(shell_command, inst, host)
+        if cmd is None:
+            self.app.notify(f"{inst['name']} isn't running — no shell command to copy", severity="warning", timeout=3)
+            return
+
+        text = host.shell_invocation(cmd)
+        # local run -> pyperclip (this machine's clipboard); SSH -> OSC 52 (the
+        # one that survives the tunnel back to the user's own machine)
+        if not await to_thread(try_local_clipboard, text):
+            self.app.copy_to_clipboard(text)
+        self.app.notify("Shell command copied to clipboard", timeout=3)
+
+    async def _count_sessions(self, inst: Instance, host: Host) -> None:
+        confirmed = await self.app.push_screen_wait(
+            ConfirmScreen(f"Count sessions for {inst['name']}? (walks the session dir, may be slow)")
+        )
+        if not confirmed:
+            return
+
+        session_dir = await to_thread(session_dir_of, inst, host)
+        if session_dir is None:
+            self.app.notify(f"{inst['name']}: no data_dir configured", severity="warning", timeout=3)
+            return
+
+        count = await to_thread(session_count, session_dir, host)
+        self.app.notify(f"{count} sessions in {session_dir}", timeout=5)
 
     async def _jump_from_process_row(self, idx: int) -> None:
         """`enter` on a postgres row moves the cursor to the Odoo worker
@@ -480,16 +537,16 @@ class ActivityPane(Vertical):
         self.select_tab(self._tab + 1)
 
     def tick(self) -> None:
-        """Keep Processes live while it's the active tab. Rides the host
+        """Keep Top live while it's the active tab. Rides the host
         refresh timer, so it inherits that timer's local/remote cadence —
         CPU% is a rate between two of these samples, so it needs to fire on
         its own rather than only on `R`."""
-        if self.is_processes_active():
-            self._render_processes()
+        if self.is_top_active():
+            self._render_top()
 
     def refresh_active(self) -> None:
         """Manual re-fetch of whatever the active tab shows — the only way
-        to update Processes on a remote host now that `tick` skips it."""
+        to update Top on a remote host now that `tick` skips it."""
         self._render_active()
 
     def _stop_log_stream(self) -> None:
@@ -590,13 +647,19 @@ class ActivityPane(Vertical):
         if self._mode == "instance":
             if active == "Logs":
                 # clear whatever the prior tab left in #acbody (e.g.
-                # Processes' "Loading processes…") instead of leaving it
+                # Top' "Loading top…") instead of leaving it
                 # visible until the async tail fetch lands
                 self._log_body("Loading logs…")
                 self._load_log(self._instance)
             elif active == "Config":
                 self._use("log")
                 self._render_config()
+            elif active == "Processes":
+                self._use("processes")
+                tree = self.query_one("#acprocesses", Tree)
+                tree.clear()
+                tree.root.add_leaf("Loading…")
+                self._render_processes()
             elif active == "Stacks":
                 # deferred here (not on every instance nav — see
                 # _restore_stacks) until the tab a user actually switches to.
@@ -609,16 +672,16 @@ class ActivityPane(Vertical):
                 self.call_after_refresh(self._populate_stacks, self._instance)
             elif active == "Toolbox":
                 self._render_toolbox()
-            else:  # Processes
-                # loading text now, table (_do_render_processes flips _use
+            else:  # Top
+                # loading text now, table (_do_render_top flips _use
                 # back once ready) -- a remote fetch is slow enough that an
                 # empty, already-visible table read as "nothing happened"
-                self._log_body("Loading processes…")
+                self._log_body("Loading top…")
                 # _top_prev is not cleared here: it is the baseline CPU% is
-                # derived from, and _do_render_processes rebuilds it from the
+                # derived from, and _do_render_top rebuilds it from the
                 # live pid set anyway. Dropping it made every tab switch show
                 # 0.0% until a second refresh -- remotely, a second `R`.
-                self._render_processes()
+                self._render_top()
         else:
             self._load_db_tab(active)
 
@@ -760,6 +823,23 @@ class ActivityPane(Vertical):
     async def _do_render_processes(self) -> None:
         inst = self._instance
         if inst is None:
+            self.query_one("#acprocesses", Tree).clear()
+            return
+
+        host = self.app.host
+        master, rows = await to_thread(instance_workers, inst, host)
+
+        if self._instance is not inst or not self.is_processes_active():
+            return  # instance or tab changed while this was fetching; the result is stale
+
+        render_processes(self.query_one("#acprocesses", Tree), rows, master)
+
+    def _render_top(self) -> None:
+        self._coalesce("top", _inst_key(self._instance), self._do_render_top)
+
+    async def _do_render_top(self) -> None:
+        inst = self._instance
+        if inst is None:
             self._proc_rows = []
             self._use("table")
             self._show_process_table([])
@@ -768,7 +848,7 @@ class ActivityPane(Vertical):
         host = self.app.host
         odoo_procs, pg_procs = await to_thread(instance_procs, inst, host)
 
-        if self._instance is not inst or not self.is_processes_active():
+        if self._instance is not inst or not self.is_top_active():
             return  # instance or tab changed while this was fetching; the result is stale
 
         procs: list[tuple[ProcRow, str]] = [(p, "odoo") for p in odoo_procs] + [(p, "pg") for p in pg_procs]
@@ -780,7 +860,7 @@ class ActivityPane(Vertical):
         # one more round trip (batched -- see proc_cpu_ticks_many) since the
         # guard above; recheck before forcing #actable visible, or a late
         # completion hijacks whatever tab is now showing
-        if self._instance is not inst or not self.is_processes_active():
+        if self._instance is not inst or not self.is_top_active():
             return
 
         rows: list[ProcDisplayRow] = []
@@ -932,11 +1012,12 @@ class ActivityPane(Vertical):
         "table": ("#actable", DataTable),
         "raw": ("#acraw", VerticalScroll),
         "stacks": ("#acstacks", Tree),
+        "processes": ("#acprocesses", Tree),
     }
 
     def _use(self, which: str) -> None:
-        """Show the Log, the DataTable, the raw-json view, or the Stacks tree
-        in the pane body."""
+        """Show the Log, the DataTable, the raw-json view, the Stacks tree,
+        or the Processes tree in the pane body."""
         for name, (selector, widget_type) in self._BODY_WIDGETS.items():
             self.query_one(selector, widget_type).display = name == which
 
@@ -949,7 +1030,7 @@ class ActivityPane(Vertical):
             table.add_row(label, key=str(i))
 
     def _show_datatable(self, rows: list[dict]) -> None:
-        # Unlike Processes (re-rendered every 0.5s poll, so a wrong width
+        # Unlike Top (re-rendered every 0.5s poll, so a wrong width
         # self-corrects within a tick), db tabs render once — reveal the
         # table first so layout can size it, then measure it, instead of
         # sizing the wrap column off its pre-layout (e.g. leftover/zero)
@@ -965,7 +1046,7 @@ class ActivityPane(Vertical):
 
         # "code" (crons' --include-code) is a blob, not a cell — wrap it into
         # the table's remaining width instead of stringify's 80-char clip,
-        # same as the Processes tab's COMMAND column.
+        # same as the Top tab's COMMAND column.
         wrap_col = "code" if "code" in columns else None
         fixed = [c for c in columns if c != wrap_col]
         table.add_columns(*(c.upper() for c in fixed))

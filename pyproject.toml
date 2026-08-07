@@ -13,6 +13,7 @@ dependencies = [
     "textual>=8",
     "typing-extensions>=4.16",
     "mcp[cli]>=1.28.1",
+    "pyperclip>=1.11.0",
 ]
 
 [project.urls]
