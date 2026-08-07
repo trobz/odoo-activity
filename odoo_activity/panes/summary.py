@@ -1,5 +1,5 @@
 """Summary tab body — populates a Tree with a frozen snapshot of the
-instance's odoo processes grouped by role. Unlike Processes (re-rendered
+instance's top grouped by role. Unlike Top (re-rendered
 every tick, sorted by live CPU%), this is only refreshed when the tab is
 (re)opened -- see ActivityPane._render_active's Summary branch.
 """

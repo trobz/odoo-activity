@@ -55,8 +55,8 @@ def test_parse_odoo_db_output_wraps_a_single_json_object():
 
 def test_proc_cpu_ticks_many_batches_a_remote_host_into_one_call(monkeypatch):
     # regression: this used to be one ssh round trip per pid (proc_cpu_ticks
-    # in a loop) -- slow enough with more than a couple of processes that
-    # the Processes tab sat on "Loading processes..." for real seconds.
+    # in a loop) -- slow enough with more than a couple of top that
+    # the Top tab sat on "Loading top..." for real seconds.
     calls = []
 
     def fake_run(self, argv, **_):

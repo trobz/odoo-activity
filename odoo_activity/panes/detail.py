@@ -1,8 +1,8 @@
 """ActivityPane — Tabbed view for the selected row.
 
-Switches dynamically based on selection: Instance mode shows
-Processes/Logs/Config, while Database mode shows db-specific tabs. Mode-switched
-inline, no popups.
+Switches dynamically based on selection: Instance mode shows instance-specific
+tabs, while Database mode shows db-specific tabs. Mode-switched inline, no
+popups.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ _log = logging.getLogger("odoo_activity")
 
 
 class ProcDisplayRow(ProcRow):
-    """A `ProcRow` as shown in the Processes tab: odoo vs. postgres, plus
+    """A `ProcRow` as shown in the Top tab: odoo vs. postgres, plus
     the CPU-time/percent computed each refresh from consecutive `ps` polls."""
 
     kind: str
@@ -144,7 +144,7 @@ class ActivityPane(Vertical):
     CONFIG_MODES: ClassVar = ["compact", "explain", "expand", "clean"]
 
     TABS: ClassVar = {
-        "instance": ["Processes", "Summary", "Stacks", "Logs", "Config", "Toolbox"],
+        "instance": ["Top", "Summary", "Stacks", "Logs", "Config", "Toolbox"],
         "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules"],
     }
 
@@ -191,7 +191,7 @@ class ActivityPane(Vertical):
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
         self._log_query: str | None = None
         self._top_prev: dict[str, tuple[int, float]] = {}  # pid -> (ticks, monotonic)
-        self._proc_rows: list[ProcDisplayRow] = []  # rows behind #actable in the Processes tab
+        self._proc_rows: list[ProcDisplayRow] = []  # rows behind #actable in the Top tab
         self._config_mode = self.CONFIG_MODES[0]  # which odoo-config view the Config tab shows
         self._inflight: dict[str, object] = {}  # key -> ident of the run in progress
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
@@ -209,10 +209,10 @@ class ActivityPane(Vertical):
 
     def on_resize(self, event: events.Resize) -> None:
         # COMMAND's width is derived from table.size, which is still 0 the
-        # first time _render_processes runs (on_mount fires before layout
+        # first time _render_top runs (on_mount fires before layout
         # has sized anything) — redraw once the real size lands instead of
         # leaving it wrapped narrow until the next 1s poll tick.
-        if self.is_processes_active():
+        if self.is_top_active():
             self._show_process_table(self._proc_rows)
         elif self._dbtab.rows and not self._showing_raw:
             self._populate_datatable(self._dbtab.rows)
@@ -269,8 +269,8 @@ class ActivityPane(Vertical):
     def is_config_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Config"
 
-    def is_processes_active(self) -> bool:
-        return self._mode == "instance" and self._active_tab() == "Processes"
+    def is_top_active(self) -> bool:
+        return self._mode == "instance" and self._active_tab() == "Top"
 
     def is_summary_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Summary"
@@ -287,8 +287,8 @@ class ActivityPane(Vertical):
         return self.is_logs_active() or self.is_config_active()
 
     def selected_process(self) -> ProcDisplayRow | None:
-        """The process under the Processes tab's table cursor, if any."""
-        if not self.is_processes_active() or not self._proc_rows:
+        """The process under the Top tab's table cursor, if any."""
+        if not self.is_top_active() or not self._proc_rows:
             return None
 
         idx = self.query_one("#actable", DataTable).cursor_row
@@ -326,7 +326,7 @@ class ActivityPane(Vertical):
             self.run_worker(self._run_toolbox_tool(idx))
             return
 
-        if self.is_processes_active():
+        if self.is_top_active():
             self.run_worker(self._jump_from_process_row(idx))
             return
 
@@ -518,16 +518,16 @@ class ActivityPane(Vertical):
         self.select_tab(self._tab + 1)
 
     def tick(self) -> None:
-        """Keep Processes live while it's the active tab. Rides the host
+        """Keep Top live while it's the active tab. Rides the host
         refresh timer, so it inherits that timer's local/remote cadence —
         CPU% is a rate between two of these samples, so it needs to fire on
         its own rather than only on `R`."""
-        if self.is_processes_active():
-            self._render_processes()
+        if self.is_top_active():
+            self._render_top()
 
     def refresh_active(self) -> None:
         """Manual re-fetch of whatever the active tab shows — the only way
-        to update Processes on a remote host now that `tick` skips it."""
+        to update Top on a remote host now that `tick` skips it."""
         self._render_active()
 
     def _stop_log_stream(self) -> None:
@@ -628,7 +628,7 @@ class ActivityPane(Vertical):
         if self._mode == "instance":
             if active == "Logs":
                 # clear whatever the prior tab left in #acbody (e.g.
-                # Processes' "Loading processes…") instead of leaving it
+                # Top' "Loading top…") instead of leaving it
                 # visible until the async tail fetch lands
                 self._log_body("Loading logs…")
                 self._load_log(self._instance)
@@ -653,16 +653,16 @@ class ActivityPane(Vertical):
                 self.call_after_refresh(self._populate_stacks, self._instance)
             elif active == "Toolbox":
                 self._render_toolbox()
-            else:  # Processes
-                # loading text now, table (_do_render_processes flips _use
+            else:  # Top
+                # loading text now, table (_do_render_top flips _use
                 # back once ready) -- a remote fetch is slow enough that an
                 # empty, already-visible table read as "nothing happened"
-                self._log_body("Loading processes…")
+                self._log_body("Loading top…")
                 # _top_prev is not cleared here: it is the baseline CPU% is
-                # derived from, and _do_render_processes rebuilds it from the
+                # derived from, and _do_render_top rebuilds it from the
                 # live pid set anyway. Dropping it made every tab switch show
                 # 0.0% until a second refresh -- remotely, a second `R`.
-                self._render_processes()
+                self._render_top()
         else:
             self._load_db_tab(active)
 
@@ -815,10 +815,10 @@ class ActivityPane(Vertical):
 
         render_summary(self.query_one("#acsummary", Tree), rows, master)
 
-    def _render_processes(self) -> None:
-        self._coalesce("processes", _inst_key(self._instance), self._do_render_processes)
+    def _render_top(self) -> None:
+        self._coalesce("top", _inst_key(self._instance), self._do_render_top)
 
-    async def _do_render_processes(self) -> None:
+    async def _do_render_top(self) -> None:
         inst = self._instance
         if inst is None:
             self._proc_rows = []
@@ -829,7 +829,7 @@ class ActivityPane(Vertical):
         host = self.app.host
         odoo_procs, pg_procs = await to_thread(instance_procs, inst, host)
 
-        if self._instance is not inst or not self.is_processes_active():
+        if self._instance is not inst or not self.is_top_active():
             return  # instance or tab changed while this was fetching; the result is stale
 
         procs: list[tuple[ProcRow, str]] = [(p, "odoo") for p in odoo_procs] + [(p, "pg") for p in pg_procs]
@@ -841,7 +841,7 @@ class ActivityPane(Vertical):
         # one more round trip (batched -- see proc_cpu_ticks_many) since the
         # guard above; recheck before forcing #actable visible, or a late
         # completion hijacks whatever tab is now showing
-        if self._instance is not inst or not self.is_processes_active():
+        if self._instance is not inst or not self.is_top_active():
             return
 
         rows: list[ProcDisplayRow] = []
@@ -1011,7 +1011,7 @@ class ActivityPane(Vertical):
             table.add_row(label, key=str(i))
 
     def _show_datatable(self, rows: list[dict]) -> None:
-        # Unlike Processes (re-rendered every 0.5s poll, so a wrong width
+        # Unlike Top (re-rendered every 0.5s poll, so a wrong width
         # self-corrects within a tick), db tabs render once — reveal the
         # table first so layout can size it, then measure it, instead of
         # sizing the wrap column off its pre-layout (e.g. leftover/zero)
@@ -1027,7 +1027,7 @@ class ActivityPane(Vertical):
 
         # "code" (crons' --include-code) is a blob, not a cell — wrap it into
         # the table's remaining width instead of stringify's 80-char clip,
-        # same as the Processes tab's COMMAND column.
+        # same as the Top tab's COMMAND column.
         wrap_col = "code" if "code" in columns else None
         fixed = [c for c in columns if c != wrap_col]
         table.add_columns(*(c.upper() for c in fixed))

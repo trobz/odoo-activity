@@ -116,7 +116,7 @@ class InstanceDatabases(TypedDict):
     db_port: str | None
 
 
-class InstanceProcesses(TypedDict):
+class InstanceTop(TypedDict):
     odoo: list[ProcRow]
     postgres: list[ProcRow]
 
@@ -190,7 +190,7 @@ def get_instance(name: str, *, target: Host) -> Instance | None:
 
 @mcp.tool()
 @_pinned_host
-def list_processes(name: str, *, target: Host) -> list[ProcRow]:
+def list_top(name: str, *, target: Host) -> list[ProcRow]:
     """The instance's master process plus every descendant worker, or an
     empty list if the instance isn't found or has no live process.
 
@@ -256,9 +256,9 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
 
 @mcp.tool()
 @_pinned_host
-def instance_processes(name: str, *, target: Host) -> InstanceProcesses | None:
-    """The instance's odoo processes and its postgres backends, or None if
-    the instance isn't found. Additive to `list_processes`, which stays
+def instance_top(name: str, *, target: Host) -> InstanceTop | None:
+    """The instance's odoo top and its postgres backends, or None if
+    the instance isn't found. Additive to `list_top`, which stays
     odoo-only.
 
     Args:

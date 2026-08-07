@@ -384,7 +384,7 @@ def _proc_uptime(pid: str, host: Host = LOCAL) -> float | None:
     /proc/uptime: both are boot-relative, so they're only consistent if they
     share the same boot reference — true on a bare host, but odoo.sh's
     /proc/uptime reflects the shared build node's uptime (weeks/months),
-    while a container's own processes can start ticks-since-boot counting
+    while a container's own top can start ticks-since-boot counting
     from a much more recent point, so the subtraction came out as the node's
     uptime, not the worker's. Same divergence class as the systemd
     ActiveEnterTimestamp/CLOCK_BOOTTIME fix noted in host.py's history —
@@ -727,9 +727,9 @@ def proc_cpu_ticks(pid: str, host: Host = LOCAL) -> int | None:
 def proc_cpu_ticks_many(pids: list[str], host: Host = LOCAL) -> dict[str, int | None]:
     """Batched `proc_cpu_ticks` -- local stays one read per pid (microseconds
     each, no need to batch), but remote becomes one ssh round trip for every
-    pid instead of one round trip per pid: the Processes tab was sitting on
-    "Loading processes..." for several real seconds against a host with more
-    than a couple of processes, one sequential round trip at a time."""
+    pid instead of one round trip per pid: the Top tab was sitting on
+    "Loading top..." for several real seconds against a host with more
+    than a couple of top, one sequential round trip at a time."""
     if host.is_local or not pids:
         return {pid: proc_cpu_ticks(pid, host) for pid in pids}
 
@@ -860,8 +860,8 @@ def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
 
 
 def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], list[ProcRow]]:
-    """(odoo_processes, postgres_backends) from one `ps` call, halving the
-    system-wide `ps` fork+parse the Processes tab used to do twice a tick.
+    """(odoo_top, postgres_backends) from one `ps` call, halving the
+    system-wide `ps` fork+parse the Top tab used to do twice a tick.
 
     Postgres process titles vary by cluster configuration, so backends are
     matched by db-name membership rather than a fixed token position.
@@ -881,7 +881,7 @@ def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], l
 
 
 def instance_workers(inst: Instance, host: Host = LOCAL) -> tuple[str | None, list[ProcRow]]:
-    """(master_pid, odoo_processes) for the Summary tab's worker tree --
+    """(master_pid, odoo_top) for the Summary tab's worker tree --
     same ppid-walk as instance_procs' odoo side, without paying for its
     postgres-backend matching (unused here)."""
     master = instance_pid(inst, host)
@@ -1104,7 +1104,7 @@ def stacks_by_activity(workers: list[Worker]) -> list[Worker]:
 
 
 def dump_and_parse_stacks(inst: Instance, host: Host = LOCAL) -> tuple[str, list[Worker]]:
-    """SIGQUIT all instance processes, read new log output, and parse stack dumps.
+    """SIGQUIT all instance top, read new log output, and parse stack dumps.
 
     Sends SIGQUIT to master and descendant workers, reading the log file from the
     pre-signal offset. Polls up to ~2s for all expected PID headers to appear.

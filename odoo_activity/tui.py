@@ -122,7 +122,7 @@ class OdooActivity(App):
         ("r", "restart", "Restart"),
         ("[", "prev_tab", "Prev tab"),
         ("]", "next_tab", "Next tab"),
-        ("p", "select_tab('Processes')", "Processes"),
+        ("p", "select_tab('Top')", "Top"),
         ("l", "select_tab('Logs')", "Logs"),
         ("l", "select_tab('Locks')", "Locks"),
         ("c", "select_tab('Config')", "Config"),
@@ -201,7 +201,7 @@ class OdooActivity(App):
         self.query_one("#instances", ListView).loading = True
         self.refresh_instances()
 
-        # also paces the Processes tab, which rides this tick (ActivityPane.tick)
+        # also paces the Top tab, which rides this tick (ActivityPane.tick)
         self.set_interval(1.0 if self.host.is_local else 5.0, self.refresh_host)
         self.set_interval(0.5, self.query_one(ActivityPane).poll)
         # slower remotely (a tick is one ssh round trip per instance), but not
@@ -539,7 +539,7 @@ class OdooActivity(App):
             return self.query_one(ActivityPane).has_search()
 
         if action in ("kill_process", "quit_process"):
-            return self.query_one(ActivityPane).is_processes_active()
+            return self.query_one(ActivityPane).is_top_active()
 
         if action in ("dumpstacks", "copy_shell_command", "count_sessions"):
             return self.current_instance() is not None

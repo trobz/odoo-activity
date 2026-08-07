@@ -31,10 +31,10 @@ one supports.
 | `s` / `r` | start/stop toggle / restart (confirm popup) |
 | `[` / `]` | switch tab in the detail pane |
 | `f` | maximize/minimize the focused pane |
-| `p` / `l` / `c` / `t` | Processes / Logs / Config / Toolbox |
+| `p` / `l` / `c` / `t` | Top / Logs / Config / Toolbox |
 | `u` / `l` / `j` / `c` | Users / Locks / Jobs / Crons |
-| `K` | kill -9 the selected process (Processes tab, confirm popup) |
-| `L` | kill -3 the selected process, then jump to Stacks (Processes tab) |
+| `K` | kill -9 the selected process (Top tab, confirm popup) |
+| `L` | kill -3 the selected process, then jump to Stacks (Top tab) |
 | `D` | dump stacks of all workers, then jump to Stacks |
 | `S` | copy the instance's `odoo shell` launch command to the clipboard |
 | `C` | count sessions under the instance's data dir (confirm popup, may be slow) |
@@ -58,7 +58,7 @@ remote host. Connections are multiplexed, so the first call opens the
 session and the rest reuse it.
 
 Everything still refreshes on its own against a remote host, just on a
-slower tick — host stats and Processes every 5s, the instance list every
+slower tick — host stats and Top every 5s, the instance list every
 15s. `R` refreshes the active tab immediately, plus the instance list and
 the highlighted instance's databases.
 
@@ -124,7 +124,7 @@ odoo_activity/
 - **`probes.py`** — pure functions, no UI. Every `systemctl`/`supervisorctl`/
   `ps`/`psql` call and `/proc` read lives here, returning plain dicts/lists
   so it's testable without spinning up a screen. An instance's databases,
-  logfile and processes all resolve from **one config**: its
+  logfile and top all resolve from **one config**: its
   `<workdir>/config/{odoo.conf,server.conf}`.
 - **`mcp_server.py`** — thin `@mcp.tool()` wrappers over `probes.py`, no
   logic of its own; the same data the TUI shows, for an agent instead of a
@@ -143,7 +143,7 @@ odoo_activity/
 
 `ActivityPane` mode-switches on whatever's highlighted in the instances list:
 
-- **Instance mode** — an instance row is highlighted. Tabs: Processes,
+- **Instance mode** — an instance row is highlighted. Tabs: Top,
   Summary, Stacks, Logs, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
   Queries, Users, Locks, Jobs, Crons, Modules.
@@ -160,7 +160,7 @@ in database mode).
 - **Databases** — each instance's `<workdir>/config/{odoo.conf,server.conf}`
   gives a db role (or `ODOO_ACTIVITY_DB_ROLE`); `psql` lists the databases owned
   by that role.
-- **Processes** — the manager gives the instance's master pid (`systemctl ...
+- **Top** — the manager gives the instance's master pid (`systemctl ...
   -p MainPID` / `supervisorctl pid`); `ps -eo pid,ppid,user,%mem,args` is then
   walked down the ppid tree from there to find every worker.
 - **Logs** — the same config gives `logfile`, tailed by reading backward in
