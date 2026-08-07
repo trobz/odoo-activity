@@ -2,6 +2,41 @@
 
 <!-- version list -->
 
+## v0.11.0 (2026-08-07)
+
+### Bug Fixes
+
+- **probes**: Resolve bare interpreter in shell_command
+  ([`65d11db`](https://github.com/trobz/odoo-activity/commit/65d11dbc266e25662948b4a02201a02425fba189))
+
+### Documentation
+
+- Update keybindings table and add docs-check make target
+  ([`f7f4d35`](https://github.com/trobz/odoo-activity/commit/f7f4d3513a67d9bf08885d6daf13e1d520dc1232))
+
+### Features
+
+- **activity-pane**: Add Summary tab for workers by role
+  ([`9a44fbf`](https://github.com/trobz/odoo-activity/commit/9a44fbf03c13434a3c448b8fa6e0d7e370ddd399))
+
+- **mcp**: Add instance_shell_command tool
+  ([`3ab75df`](https://github.com/trobz/odoo-activity/commit/3ab75df08e2368ff47cddd42ed5a2b6711e8696f))
+
+- **toolbox**: Add open shell command copy and session counter
+  ([`41b149c`](https://github.com/trobz/odoo-activity/commit/41b149c8a215c0dad7b01c999e72890beb578459))
+
+### Refactoring
+
+- Rename Processes tab to Top
+  ([`a12c4d3`](https://github.com/trobz/odoo-activity/commit/a12c4d3928c36c147f4df38912205b75d12f4fab))
+
+- Rename Summary tab to Processes
+  ([`5093f19`](https://github.com/trobz/odoo-activity/commit/5093f193e086689773c8d761c26d3c1ce1673f8e))
+
+- **toolbox**: Move session count off C into Toolbox
+  ([`145d668`](https://github.com/trobz/odoo-activity/commit/145d6687a674a6e27461ddf3688ae99babbd9a0b))
+
+
 ## v0.10.0 (2026-08-04)
 
 ### Bug Fixes
