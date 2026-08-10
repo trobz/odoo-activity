@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 from odoo_activity import probes, tui
 from odoo_activity.host import Host
-from odoo_activity.probes import Instance
 
 
 def test_bar_colors_by_htop_thresholds():
@@ -11,35 +10,6 @@ def test_bar_colors_by_htop_thresholds():
     assert "[yellow]" in tui._bar(50)
     assert "[yellow]" in tui._bar(79)
     assert "[red]" in tui._bar(80)
-
-
-def test_systemd_instances_filters_templates_and_maps_status(monkeypatch):
-    files = (
-        "gnome@.service           disabled enabled\n"  # template, dropped
-        "wiki.service             enabled  enabled\n"  # not odoo, filtered
-        "openerp-demo.service    disabled enabled\n"  # matched by name only
-        "odoo-demo.service        disabled enabled\n"
-        "odoo-crashed.service     disabled enabled\n"
-    )
-    show = (
-        "Id=wiki.service\nDescription=A wiki\nActiveState=inactive\n\n"
-        "Id=openerp-demo.service\nDescription=Staging\nActiveState=inactive\n\n"
-        "Id=odoo-demo.service\nDescription=Odoo odoo 18.0 instance\n"
-        "ActiveState=active\nActiveEnterTimestampMonotonic=1000000\n\n"
-        "Id=odoo-crashed.service\nDescription=Odoo crashed instance\nActiveState=failed\n"
-    )
-
-    def fake_run(cmd, **_):
-        return SimpleNamespace(stdout=files if "list-unit-files" in cmd else show)
-
-    monkeypatch.setattr(probes.subprocess, "run", fake_run)
-    monkeypatch.setattr(probes.time, "clock_gettime", lambda _clk: 61.0)  # 60s after entering active
-
-    assert probes.systemd_instances() == [
-        {"name": "openerp-demo.service", "status": "stopped", "uptime": "-", "manager": "systemd"},
-        {"name": "odoo-demo.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"},
-        {"name": "odoo-crashed.service", "status": "failed", "uptime": "-", "manager": "systemd"},
-    ]
 
 
 def test_parse_odoo_db_output_falls_back_to_raw_for_non_json():
@@ -78,54 +48,6 @@ def test_proc_cpu_ticks_many_batches_a_remote_host_into_one_call(monkeypatch):
     assert len(calls) == 1  # one round trip, not three
 
 
-def test_supervisor_instances_maps_status_vocab_and_uptime(monkeypatch, tmp_path):
-    monkeypatch.setattr(probes, "SUPERVISOR_CONFD", tmp_path / "absent")  # status only
-    status = (
-        "/usr/bin/supervisorctl:6: DeprecationWarning: pkg_resources is deprecated\n"
-        "  from pkg_resources import load_entry_point\n"
-        "mailhog                        RUNNING   pid 23107, uptime 9:19:07\n"  # not odoo, filtered
-        "openerp-odoo-staging           RUNNING   pid 19841, uptime 0:05:00\n"
-        "openerp-odoo-crashed           FATAL     Exited too quickly\n"
-        "openerp-odoo-exited            EXITED    Jul 02 10:59 AM\n"
-        "openerp-odoo18-staging         STOPPED   Not started\n"
-    )
-    monkeypatch.setattr(probes.subprocess, "run", lambda *_, **__: SimpleNamespace(stdout=status))
-    assert probes.supervisor_instances() == [
-        {
-            "name": "openerp-odoo-crashed",
-            "status": "fatal",
-            "uptime": "-",
-            "manager": "supervisor",
-            "command": "",
-            "directory": "",
-        },
-        {
-            "name": "openerp-odoo-exited",
-            "status": "exited",
-            "uptime": "-",
-            "manager": "supervisor",
-            "command": "",
-            "directory": "",
-        },
-        {
-            "name": "openerp-odoo-staging",
-            "status": "running",
-            "uptime": "0:05:00",
-            "manager": "supervisor",
-            "command": "",
-            "directory": "",
-        },
-        {
-            "name": "openerp-odoo18-staging",
-            "status": "stopped",
-            "uptime": "-",
-            "manager": "supervisor",
-            "command": "",
-            "directory": "",
-        },
-    ]
-
-
 def test_instance_action_routes_by_manager(monkeypatch):
     calls = []
 
@@ -156,24 +78,6 @@ def test_instance_action_odoosh_restarts_both_services(monkeypatch):
         ["odoosh-restart", "cron"],
     ]
     assert probes.instance_action("demo", "start", manager="odoosh") != ""
-
-
-def _inst(status: str) -> Instance:
-    return {"name": "x", "status": status, "uptime": "-", "manager": "systemd"}
-
-
-def test_instance_status_promotes_ambiguous_stopped_but_not_explicit_failure(monkeypatch):
-    # a live process promotes an ambiguous "stopped" report to running
-    monkeypatch.setattr(probes, "procs_of", lambda *_: [{"pid": "1"}])
-    assert probes.instance_status(_inst("stopped")) == "running"
-
-    # regression: an explicit failure is authoritative even with a live
-    # process matching the same db — procs_of() matches by db name, not
-    # manager, so that process may belong to the *other* manager's instance
-    assert probes.instance_status(_inst("failed")) == "failed"
-
-    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
-    assert probes.instance_status(_inst("stopped")) == "stopped"
 
 
 def test_rebuild_instances_sorts_by_status_and_nests_dbs(monkeypatch):

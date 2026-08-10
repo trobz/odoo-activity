@@ -59,6 +59,17 @@ TROBZ_THEME = Theme(
 )
 
 
+_PULSE_PERIOD = 1.6  # seconds, one full on/off cycle of a running dot
+
+
+def _pulse_on(name: str) -> bool:
+    """Whether `name`'s running dot is lit right now. The phase is offset per
+    name so rows breathe on their own rather than in lockstep, and holds as
+    long as the row keeps its name — which is what keeps it the same row."""
+    offset = _PULSE_PERIOD * (hash(name) % 100) / 100
+    return (time.monotonic() + offset) % _PULSE_PERIOD < _PULSE_PERIOD / 2
+
+
 def _display_name(inst: Instance) -> str:
     """Instance name for display — `.service` is systemd-unit plumbing, not
     part of the name a user recognizes."""
@@ -187,7 +198,6 @@ class OdooActivity(App):
         self._row_db: dict[str, str] = {}  # db row key -> db name
         self._db_cache: dict[str, tuple[list[str], str | None]] = {}  # instance key -> its (dbs, port)
         self._shown_key: str | None = None  # highlighted row driving the activity pane
-        self._pulse_on = True
         self._instances_ready = False  # first _rebuild_instances has finished mounting rows
 
         # spinner over the initial (possibly slow, over ssh) discovery only --
@@ -204,7 +214,9 @@ class OdooActivity(App):
         # slower remotely (a tick is one ssh round trip per instance), but not
         # off: an externally started/stopped instance has to show up on its own
         self.set_interval(5.0 if self.host.is_local else 15.0, self.poll_instances)
-        self.set_interval(0.7, self._pulse_running)
+        # samples the pulse, doesn't drive it — the phase is per row, so this
+        # only has to be finer than _PULSE_PERIOD to render it smoothly
+        self.set_interval(0.2, self._pulse_running)
 
         self._lag_tick = time.monotonic()
         self.set_interval(_LAG_INTERVAL, self._check_loop_lag)
@@ -406,23 +418,22 @@ class OdooActivity(App):
         return max(10, max(len(inst["uptime"]) for inst in self._instances.values()))
 
     def _render_instance_row(self, inst: Instance, status: str) -> str:
-        dot = self._dot(status)
+        dot = self._dot(status, inst["name"])
         color = {"running": "green", "stopped": "dim"}.get(status, "red")
         width = self._name_width()
         uptime_width = self._uptime_width()
         return f"{dot} {_display_name(inst):<{width}} {inst['uptime']:>{uptime_width}}  [{color}]{status.upper()}[/]"
 
-    def _dot(self, status: str) -> str:
+    def _dot(self, status: str, name: str) -> str:
         if status == "stopped":
             return "○"
         if status == "running":
-            return "[green]●[/]" if self._pulse_on else " "
+            return "[green]●[/]" if _pulse_on(name) else " "
         return "[red]●[/]"  # failed / exited / fatal
 
     def _pulse_running(self) -> None:
-        """Fade the running dot in/out in place — a cheap re-render off the
+        """Redraw the running dots in place — a cheap re-render off the
         cached state, no process polling (that's poll_instances' job)."""
-        self._pulse_on = not self._pulse_on
         for item in self.query_one("#instances", ListView).children:
             inst = self._instances.get(item.name or "")
             if inst is None:  # a db row, not an instance row

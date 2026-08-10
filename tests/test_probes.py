@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pyperclip
 
 from odoo_activity import probes
@@ -22,7 +24,6 @@ def test_copy_shell_command_local(monkeypatch):
     """Local host: the raw `odoo shell` command is copied as-is."""
     _no_ssh_tty(monkeypatch)
     monkeypatch.setattr(probes, "procs_of", _fake_procs("/venv/bin/python3 /opt/odoo/odoo-bin -c /etc/odoo.conf"))
-    monkeypatch.setattr(probes, "_exe_of", lambda *_: None)
     copied = {}
     monkeypatch.setattr(pyperclip, "copy", lambda text: copied.setdefault("text", text))
 
@@ -42,7 +43,6 @@ def test_copy_shell_command_remote(monkeypatch):
     bare remote command, which would just fail to run locally."""
     _no_ssh_tty(monkeypatch)
     monkeypatch.setattr(probes, "procs_of", _fake_procs("/venv/bin/python3 /opt/odoo/odoo-bin -c /etc/odoo.conf"))
-    monkeypatch.setattr(probes, "_exe_of", lambda *_: None)
     copied = {}
     monkeypatch.setattr(pyperclip, "copy", lambda text: copied.setdefault("text", text))
 
@@ -58,9 +58,65 @@ def test_copy_shell_command_remote(monkeypatch):
 
 
 def test_shell_command_resolves_bare_interpreter(monkeypatch):
-    """A bare `python3` argv[0] gets upgraded to `_exe_of`'s resolved path."""
+    """A bare argv[0] only resolves in the process's own launch context: the
+    venv it was found in wins, since `/proc/<pid>/exe` resolves through the
+    venv symlink to the base interpreter; `exe` is the fallback. A relative
+    argv[0] resolves against the process's cwd."""
     monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin -c /etc/odoo.conf"))
-    monkeypatch.setattr(probes, "_exe_of", lambda pid, host: "/venv/bin/python3" if pid == "1" else None)
+    monkeypatch.setattr(probes, "_exe_of", lambda *_: "/usr/bin/python3.10")
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")
 
-    cmd = probes.shell_command(_INSTANCE, Host())
-    assert cmd == "/venv/bin/python3 /opt/odoo/odoo-bin shell --no-http -c /etc/odoo.conf"
+    tail = "/opt/odoo/odoo-bin shell --no-http -c /etc/odoo.conf"
+    assert probes.shell_command(_INSTANCE, Host()) == f"/venv/bin/python3 {tail}"
+
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {})
+    assert probes.shell_command(_INSTANCE, Host()) == f"/usr/bin/python3.10 {tail}"
+
+    monkeypatch.setattr(probes, "_proc_link", lambda *_: "/opt/odoo")
+    assert probes._resolve_argv0("./odoo-bin", "1", Host()) == "/opt/odoo/odoo-bin"
+
+
+def _argv_inst(command: str, pid: str = "") -> Instance:
+    """An instance with no odoo.conf — argv is the only config it has."""
+    return {
+        "name": "demo",
+        "status": "running",
+        "uptime": "-",
+        "manager": "local",
+        "command": command,
+        "directory": "/nonexistent",
+        "config": "",
+        "pid": pid,
+    }
+
+
+def test_argv_reads_back_as_config(monkeypatch):
+    """A directly-run instance may never touch odoo.conf, so its argv has to
+    read back through the same parser and accessors every other manager uses
+    — both `--k=v` and `--k v`, short flags under their config key."""
+    inst = _argv_inst("odoo-bin -d demo --http-port=8070 --logfile /var/log/odoo.log --db_port 5434 -s")
+
+    _, parser = probes.instance_config(inst, Host())
+
+    assert probes._opt(parser, "db_name") == "demo"
+    assert probes._opt(parser, "http_port") == "8070"
+    assert probes.db_port_of(inst, Host()) == "5434"
+    assert probes.logfile_of(inst, Host()) == Path("/var/log/odoo.log")
+
+    # `-d` names the one db it serves; only an unpinned runner lists its role's
+    monkeypatch.setattr(probes, "databases_by_role", lambda *_, **__: ["unrelated", "other"])
+    assert probes.databases_of(inst, Host()) == (["demo"], "5434")
+    assert probes.databases_of(_argv_inst("odoo-bin --addons-path /a"), Host())[0] == ["unrelated", "other"]
+
+
+def test_logfile_falls_back_to_redirected_stdout(monkeypatch):
+    """No `logfile` anywhere: a `> server.log` redirect is still tailable, a
+    terminal is not — Log and Stacks stay empty for that instance."""
+    inst = _argv_inst("odoo-bin -d demo", pid="100")
+
+    monkeypatch.setattr(probes, "_proc_link", lambda *_: "/home/x/server.log")
+    assert probes.logfile_of(inst, Host()) == Path("/home/x/server.log")
+
+    monkeypatch.setattr(probes, "_proc_link", lambda *_: "/dev/pts/5")
+    assert probes.logfile_of(inst, Host()) is None
