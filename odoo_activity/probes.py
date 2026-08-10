@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import itertools
 import json
 import os
 import platform
@@ -17,6 +18,7 @@ import signal
 import socket
 import subprocess
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -147,13 +149,13 @@ def _is_odoo(*text: str) -> bool:
 
 
 def list_instances(host: Host = LOCAL) -> list[Instance]:
-    """All Odoo instances on `host`, from systemd --user, supervisor and
-    odoo.sh.
+    """All Odoo instances on `host`, from systemd --user, supervisor, odoo.sh
+    and directly-run processes.
 
     Each row carries its `manager` so actions route to the right controller;
     managers can even expose the same name (e.g. odoo-demo).
     """
-    return systemd_instances(host) + supervisor_instances(host) + odoosh_instances(host)
+    return systemd_instances(host) + supervisor_instances(host) + odoosh_instances(host) + local_instances(host)
 
 
 def instance_status(inst: Instance, host: Host = LOCAL) -> str:
@@ -425,25 +427,155 @@ def odoosh_instances(host: Host = LOCAL) -> list[Instance]:
 
 
 def _odoosh_master_pid(host: Host = LOCAL) -> str | None:
-    """Returns the PID of the top-level `odoo-bin` process, or None.
+    """The pid of odoo.sh's top-level odoo process, or None.
 
-    PID 1 is the container init and reaps unrelated orphans, so we cannot
-    simply walk descendants from it. Instead, we identify the master
-    `odoo-bin` as the only "odoo-bin" process whose parent is not also
-    an "odoo-bin" process.
+    PID 1 is the container init and reaps unrelated orphans, so the tree can't
+    just be walked down from there — `_odoo_roots` picks the master out by
+    argv instead. One odoo.sh host is one build, so the first root is the
+    only one.
     """
-    out = host.run(["ps", "-eo", "pid,ppid,args"]).stdout
-    odoo_ppid: dict[str, str] = {}
+    roots = _odoo_roots(_ps_snapshot(host)[0])
+    return roots[0] if roots else None
 
-    for line in out.splitlines()[1:]:
-        parts = line.strip().split(maxsplit=2)
-        if len(parts) < 3:
+
+# `_is_odoo` alone is too loose here (`vi odoo/tools/config.py` matches), so
+# it only gates a narrower test: an odoo entry point, or a flag only odoo
+# takes. `-c` is excluded from those — `sh -c` would match it.
+_ODOO_ENTRYPOINTS = {"odoo", "odoo-bin", "openerp-server", "openerp-gevent"}
+# `-d`/`--database` are out: psql and pg_dump take them too
+_ODOO_FLAGS = {"--config", "--addons-path"}
+# our own toolchain: every one has "odoo" in its name and is typically run
+# from a shell, so each would otherwise look like an instance root
+_OUR_TOOLS = ("odoo-activity", "odoo-config", "odoo-db", "odoo-addons-path")
+# a root owned by one of these is already listed by that manager
+_MANAGER_PARENTS = ("systemd --user", "supervisord")
+# containerized odoo is its own manager (separate ticket); until then it is
+# excluded, and ODOO_ACTIVITY_DOCKER=1 lists it as a plain local instance
+_CONTAINER_RUNTIMES = ("containerd-shim", "dockerd", "podman", "runc", "crun")
+SHOW_DOCKER = os.environ.get("ODOO_ACTIVITY_DOCKER") == "1"
+
+# `<project>/18.0` is a version directory, not an instance name
+_VERSION_DIR_RE = re.compile(r"^\d+\.\d+$")
+
+
+def _looks_like_odoo(cmd: str) -> bool:
+    """True if `cmd` is an odoo server process (any runner: `odoo-bin`, an
+    egg-installed `odoo` console script, a venv wrapper around either)."""
+    if cmd.startswith("postgres:") or not _is_odoo(cmd) or any(tool in cmd for tool in _OUR_TOOLS):
+        return False
+
+    tokens = cmd.split()
+    # only what runs the program can name it: `psql -U odoo postgres` carries
+    # an `odoo` token too, but as a flag's value
+    program = itertools.takewhile(lambda tok: not tok.startswith("-"), tokens)
+
+    return any(tok.rsplit("/", 1)[-1] in _ODOO_ENTRYPOINTS for tok in program) or any(
+        tok.split("=", 1)[0] in _ODOO_FLAGS for tok in tokens
+    )
+
+
+def _containerized(pid: str, by_pid: dict[str, ProcRow]) -> bool:
+    """True if `pid`'s ancestry passes through a container runtime — the
+    whole chain, since an entrypoint shell often sits between the shim and
+    odoo. Reads the ps snapshot only; blind to a runtime we don't name,
+    `/proc/<pid>/cgroup` is the definitive test if that shows up."""
+    while (row := by_pid.get(pid)) is not None:
+        if any(runtime in row["cmd"] for runtime in _CONTAINER_RUNTIMES):
+            return True
+        pid = row["ppid"]
+
+    return False
+
+
+def _odoo_roots(by_pid: dict[str, ProcRow]) -> list[str]:
+    """Pids that start an odoo process tree: an odoo process whose parent
+    isn't one too. Prefork workers and the `gevent` child hang off these, so
+    one root is one instance."""
+    odoo = {pid: row for pid, row in by_pid.items() if _looks_like_odoo(row["cmd"])}
+    return [pid for pid, row in odoo.items() if row["ppid"] not in odoo]
+
+
+def local_instances(host: Host = LOCAL) -> list[Instance]:
+    """Odoo instances started directly — a shell, `emoi start`, a venv
+    runner — rather than registered with a process manager.
+
+    The other three managers each have a registry to ask (unit properties,
+    conf.d + supervisorctl, build env vars); here the process *is* the
+    identity, and its argv stands in for the config a registry would name.
+    Roots owned by systemd or supervisord are dropped, since those already
+    list themselves; so are containerized ones, unless `ODOO_ACTIVITY_DOCKER=1`.
+
+    A wrapper that execs odoo in a venv (`pew in <venv> odoo ...`) matches
+    too and becomes the root instead of the odoo process it spawned. That's
+    harmless: the descendant walk still collects every worker, and the
+    wrapper's own argv still names the config.
+
+    Two runners can serve the same db, which `_local_name` alone can't tell
+    apart; those rows carry their master pid, the rest stay pid-free so a
+    restart doesn't look like a different instance.
+    """
+    by_pid, _ = _ps_snapshot(host)
+    instances: list[Instance] = []
+    roots = []
+
+    for pid in _odoo_roots(by_pid):
+        parent = by_pid.get(by_pid[pid]["ppid"])
+        if parent is not None and any(mgr in parent["cmd"] for mgr in _MANAGER_PARENTS):
             continue
-        pid, ppid, cmd = parts
-        if "odoo-bin" in cmd:
-            odoo_ppid[pid] = ppid
 
-    return next((pid for pid, ppid in odoo_ppid.items() if ppid not in odoo_ppid), None)
+        if not SHOW_DOCKER and _containerized(pid, by_pid):
+            continue
+
+        cwd = _proc_link(pid, "cwd", host)
+        options = _cli_options(by_pid[pid]["cmd"])
+        roots.append((pid, options, cwd, _local_name(options, cwd)))
+
+    taken = Counter(name for *_, name in roots)
+
+    for pid, options, cwd, name in roots:
+        cmd = by_pid[pid]["cmd"]
+        secs = _proc_uptime(pid, host)
+        instances.append({
+            "name": name if taken[name] == 1 else f"{name} [{pid}]",
+            "status": "running",
+            "uptime": format_duration(secs) if secs is not None else "-",
+            "manager": "local",
+            "command": cmd,
+            "directory": cwd or "",
+            "config": _abspath(options.get("config"), cwd) or "",
+            "pid": pid,
+        })
+
+    return instances
+
+
+def _local_name(options: dict[str, str], cwd: str | None) -> str:
+    """A directly-run instance's display name: its db name, else the
+    directory it was launched from.
+
+    Not the pid — that changes on every restart, and `list_instances` re-runs
+    on a timer, so the name is what keeps a row *the same row* across polls;
+    `local_instances` appends one only to break a tie.
+    """
+    if db := options.get("db_name"):
+        return db
+
+    if not cwd:
+        return "local"
+
+    path = Path(cwd)
+    return path.parent.name if _VERSION_DIR_RE.match(path.name) else path.name
+
+
+def _abspath(path: str | None, cwd: str | None) -> str | None:
+    """`path` resolved against the process's own cwd — a directly-run
+    instance's `--config` is usually relative to wherever it was launched.
+    None when it's relative and that cwd can't be read."""
+    if not path:
+        return None
+    if path.startswith("/"):
+        return path
+    return str(Path(cwd) / path) if cwd else None
 
 
 def instance_action(unit: str, action: str, manager: str = "systemd", host: Host = LOCAL) -> str:
@@ -455,6 +587,9 @@ def instance_action(unit: str, action: str, manager: str = "systemd", host: Host
     output (so the UI can show why nothing happened instead of failing
     silently).
     """
+    if manager == "local":
+        return "no process manager — a directly-run instance can't be started or stopped from here"
+
     if manager == "odoosh":
         # odoo.sh has no separate start/stop — sleep/wake is the platform's
         # call, not ours; only a restart of the http workers is exposed.
@@ -510,9 +645,10 @@ def _systemd_workdir(unit: str, host: Host = LOCAL) -> Path:
 
 
 def instance_workdir(inst: Instance, host: Host = LOCAL) -> Path:
-    """The instance's working directory (supervisor `directory=`, the
-    systemd unit's WorkingDirectory, or $HOME on odoo.sh)."""
-    if inst["manager"] == "supervisor":
+    """The instance's working directory (supervisor `directory=`, a
+    directly-run instance's own cwd, the systemd unit's WorkingDirectory, or
+    $HOME on odoo.sh)."""
+    if inst["manager"] in ("supervisor", "local"):
         return Path(inst.get("directory") or ".")
 
     if inst["manager"] == "odoosh":
@@ -521,6 +657,58 @@ def instance_workdir(inst: Instance, host: Host = LOCAL) -> Path:
         return Path(host.run(["sh", "-c", "echo $HOME"]).stdout.strip() or "/root")
 
     return _systemd_workdir(inst["name"], host)
+
+
+# Odoo's CLI mirrors its config keys once `--` is stripped and dashes become
+# underscores (`--http-port` -> `http_port`); these are the ones that don't,
+# plus the short forms.
+_CLI_KEYS = {
+    "c": "config",
+    "d": "db_name",
+    "database": "db_name",
+    "r": "db_user",
+    "w": "db_password",
+    "p": "http_port",
+    "D": "data_dir",
+    "load": "server_wide_modules",
+}
+
+
+def _cli_options(cmd: str) -> dict[str, str]:
+    """Odoo options parsed out of a process's argv, keyed like the config
+    file's `[options]`.
+
+    A directly-run instance may have no config file at all — the same sparse
+    shape as odoo.sh — so argv is the only place settings like `logfile` or
+    `db_port` exist; and where both exist, Odoo's own precedence puts the
+    command line on top. Both `--key=value` and `--key value` spellings are in
+    live use. Valueless flags (`-s`, `--dev`) are skipped: there's no
+    `[options]` value to carry.
+    """
+    tokens = cmd.split()
+    options: dict[str, str] = {}
+    i = 0
+
+    while i < len(tokens):
+        arg = tokens[i]
+        if not arg.startswith("-") or arg == "-":
+            i += 1
+            continue
+
+        flag, sep, value = arg.partition("=")
+        if not sep:
+            following = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if not following or following.startswith("-"):
+                i += 1
+                continue
+            value = following
+            i += 1
+
+        key = flag.lstrip("-")
+        options[_CLI_KEYS.get(key, key.replace("-", "_"))] = value
+        i += 1
+
+    return options
 
 
 def _config_names(instance_name: str) -> list[str]:
@@ -536,8 +724,12 @@ def _config_names(instance_name: str) -> list[str]:
 
 
 def _config_file(inst: Instance, host: Host = LOCAL) -> Path | None:
-    """The first `<workdir>/config/` file matching `_config_names`, or the
-    fixed `~/.config/odoo/odoo.conf` odoo.sh always writes."""
+    """The config file named on a directly-run instance's own command line,
+    the fixed `~/.config/odoo/odoo.conf` odoo.sh always writes, or the first
+    `<workdir>/config/` file matching `_config_names`."""
+    if path := inst.get("config"):
+        return Path(path) if host.is_file(path) else None
+
     if inst["manager"] == "odoosh":
         path = instance_workdir(inst, host) / ".config" / "odoo" / "odoo.conf"
         return path if host.is_file(path) else None
@@ -563,14 +755,26 @@ def instance_config(inst: Instance, host: Host = LOCAL) -> tuple[Path, configpar
 
     The config is the first of `<workdir>/config/` matching `_config_names`;
     returns (workdir, None) when none exists.
+
+    A directly-run instance layers its own argv on top, so its settings read
+    back through this one parser whether they came from a file, the command
+    line, or — with no config file at all — only the latter.
     """
     workdir = instance_workdir(inst, host)
     path = _config_file(inst, host)
-    if path is None:
+    if path is None and inst["manager"] != "local":
         return workdir, None
 
     parser = configparser.RawConfigParser()  # odoo configs may contain `%`
-    parser.read_string(host.read_text(path))
+    if path is not None:
+        parser.read_string(host.read_text(path))
+
+    if inst["manager"] == "local":
+        if not parser.has_section("options"):
+            parser.add_section("options")
+        for key, value in _cli_options(inst.get("command", "")).items():
+            parser.set("options", key, value)
+
     return workdir, parser
 
 
@@ -593,10 +797,27 @@ def logfile_of(inst: Instance, host: Host = LOCAL) -> Path | None:
     workdir, parser = instance_config(inst, host)
     logfile = _opt(parser, "logfile")
     if logfile is None:
-        return None
+        return _redirected_stdout(inst, host) if inst["manager"] == "local" else None
 
     path = Path(logfile)
     return path if path.is_absolute() else workdir / path
+
+
+def _redirected_stdout(inst: Instance, host: Host = LOCAL) -> Path | None:
+    """A directly-run instance's stdout when it was redirected to a file
+    (`odoo-bin > server.log`) — the closest thing to a `logfile` for a runner
+    that never set one.
+
+    None when stdout is a terminal, pipe or socket, which is the normal case
+    for something started by hand: there's nothing to tail, so the Log and
+    Stacks tabs stay empty for that instance. Not a failure to report — a
+    SIGQUIT dump goes to that terminal, somewhere we can't read.
+    """
+    target = _proc_link(inst.get("pid", ""), "fd/1", host)
+    if target is None or not target.startswith("/") or target.startswith("/dev/"):
+        return None
+
+    return Path(target)
 
 
 def db_port_of(inst: Instance, host: Host = LOCAL) -> str | None:
@@ -659,6 +880,11 @@ def databases_of(inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | N
 
     _, parser = instance_config(inst, host)
     port = _opt(parser, "db_port")
+
+    # `-d`/`db_name` pins it to one db; unpinned is genuinely multi-db
+    if inst["manager"] == "local" and (pinned := _opt(parser, "db_name")):
+        return [name.strip() for name in pinned.split(",") if name.strip()], port
+
     role = DB_ROLE or _opt(parser, "db_user") or inst["name"].removesuffix(".service")
     return databases_by_role(role, port, host), port
 
@@ -755,6 +981,11 @@ def instance_pid(inst: Instance, host: Host = LOCAL) -> str | None:
     if inst["manager"] == "odoosh":
         return _odoosh_master_pid(host)
 
+    if inst["manager"] == "local":
+        # nothing to re-ask for a MainPID; `list_instances` re-runs on a timer,
+        # so a restart arrives as a fresh row rather than being tracked here
+        return inst.get("pid")
+
     if inst["manager"] == "supervisor":
         out = host.run(["supervisorctl", "pid", inst["name"]]).stdout.strip()
         return out if out.isdigit() else None
@@ -804,38 +1035,79 @@ def _descendants(root: str, by_pid: dict[str, ProcRow], children: dict[str, list
     return [by_pid[pid] for pid in keep]
 
 
-def _exe_of(pid: str, host: Host) -> str | None:
-    """Absolute path of `pid`'s running executable, via `/proc/<pid>/exe` --
-    unlike argv[0], never a bare `python3` left over from a `PATH` lookup
-    at launch. None on any failure (permission denied, pid gone, ...)."""
+def _proc_link(pid: str, name: str, host: Host) -> str | None:
+    """Target of one of `/proc/<pid>`'s symlinks (`exe`, `cwd`, `fd/1`).
+    None on any failure (permission denied, pid gone, ...) — a
+    supervisor-owned process's `cwd` is unreadable to us, for one."""
+    if not pid:
+        return None
+
     if host.is_local:
         try:
-            return os.readlink(f"/proc/{pid}/exe")
+            return os.readlink(f"/proc/{pid}/{name}")
         except OSError:
             return None
 
-    out = host.run(["readlink", "-f", f"/proc/{pid}/exe"]).stdout.strip()
+    out = host.run(["readlink", "-f", f"/proc/{pid}/{name}"]).stdout.strip()
     return out or None
 
 
+def _exe_of(pid: str, host: Host) -> str | None:
+    """Absolute path of `pid`'s running executable -- unlike argv[0], never a
+    bare `python3` left over from a `PATH` lookup at launch."""
+    return _proc_link(pid, "exe", host)
+
+
+def _environ_of(pid: str, host: Host) -> dict[str, str]:
+    """`pid`'s environment at launch, or {} if unreadable (another user's
+    process). NUL-separated `KEY=value`, same shape local or over ssh."""
+    try:
+        raw = host.read_text(f"/proc/{pid}/environ")
+    except OSError:
+        return {}
+
+    return dict(entry.split("=", 1) for entry in raw.split("\0") if "=" in entry)
+
+
+def _resolve_argv0(argv0: str, pid: str, host: Host) -> str:
+    """`argv0` as a path that still resolves once pasted into another shell.
+
+    A bare `python3`/`odoo` was found on `PATH` at launch, under
+    `$VIRTUAL_ENV/bin` for a venv runner -- which beats `/proc/<pid>/exe`,
+    resolved through `bin/python3`'s symlink to the base interpreter and so
+    blind to the venv's site-packages. `exe` is the last resort: for a
+    console script it names the interpreter, not the script.
+    """
+    if argv0.startswith("/"):
+        return argv0
+
+    if "/" in argv0:  # ./odoo-bin -- cwd-relative, meaningless once pasted
+        cwd = _proc_link(pid, "cwd", host)
+        return os.path.normpath(f"{cwd}/{argv0}") if cwd else argv0
+
+    venv = _environ_of(pid, host).get("VIRTUAL_ENV")
+    if venv and host.is_file(f"{venv}/bin/{argv0}"):
+        return f"{venv}/bin/{argv0}"
+
+    return _exe_of(pid, host) or argv0
+
+
 def shell_command(inst: Instance, host: Host = LOCAL) -> str | None:
-    """The instance's `odoo-bin shell --no-http` command, e.g.
-    `/path/to/venv/bin/python3 /path/to/odoo-bin shell --no-http -c ...`,
-    or None if it isn't running. Built from the live process's own argv
-    (`procs_of`), with argv[0] upgraded via `_exe_of` when possible --
-    otherwise this could copy a `python3` that only resolves inside the
-    process's own launch context, not wherever it gets pasted.
-    `--no-http` skips binding the port the running instance already holds
-    (EADDRINUSE otherwise)."""
+    """Return an `odoo-bin shell --no-http` command for a running instance, or None.
+
+    Builds from the live process argv, absolutizing argv[0] to ensure execution
+    outside the process context. Appends `shell --no-http` if not already present.
+    """
     procs = procs_of(inst, host)
     if not procs:
         return None
 
     tokens = procs[0]["cmd"].split()
-    if exe := _exe_of(procs[0]["pid"], host):
-        tokens[0] = exe
+    tokens[0] = _resolve_argv0(tokens[0], procs[0]["pid"], host)
 
     split_at = next((i for i, tok in enumerate(tokens) if tok.startswith("-")), len(tokens))
+    if "shell" in tokens[:split_at]:
+        return " ".join(tokens)
 
     return " ".join([*tokens[:split_at], "shell", "--no-http", *tokens[split_at:]])
 
@@ -986,13 +1258,16 @@ class _InstanceRequired(TypedDict):
 
 
 class Instance(_InstanceRequired, total=False):
-    """`command`/`directory` come from supervisor, `db`/`version` from
-    odoo.sh — each manager only ever sets its own subset."""
+    """`command`/`directory` come from supervisor or a directly-run
+    instance's own argv/cwd, `db`/`version` from odoo.sh, `config`/`pid` only
+    from a directly-run one — each manager sets its own subset."""
 
     command: str
     directory: str
     db: str
     version: str
+    config: str
+    pid: str
 
 
 class ProcRow(TypedDict):
