@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.12.0 (2026-08-10)
+
+### Features
+
+- **probes**: Detect directly-run local instances
+  ([`b9e62f3`](https://github.com/trobz/odoo-activity/commit/b9e62f3e295ad8bdef335d7ec335ad5436cfbbf9))
+
+
 ## v0.11.0 (2026-08-07)
 
 ### Bug Fixes
