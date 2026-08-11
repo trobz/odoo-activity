@@ -474,6 +474,57 @@ def _looks_like_odoo(cmd: str) -> bool:
     )
 
 
+# a python interpreter runs whatever script comes next, so it never names
+# the program itself — `python .../bin/odoo` is odoo, `python .../bin/pew` is not
+_PYTHON_RE = re.compile(r"^python[\d.]*$")
+# systemd's per-user manager: an ancestor of everything in a user session,
+# service unit and terminal alike, so it never identifies the unit itself
+_USER_MANAGER_RE = re.compile(r"^user@\d+\.service$")
+
+
+def _entry_point(cmd: str) -> str:
+    """The program `cmd` actually runs: its first non-flag word, skipping a
+    leading python interpreter (which only names the script that follows)."""
+    words = (tok.rsplit("/", 1)[-1] for tok in cmd.split() if not tok.startswith("-"))
+
+    return next((word for word in words if not _PYTHON_RE.match(word)), "")
+
+
+def _runs_odoo_itself(cmd: str) -> bool:
+    """True if `cmd`'s own entry point is odoo, rather than a wrapper that
+    goes on to spawn it (`pew in <venv> odoo ...`, `poetry run odoo ...`).
+
+    Narrower than `_looks_like_odoo`, which matches a wrapper too because
+    odoo is named somewhere in its argv. The difference matters only when we
+    signal: a wrapper is a plain process with no SIGQUIT handler, so the
+    dumpstacks signal kills it instead of dumping (and takes the shell that
+    started it down with it)."""
+    return _entry_point(cmd) in _ODOO_ENTRYPOINTS
+
+
+def _odoo_master(pid: str, by_pid: dict[str, ProcRow], children: dict[str, list[str]]) -> str:
+    """The odoo master under `pid` — `pid` itself once it runs odoo directly,
+    else the single odoo child a wrapper execs into, following a chain of
+    them (`pew` spawns a python that spawns odoo).
+
+    Only a child that runs a *different* program is a wrapper's exec; one
+    that shares its parent's entry point is a fork of it, i.e. a worker. That
+    keeps the descent off a master `_runs_odoo_itself` doesn't recognize (a
+    custom launcher script, which `_looks_like_odoo` still matches on
+    `--config` alone): with a single worker under it, stepping down would
+    otherwise hand every signal and every field on the row to that worker.
+
+    Falls back to `pid` when the chain forks or dies out, since there's then
+    no better candidate to point at."""
+    while not _runs_odoo_itself(by_pid[pid]["cmd"]):
+        kids = [kid for kid in children.get(pid, []) if kid in by_pid and _looks_like_odoo(by_pid[kid]["cmd"])]
+        if len(kids) != 1 or _entry_point(by_pid[kids[0]]["cmd"]) == _entry_point(by_pid[pid]["cmd"]):
+            return pid
+        pid = kids[0]
+
+    return pid
+
+
 def _containerized(pid: str, by_pid: dict[str, ProcRow]) -> bool:
     """True if `pid`'s ancestry passes through a container runtime — the
     whole chain, since an entrypoint shell often sits between the shim and
@@ -495,6 +546,83 @@ def _odoo_roots(by_pid: dict[str, ProcRow]) -> list[str]:
     return [pid for pid, row in odoo.items() if row["ppid"] not in odoo]
 
 
+def _runs_under_unit(cgroup: str) -> bool:
+    """True if `cgroup` (the contents of `/proc/<pid>/cgroup`) puts its
+    process inside a systemd service unit.
+
+    False when it runs under a scope instead (`vte-spawn-….scope` for a
+    terminal, `session-3.scope` for a login) — nobody started it as a
+    service. A cgroup we can't read or don't understand answers True:
+    "don't know" has to keep the old parent-based answer rather than risk
+    listing a real unit twice.
+
+    Only systemd's own hierarchy answers this: v2's unified `0::` line, or
+    the `name=systemd` line under v1. The other v1 controllers are mounted
+    separately and commonly stop at the delegated user-manager cgroup
+    (`…/user@1000.service`), whose leaf would otherwise read as a unit and
+    put every terminal-started instance back in systemd's hands.
+    """
+    paths = [line.split(":", 2) for line in cgroup.splitlines() if line.count(":") >= 2]
+    path = next(
+        (parts[2] for parts in paths if parts[0] == "0" and not parts[1]),  # v2: `0::<path>`
+        next((parts[2] for parts in paths if parts[1] == "name=systemd"), None),  # v1
+    )
+    if path is None:
+        return True
+
+    leaf = path.rstrip("/").rsplit("/", 1)[-1]
+
+    return leaf.endswith(".service") and not _USER_MANAGER_RE.match(leaf)
+
+
+def _cgroups_of(pids: list[str], host: Host = LOCAL) -> dict[str, str]:
+    """`/proc/<pid>/cgroup` for each pid — one `cat` each locally, one ssh
+    round trip for the lot remotely (same batching as `proc_cpu_ticks_many`,
+    for the same reason: `list_instances` re-runs on a timer, and a host
+    running several units would pay a round trip per unit per poll).
+
+    A pid missing from the result is one whose cgroup couldn't be read.
+    """
+    if host.is_local:
+        texts = {}
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                texts[pid] = host.read_text(f"/proc/{pid}/cgroup")
+        return texts
+
+    if not pids:
+        return {}
+
+    marker = "\x1e"  # ASCII record separator -- won't appear in /proc/*/cgroup
+    script = ";".join(f"echo {marker}{pid}; cat /proc/{pid}/cgroup 2>/dev/null" for pid in pids)
+    out = host.run(["sh", "-c", script]).stdout
+
+    texts = {}
+    for block in out.split(marker)[1:]:
+        pid, _, data = block.partition("\n")
+        if data.strip():
+            texts[pid.strip()] = data
+    return texts
+
+
+def _owned_by_manager(parent: ProcRow, cgroup: str | None) -> bool:
+    """True if `parent` is the process manager actually running the process
+    whose `cgroup` this is, so that manager's own listing already covers it.
+
+    `systemd --user` needs more than the parent's name: it reaps orphans as
+    a subreaper, so a directly-run instance is reparented onto it the moment
+    its wrapper or shell exits, and looked "owned" by it from then on — which
+    dropped the row here while `systemd_instances` never listed it either
+    (it has no unit), losing the instance entirely. The cgroup is what
+    doesn't move on reparenting, so that's what decides. supervisord reaps
+    nothing, so being its child is ownership enough.
+    """
+    if not any(mgr in parent["cmd"] for mgr in _MANAGER_PARENTS):
+        return False
+
+    return "supervisord" in parent["cmd"] or _runs_under_unit(cgroup or "")
+
+
 def local_instances(host: Host = LOCAL) -> list[Instance]:
     """Odoo instances started directly — a shell, `emoi start`, a venv
     runner — rather than registered with a process manager.
@@ -506,26 +634,35 @@ def local_instances(host: Host = LOCAL) -> list[Instance]:
     list themselves; so are containerized ones, unless `ODOO_ACTIVITY_DOCKER=1`.
 
     A wrapper that execs odoo in a venv (`pew in <venv> odoo ...`) matches
-    too and becomes the root instead of the odoo process it spawned. That's
-    harmless: the descendant walk still collects every worker, and the
-    wrapper's own argv still names the config.
+    too and becomes the root instead of the odoo process it spawned, so
+    `_odoo_master` steps down to the odoo process itself: the row has to
+    carry a pid that survives being signalled, and the wrapper does not.
 
     Two runners can serve the same db, which `_local_name` alone can't tell
     apart; those rows carry their master pid, the rest stay pid-free so a
     restart doesn't look like a different instance.
     """
-    by_pid, _ = _ps_snapshot(host)
+    by_pid, children = _ps_snapshot(host)
     instances: list[Instance] = []
     roots = []
 
-    for pid in _odoo_roots(by_pid):
-        parent = by_pid.get(by_pid[pid]["ppid"])
-        if parent is not None and any(mgr in parent["cmd"] for mgr in _MANAGER_PARENTS):
+    found = _odoo_roots(by_pid)
+    parents = {root: by_pid.get(by_pid[root]["ppid"]) for root in found}
+    # only a manager-parented root needs its cgroup read, and reading them
+    # together keeps a remote host to one round trip for all of them
+    cgroups = _cgroups_of(
+        [root for root, parent in parents.items() if parent is not None and "systemd" in parent["cmd"]], host
+    )
+
+    for root in found:
+        parent = parents[root]
+        if parent is not None and _owned_by_manager(parent, cgroups.get(root)):
             continue
 
-        if not SHOW_DOCKER and _containerized(pid, by_pid):
+        if not SHOW_DOCKER and _containerized(root, by_pid):
             continue
 
+        pid = _odoo_master(root, by_pid, children)
         cwd = _proc_link(pid, "cwd", host)
         options = _cli_options(by_pid[pid]["cmd"])
         roots.append((pid, options, cwd, _local_name(options, cwd)))

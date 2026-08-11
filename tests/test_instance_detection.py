@@ -15,6 +15,10 @@ from odoo_activity.probes import Instance, ProcRow
 _EGG = "/home/x/venvs/venv-odoo18/bin/python /home/x/venvs/venv-odoo18/bin/odoo --config ./odoo.conf -d v18c_queue"
 _BIN = "python3 /home/x/demo/18.0/odoo/odoo-bin --config config/local.conf -d demo"
 _SUPERVISED = "/home/x/venvs/demo/bin/python odoo/odoo-bin --config config/supervisor.conf -d prod"
+_WRAPPER = "/usr/bin/python3 /home/x/.local/bin/pew in venv-odoo18 /home/x/venvs/venv-odoo18/bin/odoo -d v18c_queue"
+
+_SCOPE_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vte-spawn-ab-cd.scope\n"
+_UNIT_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/odoo-demo.service\n"
 
 
 def _row(pid: str, ppid: str, cmd: str) -> ProcRow:
@@ -107,6 +111,10 @@ def test_skips_roots_owned_by_a_manager(monkeypatch):
     monkeypatch.setattr(probes, "_ps_snapshot", lambda *_: (by_pid, {}))
     monkeypatch.setattr(probes, "_proc_link", lambda pid, name, host: "/home/x/code/oca" if name == "cwd" else None)
     monkeypatch.setattr(probes, "_proc_uptime", lambda *_: 60.0)
+    # 200 is systemd's, so its cgroup has to say so: these pids are made up,
+    # and whatever really holds them on the machine running the suite would
+    # otherwise answer for them
+    monkeypatch.setattr(Host, "read_text", lambda *_: _UNIT_CGROUP)
 
     found = probes.local_instances(Host())
 
@@ -116,6 +124,112 @@ def test_skips_roots_owned_by_a_manager(monkeypatch):
     ]
     assert found[0]["config"] == "/home/x/code/oca/odoo.conf"  # `./odoo.conf` resolved against cwd
     assert found[0]["uptime"] == "0:01:00"
+
+
+def test_reparented_runner_is_told_apart_from_a_real_unit(monkeypatch):
+    """`systemd --user` reaps orphans, so a directly-run instance lands under
+    it as soon as its wrapper or shell exits. Dropping every root it parents
+    lost that instance for good — `systemd_instances` has no unit to list it
+    under either. The cgroup, which reparenting doesn't move, is what tells
+    the orphan (a terminal's scope) from a unit systemd really does run."""
+    by_pid = {
+        "100": _row("100", "20", _EGG),  # orphaned runner, reaped by systemd --user
+        "200": _row("200", "20", _BIN),  # a genuine odoo-demo.service
+        "20": _row("20", "1", "/lib/systemd/systemd --user"),
+    }
+    cgroups = {"/proc/100/cgroup": _SCOPE_CGROUP, "/proc/200/cgroup": _UNIT_CGROUP}
+    monkeypatch.setattr(probes, "_ps_snapshot", lambda *_: (by_pid, {}))
+    monkeypatch.setattr(probes, "_proc_link", lambda *_: None)
+    monkeypatch.setattr(probes, "_proc_uptime", lambda *_: 60.0)
+    monkeypatch.setattr(Host, "read_text", lambda _self, path: cgroups[str(path)])
+
+    assert [(inst["name"], inst["pid"]) for inst in probes.local_instances(Host())] == [("v18c_queue", "100")]
+
+
+def test_unreadable_cgroup_keeps_the_parent_based_answer(monkeypatch):
+    """A root whose cgroup can't be read is "don't know", not "not a unit":
+    it stays skipped, since listing a real unit twice is the worse failure."""
+    by_pid = {"100": _row("100", "20", _EGG), "20": _row("20", "1", "/lib/systemd/systemd --user")}
+    monkeypatch.setattr(probes, "_ps_snapshot", lambda *_: (by_pid, {}))
+    monkeypatch.setattr(Host, "read_text", lambda *_: "")  # what a remote `cat` failure looks like
+
+    assert probes.local_instances(Host()) == []
+
+
+def test_row_points_at_odoo_itself_not_the_wrapper_that_spawned_it(monkeypatch):
+    """The pid on the row is what gets signalled (`K`, `L`, `D`). A wrapper
+    like `pew` has no SIGQUIT handler, so dumping stacks through it killed it
+    — and the shell it was started from with it — instead of dumping."""
+    by_pid = {
+        "99": _row("99", "10", _WRAPPER),
+        "100": _row("100", "99", _EGG),  # the odoo master the wrapper exec'd
+        "101": _row("101", "100", _EGG),  # prefork worker
+        "10": _row("10", "1", "-zsh"),
+    }
+    children = {"99": ["100"], "100": ["101"]}
+    monkeypatch.setattr(probes, "_ps_snapshot", lambda *_: (by_pid, children))
+    monkeypatch.setattr(probes, "_proc_link", lambda *_: None)
+    monkeypatch.setattr(probes, "_proc_uptime", lambda *_: 60.0)
+
+    found = probes.local_instances(Host())
+
+    assert [(inst["name"], inst["pid"]) for inst in found] == [("v18c_queue", "100")]
+    assert found[0]["command"] == _EGG  # the master's own argv, not the wrapper's
+
+
+def test_odoo_master_stops_at_the_first_real_odoo_process():
+    assert probes._runs_odoo_itself(_EGG) is True
+    assert probes._runs_odoo_itself(_BIN) is True
+    assert probes._runs_odoo_itself(_WRAPPER) is False  # names odoo, but runs pew
+
+    by_pid = {"99": _row("99", "10", _WRAPPER), "100": _row("100", "99", _EGG)}
+    assert probes._odoo_master("99", by_pid, {"99": ["100"]}) == "100"
+    assert probes._odoo_master("100", by_pid, {}) == "100"
+    # a wrapper with no odoo child left to step into is the best answer there is
+    assert probes._odoo_master("99", by_pid, {}) == "99"
+
+
+def test_odoo_master_does_not_descend_into_a_lone_worker():
+    """A master run through a custom launcher isn't in `_ODOO_ENTRYPOINTS`,
+    though `_looks_like_odoo` still matches it on `--config`. Descending on
+    child count alone then walked past it into its one worker, handing that
+    worker every field on the row and every signal `K`/`L`/`D` sends. A fork
+    shares its parent's entry point; a wrapper's exec does not."""
+    launcher = "/venv/bin/python /opt/odoo/server.py --config /etc/odoo.conf"
+    by_pid = {
+        "100": _row("100", "10", launcher),
+        "101": _row("101", "100", f"{launcher} gevent"),  # its only child
+    }
+
+    assert probes._runs_odoo_itself(launcher) is False
+    assert probes._looks_like_odoo(launcher) is True
+    assert probes._odoo_master("100", by_pid, {"100": ["101"]}) == "100"
+
+
+def test_only_systemds_own_cgroup_hierarchy_names_the_unit():
+    """cgroup v1 lists one line per controller, and the controllers systemd
+    doesn't drive commonly stop at the user manager — `…/user@1000.service`,
+    a leaf that reads as a unit but is an ancestor of terminals too. Reading
+    it as one put every directly-run instance back under systemd, the exact
+    disappearance this fix is about."""
+    v1_terminal = (
+        "12:pids:/user.slice/user-1000.slice/user@1000.service\n"
+        "4:memory:/user.slice/user-1000.slice/user@1000.service\n"
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vte-spawn-ab-cd.scope\n"
+    )
+    v1_unit = (
+        "12:pids:/user.slice/user-1000.slice/user@1000.service\n"
+        "1:name=systemd:/user.slice/user-1000.slice/user@1000.service/odoo-demo.service\n"
+    )
+
+    assert probes._runs_under_unit(v1_terminal) is False
+    assert probes._runs_under_unit(v1_unit) is True
+    assert probes._runs_under_unit(_SCOPE_CGROUP) is False
+    assert probes._runs_under_unit(_UNIT_CGROUP) is True
+    # nothing systemd's own hierarchy answers for: "don't know", so keep the
+    # parent-based answer rather than list a real unit twice
+    assert probes._runs_under_unit("") is True
+    assert probes._runs_under_unit("12:pids:/user.slice\n") is True
 
 
 def test_named_after_project_not_version_dir(monkeypatch):
