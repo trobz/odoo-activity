@@ -46,6 +46,7 @@ from odoo_activity.probes import (
     pg_client_port,
     proc_cpu_ticks_many,
     render_config,
+    row_matches,
     session_count,
     session_dir_of,
     shell_command,
@@ -147,7 +148,7 @@ class ActivityPane(Vertical):
 
     TABS: ClassVar = {
         "instance": ["Top", "Processes", "Stacks", "Logs", "Config", "Toolbox"],
-        "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules"],
+        "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules", "Params"],
     }
 
     # (label, signal) -- an int sends that signal to the instance's master
@@ -169,7 +170,7 @@ class ActivityPane(Vertical):
         yield Horizontal(id="actabs")
         yield Input(
             id="acsearch",
-            placeholder="search logs, enter to apply, empty clears",
+            placeholder="search, enter to apply, empty clears",
             compact=True,
         )
         yield RichLog(id="acbody", highlight=True, wrap=True)
@@ -191,6 +192,7 @@ class ActivityPane(Vertical):
         self._log_pos = 0
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
         self._log_query: str | None = None
+        self._row_query: str | None = None  # active filter for db-tab rows (see is_params_active)
         self._top_prev: dict[str, tuple[int, float]] = {}  # pid -> (ticks, monotonic)
         self._proc_rows: list[ProcDisplayRow] = []  # rows behind #actable in the Top tab
         self._config_mode = self.CONFIG_MODES[0]  # which odoo-config view the Config tab shows
@@ -215,7 +217,7 @@ class ActivityPane(Vertical):
         # leaving it wrapped narrow until the next 1s poll tick.
         if self.is_top_active():
             self._show_process_table(self._proc_rows)
-        elif self._dbtab.rows and not self._showing_raw:
+        elif self._mode == "database" and self._dbtab.rows and not self._showing_raw:
             self._populate_datatable(self._dbtab.rows)
 
     def _coalesce(self, key: str, ident: object, factory: Callable[[], Awaitable[None]]) -> None:
@@ -282,10 +284,14 @@ class ActivityPane(Vertical):
     def is_toolbox_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Toolbox"
 
+    def is_params_active(self) -> bool:
+        return self._mode == "database" and self._active_tab() == "Params"
+
     def has_search(self) -> bool:
-        """Logs and Config both render plain text into #acbody with the same
-        substring filter (see _render_log)."""
-        return self.is_logs_active() or self.is_config_active()
+        """Logs and Config render plain text into #acbody with a substring
+        filter (see _render_log); Params instead filters rows -- key or
+        value -- inside _populate_datatable."""
+        return self.is_logs_active() or self.is_config_active() or self.is_params_active()
 
     def selected_process(self) -> ProcDisplayRow | None:
         """The process under the Top tab's table cursor, if any."""
@@ -444,9 +450,19 @@ class ActivityPane(Vertical):
         if event.input.id != "acsearch":
             return
 
-        self._log_query = event.value.strip() or None
+        query = event.value.strip() or None
         event.input.display = False
         self.focus_active()
+
+        if self.is_params_active():
+            self._row_query = query
+            self.border_title = self._title()  # _title() is otherwise only recomputed on tab switch
+            if self._dbtab.rows:  # nothing loaded yet (error/(empty)) -- don't clobber that message
+                self._showing_raw = False
+                self._show_datatable(self._dbtab.rows)
+            return
+
+        self._log_query = query
         self._render_log()
 
     def show_instance(self, inst: Instance | None) -> None:
@@ -617,6 +633,11 @@ class ActivityPane(Vertical):
 
         elif self.is_logs_active() and self._log_path:
             title += f" — {self._log_path}"
+
+        elif self.is_params_active() and self._row_query:
+            # once the search input hides itself, this border is the only thing
+            # left saying the table is filtered rather than short.
+            title += f" — Params (filter: {self._row_query})"
 
         return title
 
@@ -941,6 +962,7 @@ class ActivityPane(Vertical):
 
     def _load_db_tab(self, category: str) -> None:
         self._showing_raw = False
+        self._row_query = None
         self._log_body(f"Loading {category.lower()}…")  # clear any prior tab's table while this one loads
 
         if self._db is None:
@@ -969,7 +991,7 @@ class ActivityPane(Vertical):
             self._handle_rows(rows)
             return
 
-        proc = await to_thread(start_odoo_db, category.lower(), db, port, host)
+        proc = await to_thread(start_odoo_db, category.lower(), db, port, host, include_sensitive=True)
         if proc is None:
             if ident == self._dbtab.ident:
                 self._log_body("(odoo-db not found on PATH)")
@@ -1044,10 +1066,10 @@ class ActivityPane(Vertical):
         table.clear(columns=True)
         columns = table_columns(rows)
 
-        # "code" (crons' --include-code) is a blob, not a cell — wrap it into
-        # the table's remaining width instead of stringify's 80-char clip,
-        # same as the Top tab's COMMAND column.
-        wrap_col = "code" if "code" in columns else None
+        # "code" (crons' --include-code) and "value" (params) are blobs, not
+        # cells — wrap them into the table's remaining width instead of
+        # stringify's 80-char clip, same as the Top tab's COMMAND column.
+        wrap_col = next((c for c in ("code", "value") if c in columns), None)
         fixed = [c for c in columns if c != wrap_col]
         table.add_columns(*(c.upper() for c in fixed))
         if wrap_col:
@@ -1057,7 +1079,14 @@ class ActivityPane(Vertical):
             )
             table.add_column(wrap_col.upper(), width=max(20, (table.size.width or 80) - other_width))
 
-        for i, row in enumerate(rows):
+        # key must stay the index into the *unfiltered* list: on_data_table_row_selected
+        # drills into self._dbtab.rows by it, so a filtered-out row can't shift another's key.
+        visible = [(i, r) for i, r in enumerate(rows) if not self._row_query or row_matches(r, self._row_query)]
+        if not visible:
+            self._log_body(f"(no match: {self._row_query})")
+            return
+
+        for i, row in visible:
             cells: list[str | Text] = [stringify(row.get(c, "")) for c in fixed]
             if wrap_col:
                 cells.append(Text(str(row.get(wrap_col, "")), no_wrap=False))

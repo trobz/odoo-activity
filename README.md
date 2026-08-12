@@ -32,14 +32,14 @@ one supports.
 | `[` / `]` | switch tab in the detail pane |
 | `f` | maximize/minimize the focused pane |
 | `p` / `l` / `c` / `t` | Top / Logs / Config / Toolbox |
-| `u` / `l` / `j` / `c` | Users / Locks / Jobs / Crons |
+| `u` / `l` / `j` / `c` / `p` | Users / Locks / Jobs / Crons / Params |
 | `K` | kill -9 the selected process (Top tab, confirm popup) |
 | `L` | kill -3 the selected process, then jump to Stacks (Top tab) |
 | `D` | dump stacks of all workers, then jump to Stacks |
 | `S` | copy the instance's `odoo shell` launch command to the clipboard |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
 | enter | run the selected tool (Toolbox tab, confirm popup) / open a row's raw json (db tabs) |
-| `/` | search (Logs and Config tabs) |
+| `/` | search (Logs, Config, and Params tabs) |
 | `R` | refresh the active tab now |
 | `q` | quit |
 
@@ -73,6 +73,10 @@ agent to work an investigation alongside a human on `oa [host]` — both
 looking at the same target. Every tool call is pinned to `host` (local if
 omitted); a `host`/`ssh_port` argument on a tool call must match the pin
 or is rejected.
+
+`db_query`'s `params` output is always masked, unlike the TUI's: a tool call
+has no human at the screen, and the plaintext would land in the agent's
+context.
 
 `oa-mcp-multi` instead leaves the target per-call, capped by
 `--host-filter` (an odoo dbfilter-style regex; unset means unrestricted)
@@ -150,7 +154,7 @@ odoo_activity/
 - **Instance mode** — an instance row is highlighted. Tabs: Top,
   Processes, Stacks, Logs, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
-  Queries, Users, Locks, Jobs, Crons, Modules.
+  Queries, Users, Locks, Jobs, Crons, Modules, Params.
 
 Both modes share the same tab strip and Log/DataTable widgets (just a
 `_mode` flag), and several letter-key shortcuts are reused across them for
@@ -174,5 +178,10 @@ in database mode).
   against the instance's config file and its plain-text stdout is shown as-is;
   the version passed to it comes from `odoo-addons-path <workdir> --verbose
   --format json`'s `version` key.
+- **Params** — `odoo-db params <db>` reads `ir_config_parameter`; `/` filters
+  rows by key or value. Values are shown as they are: odoo-db masks
+  secret-looking ones (`password`, `token`, an `enterprise_code`, ...) as
+  `********` by default, so the TUI always runs it with
+  `--include-sensitive-information`.
 
 [odoo-config-cli]: https://github.com/trobz/odoo-config/blob/main/CLI.md

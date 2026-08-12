@@ -132,6 +132,7 @@ class OdooActivity(App):
         ("[", "prev_tab", "Prev tab"),
         ("]", "next_tab", "Next tab"),
         ("p", "select_tab('Top')", "Top"),
+        ("p", "select_tab('Params')", "Params"),
         ("l", "select_tab('Logs')", "Logs"),
         ("l", "select_tab('Locks')", "Locks"),
         ("c", "select_tab('Config')", "Config"),
