@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.12.2 (2026-08-13)
+
+### Bug Fixes
+
+- Pin mcp to <2.0.0
+  ([`502fc0f`](https://github.com/trobz/odoo-activity/commit/502fc0f7a786c77da1f7d0f9d4a31d9e9e0c6154))
+
+
 ## v0.12.1 (2026-08-13)
 
 ### Bug Fixes
