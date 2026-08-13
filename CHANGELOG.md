@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.13.0 (2026-08-13)
+
+### Bug Fixes
+
+- **tui**: Guard _pulse_running against teardown
+  ([`c0e5033`](https://github.com/trobz/odoo-activity/commit/c0e5033c7da8fff72ce59d687904a577dc17697c))
+
+### Features
+
+- **params**: Add Params tab with row search
+  ([`45f3864`](https://github.com/trobz/odoo-activity/commit/45f38641dd7bfdc9d21108c59566514d9187f290))
+
+
 ## v0.12.2 (2026-08-13)
 
 ### Bug Fixes
