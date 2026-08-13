@@ -12,7 +12,7 @@ dependencies = [
     "typer>=0.20",
     "textual>=8",
     "typing-extensions>=4.16",
-    "mcp[cli]>=1.28.1",
+    "mcp[cli]>=1.28.1,<2.0.0",
     "pyperclip>=1.11.0",
 ]
 
