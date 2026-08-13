@@ -37,13 +37,14 @@ by default — you already have a shell on this host. Pass
 | `f` | maximize/minimize the focused pane |
 | `p` / `l` / `c` / `t` | Top / Logs / Config / Toolbox |
 | `u` / `l` / `j` / `c` / `p` | Users / Locks / Jobs / Crons / Params |
-| `K` | kill -9 the selected process (Top tab, confirm popup) |
+| `K` | kill -9 the selected process (Top and Processes tabs, confirm popup) |
 | `L` | kill -3 the selected process, then jump to Stacks (Top tab) |
 | `D` | dump stacks of all workers, then jump to Stacks |
 | `S` | copy the instance's `odoo shell` launch command to the clipboard |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
 | `A` | show all rows, inactive ones included |
-| enter | run the selected tool (Toolbox tab, confirm popup) / open a row's raw json (db tabs) |
+| enter | run the selected tool (Toolbox tab, confirm popup) / open a Jobs group / open a row's raw json (db tabs) |
+| escape | back out of a Jobs group, or of a row's raw json |
 | `/` | search |
 | `R` | refresh the active tab now |
 | `q` | quit |
@@ -55,6 +56,35 @@ and **Modules** (database mode).
 `A` asks `odoo-db` for the rows it filters out by default (its `--all`
 flag). Against a host whose `odoo-db` predates that flag, the tab falls
 back to the default rows and `A` says so instead of doing nothing.
+
+### Jobs (`j`)
+
+queue_job's jobs grouped by function and state, numbered, with the oldest
+creation date and the longest wait/run in each group — which is what a job
+stuck in `started` for hours looks like. Enter opens a group as its
+individual jobs (numbered too, `date_created`/`date_started` each, oldest
+first, capped at 500), escape backs out, and enter on one of those opens its
+raw json.
+
+Under the table is the tab's action strip — buttons that act on the
+database rather than on the row under the cursor, so they are not rows
+themselves. Jobs has one: **Requeue jobs** puts every `started`/`enqueued`
+job back to `pending` (after a confirm popup — including jobs a live worker
+is still running, which will then run again), clearing the dates that go
+with those states the way queue_job's own `set_pending` does — what a runner
+does for its own dead jobs at startup, for when a worker was killed mid-job
+and nothing else will revisit the row. It's offered even when the table above is empty, and the strip is
+hidden entirely on a tab that has no actions.
+
+The Processes tab lists the queue_job runner as its own role. Odoo only
+labels a worker in `ps` when `setproctitle` is installed — with it, that
+label is the whole answer and costs nothing. Without it, the runner is found
+by its postgres connection instead: `application_name` names the pid outright
+from Odoo 16.0 on, and before that (where odoo never set it) the connection
+is traced by its TCP endpoint, `ss` or `lsof` saying which process holds the
+client port. An instance on a unix socket reports no port and can't be traced
+that way; if nothing can account for it, the runner just stays under HTTP
+Worker.
 
 Toolbox (`t`) offers four tools:
 - Spin a worker up (`SIGTTIN`) or down (`SIGTTOU`).
