@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.12.1 (2026-08-13)
+
+### Bug Fixes
+
+- **probes**: Keep local instances findable and safe to signal
+  ([`7b92a48`](https://github.com/trobz/odoo-activity/commit/7b92a48c3f4635ad7ce4385e0eeff790c56b81ec))
+
+
 ## v0.12.0 (2026-08-10)
 
 ### Features
