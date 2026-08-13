@@ -151,9 +151,10 @@ class OdooActivity(App):
         ("R", "refresh", "Refresh"),
     ]
 
-    def __init__(self, host: Host | None = None) -> None:
+    def __init__(self, host: Host | None = None, *, include_sensitive_information: bool = True) -> None:
         super().__init__()
         self.host = host or Host()
+        self.include_sensitive_information = include_sensitive_information
 
     def compose(self) -> ComposeResult:
         with Vertical(id="body"):

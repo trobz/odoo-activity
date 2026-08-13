@@ -1,3 +1,4 @@
+import inspect
 import re
 
 from odoo_activity import mcp_server
@@ -14,6 +15,26 @@ def test_ssh_config_aliases_skips_wildcards_and_negation(tmp_path):
     cfg = tmp_path / "config"
     cfg.write_text("Host demo\nHost *.internal\nHost !skip real\n")
     assert mcp_server._ssh_config_aliases(cfg) == ["demo", "real"]
+
+
+def test_db_query_has_no_include_sensitive_information_argument():
+    """No tool call can ask for plaintext -- the parameter must not exist on
+    db_query's callable signature (what FastMCP turns into the tool schema
+    an agent sees), only on the launch-time CLI flag."""
+    assert "include_sensitive_information" not in inspect.signature(mcp_server.db_query).parameters
+
+
+def test_db_query_honors_launch_time_flag_only(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_db", lambda *_a, **kw: captured.update(kw) or None)
+
+    monkeypatch.setattr(mcp_server, "_include_sensitive_information", False)
+    mcp_server.db_query("demo", "params")
+    assert captured["include_sensitive_information"] is False
+
+    monkeypatch.setattr(mcp_server, "_include_sensitive_information", True)
+    mcp_server.db_query("demo", "params")
+    assert captured["include_sensitive_information"] is True
 
 
 def test_mcp_tools_do_not_crash():

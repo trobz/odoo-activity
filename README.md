@@ -25,6 +25,10 @@ database category tabs. The Config tab additionally needs `odoo-config`
 and `odoo-addons-path` on `PATH`. See [Managers](#managers) for what each
 one supports.
 
+The Params tab shows `ir_config_parameter` secret-looking values unmasked
+by default — you already have a shell on this host. Pass
+`--no-include-sensitive-information` to keep odoo-db's own masking instead.
+
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` | move through instances and their nested dbs |
@@ -74,9 +78,11 @@ looking at the same target. Every tool call is pinned to `host` (local if
 omitted); a `host`/`ssh_port` argument on a tool call must match the pin
 or is rejected.
 
-`db_query`'s `params` output is always masked, unlike the TUI's: a tool call
-has no human at the screen, and the plaintext would land in the agent's
-context.
+`db_query`'s `params` output is masked by default, unlike the TUI's: a tool
+call has no human at the screen, and the plaintext would land in the agent's
+context. Unmasking is launch-time only, via `--include-sensitive-information`
+on the `oa-mcp`/`oa-mcp-multi` command line — never a per-call tool
+argument, so no tool call can turn it on itself.
 
 `oa-mcp-multi` instead leaves the target per-call, capped by
 `--host-filter` (an odoo dbfilter-style regex; unset means unrestricted)

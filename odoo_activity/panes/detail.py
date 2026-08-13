@@ -991,7 +991,14 @@ class ActivityPane(Vertical):
             self._handle_rows(rows)
             return
 
-        proc = await to_thread(start_odoo_db, category.lower(), db, port, host, include_sensitive=True)
+        proc = await to_thread(
+            start_odoo_db,
+            category.lower(),
+            db,
+            port,
+            host,
+            include_sensitive_information=self.app.include_sensitive_information,
+        )
         if proc is None:
             if ident == self._dbtab.ident:
                 self._log_body("(odoo-db not found on PATH)")

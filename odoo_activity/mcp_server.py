@@ -40,6 +40,11 @@ _WILDCARD = re.compile(r"[*?]")
 _host_filter: re.Pattern[str] | None = None
 _host_file: Path = _DEFAULT_HOST_FILE
 _pinned_target: Host | None = None
+# Launch-time only, never a per-call tool argument -- an agent must not be
+# able to flip this on itself. Set solely by --include-sensitive-information
+# on the oa-mcp/oa-mcp-multi command line, i.e. by the human starting the
+# server.
+_include_sensitive_information = False
 
 
 def _allowed(alias: str | None) -> bool:
@@ -440,7 +445,9 @@ def db_query(
     modules, crons, jobs, users, locks, params. Stats/bloat/attachments/studio
     and the audit-oriented commands (they write a `$db.json` file to disk) are
     out of scope here. `params` returns `ir_config_parameter` rows, with
-    secret-looking values already masked by odoo-db.
+    secret-looking values masked by odoo-db unless the server was started
+    with `--include-sensitive-information` — a launch-time-only choice, not
+    a per-call argument here: no tool call can enable it on its own.
 
     Args:
         db: database name.
@@ -450,7 +457,7 @@ def db_query(
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
     """
-    proc = probes.start_odoo_db(command, db, port, target)
+    proc = probes.start_odoo_db(command, db, port, target, include_sensitive_information=_include_sensitive_information)
     if proc is None:
         return "(odoo-db not found on PATH)"
 
@@ -475,13 +482,21 @@ def main(
     ),
     bind_host: str = typer.Option("127.0.0.1", "--bind-host", help="streamable-http only"),
     bind_port: int = typer.Option(8000, "--bind-port", help="streamable-http only"),
+    include_sensitive_information: bool = typer.Option(
+        False,
+        "--include-sensitive-information",
+        help="Let db_query's `params` command return secret-looking values unmasked. Launch-time only "
+        "-- no tool call can turn this on itself; set it only if every caller of this server should see "
+        "plaintext secrets.",
+    ),
 ) -> None:
     """oa-mcp — MCP server exposing odoo-activity's read-only capacities,
     pinned to a single host: the counterpart to `oa host`, so a human on
     `oa host` and their agent on `oa-mcp host` are always looking at the
     same target. Omit `host` to pin to local, matching bare `oa`."""
-    global _pinned_target
+    global _pinned_target, _include_sensitive_information
     _pinned_target = Host(alias=host, port=port)
+    _include_sensitive_information = include_sensitive_information
 
     if transport == "streamable-http":
         mcp.settings.host = bind_host
@@ -505,15 +520,23 @@ def main_multi(
         Path,
         typer.Option("--host-file", help="ssh config to read literal Host aliases from, for list_hosts()."),
     ] = _DEFAULT_HOST_FILE,
+    include_sensitive_information: bool = typer.Option(
+        False,
+        "--include-sensitive-information",
+        help="Let db_query's `params` command return secret-looking values unmasked. Launch-time only "
+        "-- no tool call can turn this on itself; set it only if every caller of this server should see "
+        "plaintext secrets.",
+    ),
 ) -> None:
     """oa-mcp-multi — same tools as oa-mcp, capped by --host-filter."""
-    global _host_filter, _host_file
+    global _host_filter, _host_file, _include_sensitive_information
     if transport == "streamable-http":
         mcp.settings.host = bind_host
         mcp.settings.port = bind_port
 
     _host_filter = re.compile(host_filter) if host_filter else None
     _host_file = host_file
+    _include_sensitive_information = include_sensitive_information
 
     mcp.run(transport=transport)
 
