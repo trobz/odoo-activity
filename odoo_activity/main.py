@@ -34,6 +34,12 @@ def main(
     debug: bool = typer.Option(
         False, "--debug", help=f"log keypress/loop-lag diagnostics to {DEBUG_LOG_PATH} (tail -f it from elsewhere)."
     ),
+    include_sensitive_information: bool = typer.Option(
+        True,
+        "--include-sensitive-information/--no-include-sensitive-information",
+        help="Show db-tab params' secret-looking values unmasked. On by default -- you're a human with a "
+        "shell on this host already; --no-include-sensitive-information keeps odoo-db's own masking.",
+    ),
 ) -> None:
     """odoo-activity — TUI for local or ssh-remote Odoo instances."""
     if debug:
@@ -42,7 +48,7 @@ def main(
     target = Host(alias=host, port=port)
     code = 0
     try:
-        OdooActivity(host=target).run()
+        OdooActivity(host=target, include_sensitive_information=include_sensitive_information).run()
     except BaseException:
         traceback.print_exc()
         code = 1

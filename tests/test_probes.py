@@ -141,7 +141,7 @@ def test_start_odoo_db_builds_params_argv(monkeypatch):
     assert captured["cmd"] == ["env", "PGPORT=5433", "odoo-db", "--output-format", "json", "params", "demo"]
 
     # a *global* odoo-db option: after the subcommand Typer would reject it
-    probes.start_odoo_db("params", "demo", None, Host(), include_sensitive=True)
+    probes.start_odoo_db("params", "demo", None, Host(), include_sensitive_information=True)
     assert captured["cmd"] == [
         "odoo-db",
         "--output-format",

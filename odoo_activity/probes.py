@@ -1662,7 +1662,12 @@ def tail(path: Path, lines: int = 200, host: Host = LOCAL) -> str:
 
 
 def start_odoo_db(
-    command: str, db: str, port: str | None = None, host: Host = LOCAL, *, include_sensitive: bool = False
+    command: str,
+    db: str,
+    port: str | None = None,
+    host: Host = LOCAL,
+    *,
+    include_sensitive_information: bool = False,
 ) -> subprocess.Popen[str] | None:
     """Start `odoo-db --output-format json <command> <db>`, on `port` if the
     instance's cluster isn't the default one (odoo-db has no --port flag of
@@ -1681,15 +1686,17 @@ def start_odoo_db(
     None if `odoo-db` isn't on PATH (degrade like render_config does for
     odoo-config, instead of crashing the app on a host that lacks it).
 
-    `include_sensitive` drops odoo-db's masking of secret-looking values
-    (params' `********`), so the caller gets plaintext. The TUI always sets
-    it — its reader is a human who already has a shell on this host. The MCP
-    server never does: a tool call has no such reader, and the plaintext
-    would land in the agent's context.
+    `include_sensitive_information` mirrors odoo-db's own `--include-sensitive-information`
+    flag name and drops its masking of secret-looking values (params'
+    `********`), so the caller gets plaintext. The TUI always sets it — its
+    reader is a human who already has a shell on this host. `oa-mcp`/
+    `oa-mcp-multi` default it to False — a tool call has no such reader, and
+    the plaintext would land in the agent's context — but expose it as a
+    per-call opt-in.
     """
     cmd = ["env", f"PGPORT={port}"] if port else []
     cmd += ["odoo-db", "--output-format", "json"]
-    if include_sensitive:
+    if include_sensitive_information:
         # odoo-db's global PII master switch -- must precede the subcommand.
         cmd += ["--include-sensitive-information"]
     cmd += [command]
