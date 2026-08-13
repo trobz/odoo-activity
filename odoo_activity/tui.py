@@ -146,6 +146,7 @@ class OdooActivity(App):
         ("L", "quit_process", "Log dump -3"),
         ("D", "dumpstacks", "Dump stacks"),
         ("S", "copy_shell_command", "Copy shell cmd"),
+        ("A", "toggle_show_all", "All/active"),
         ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
         ("f", "toggle_maximize", "Maximize"),
         ("R", "refresh", "Refresh"),
@@ -561,6 +562,9 @@ class OdooActivity(App):
         if action in ("dumpstacks", "copy_shell_command"):
             return self.query_one(ActivityPane).is_instance_mode() and self.current_instance() is not None
 
+        if action == "toggle_show_all":
+            return self.query_one(ActivityPane).has_show_all()
+
         if action == "toggle_config_mode":
             return self.query_one(ActivityPane).is_config_active()
 
@@ -586,6 +590,9 @@ class OdooActivity(App):
 
     def action_search(self) -> None:
         self.query_one(ActivityPane).open_search()
+
+    def action_toggle_show_all(self) -> None:
+        self.query_one(ActivityPane).toggle_show_all()
 
     def action_toggle_maximize(self) -> None:
         if self.screen.maximized is not None:

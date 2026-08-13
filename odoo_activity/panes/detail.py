@@ -28,6 +28,7 @@ from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.processes import render_processes
 from odoo_activity.panes.stacks import render_stacks
 from odoo_activity.probes import (
+    ALL_ROW_FLAGS,
     CLK_TCK,
     Instance,
     ProcRow,
@@ -85,6 +86,7 @@ class _DbTab:
         self.ident: tuple[str, str] | None = None  # (category, db) most recently requested
         self.proc: subprocess.Popen[str] | None = None  # its still-running odoo-db, if any
         self.rows: list[dict] = []  # raw (untruncated) rows behind #actable, outlives the fetch
+        self.no_all = False  # this host's odoo-db rejected --all (see _fetch_db_tab)
 
     def abandon(self) -> None:
         """Kill a still-running fetch and forget it. Its process (and the
@@ -161,6 +163,8 @@ class ActivityPane(Vertical):
     ]
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
 
+    DB_SEARCH_TABS: ClassVar = {"Modules", "Crons", "Users", "Params"}
+
     if TYPE_CHECKING:
 
         @property
@@ -192,7 +196,8 @@ class ActivityPane(Vertical):
         self._log_pos = 0
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
         self._log_query: str | None = None
-        self._row_query: str | None = None  # active filter for db-tab rows (see is_params_active)
+        self._row_query: str | None = None  # db-tab table filter
+        self._show_all = False  # db-tab: include rows the active/installed flag hides
         self._top_prev: dict[str, tuple[int, float]] = {}  # pid -> (ticks, monotonic)
         self._proc_rows: list[ProcDisplayRow] = []  # rows behind #actable in the Top tab
         self._config_mode = self.CONFIG_MODES[0]  # which odoo-config view the Config tab shows
@@ -218,7 +223,7 @@ class ActivityPane(Vertical):
         if self.is_top_active():
             self._show_process_table(self._proc_rows)
         elif self._mode == "database" and self._dbtab.rows and not self._showing_raw:
-            self._populate_datatable(self._dbtab.rows)
+            self._populate_datatable(self._visible_db_rows())
 
     def _coalesce(self, key: str, ident: object, factory: Callable[[], Awaitable[None]]) -> None:
         """Run at most one task per `key` at a time, identified by `ident`.
@@ -287,14 +292,36 @@ class ActivityPane(Vertical):
     def is_toolbox_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Toolbox"
 
-    def is_params_active(self) -> bool:
-        return self._mode == "database" and self._active_tab() == "Params"
-
     def has_search(self) -> bool:
         """Logs and Config render plain text into #acbody with a substring
-        filter (see _render_log); Params instead filters rows -- key or
-        value -- inside _populate_datatable."""
-        return self.is_logs_active() or self.is_config_active() or self.is_params_active()
+        filter (see _render_log); the db tabs listed in DB_SEARCH_TABS
+        instead filter their table rows (see _visible_db_rows)."""
+        if self._mode == "database":
+            return self._active_tab() in self.DB_SEARCH_TABS
+
+        return self.is_logs_active() or self.is_config_active()
+
+    def _all_row_flag(self) -> str | None:
+        """The status column `A` toggles on the active db tab, if it has one
+        (see probes.ALL_ROW_FLAGS)."""
+        if self._mode != "database":
+            return None
+        return ALL_ROW_FLAGS.get(self._active_tab().lower())
+
+    def has_show_all(self) -> bool:
+        """Whether the active tab has rows `A` can reveal."""
+        return self._all_row_flag() is not None
+
+    def toggle_show_all(self) -> None:
+        if not self.has_show_all():
+            return
+
+        if self._dbtab.no_all:
+            self.app.notify("This host's odoo-db can't list inactive rows", severity="warning")
+            return
+
+        self._show_all = not self._show_all
+        self._show_datatable()
 
     def selected_process(self) -> ProcDisplayRow | None:
         """The process under the Top tab's table cursor, if any."""
@@ -310,6 +337,11 @@ class ActivityPane(Vertical):
 
         box = self.query_one("#acsearch", Input)
         box.value = ""  # blank each time: enter alone clears an existing filter
+        box.placeholder = (
+            f"filter {self._active_tab().lower()}, enter to apply, empty clears"
+            if self._mode == "database"
+            else "search logs, enter to apply, empty clears"
+        )
         box.display = True
         box.focus()
 
@@ -457,12 +489,11 @@ class ActivityPane(Vertical):
         event.input.display = False
         self.focus_active()
 
-        if self.is_params_active():
+        if self._mode == "database":
+            # filters what's already fetched -- no odoo-db round trip
             self._row_query = query
             self.border_title = self._title()  # _title() is otherwise only recomputed on tab switch
-            if self._dbtab.rows:  # nothing loaded yet (error/(empty)) -- don't clobber that message
-                self._showing_raw = False
-                self._show_datatable(self._dbtab.rows)
+            self._show_datatable()
             return
 
         self._log_query = query
@@ -637,10 +668,10 @@ class ActivityPane(Vertical):
         elif self.is_logs_active() and self._log_path:
             title += f" — {self._log_path}"
 
-        elif self.is_params_active() and self._row_query:
+        elif self._mode == "database" and self._row_query:
             # once the search input hides itself, this border is the only thing
             # left saying the table is filtered rather than short.
-            title += f" — Params (filter: {self._row_query})"
+            title += f" — {self._active_tab()} (filter: {self._row_query})"
 
         return title
 
@@ -965,7 +996,6 @@ class ActivityPane(Vertical):
 
     def _load_db_tab(self, category: str) -> None:
         self._showing_raw = False
-        self._row_query = None
         self._log_body(f"Loading {category.lower()}…")  # clear any prior tab's table while this one loads
 
         if self._db is None:
@@ -976,6 +1006,12 @@ class ActivityPane(Vertical):
         ident = (category, db)
         if ident == self._dbtab.ident and self._dbtab.proc is not None:
             return  # already fetching this exact tab; let it finish rather than restart
+
+        if ident != self._dbtab.ident:
+            # a different tab/db: its filters mean nothing here, while `R` on
+            # the same one keeps them. Read before abandon(), which clears `ident`.
+            self._row_query = None
+            self._show_all = False
 
         self._dbtab.abandon()  # drop the previous tab's client (see start_odoo_db)
         self._dbtab.ident = ident
@@ -994,6 +1030,38 @@ class ActivityPane(Vertical):
             self._handle_rows(rows)
             return
 
+        # fetch the flagged-off rows too, so `A` toggles client-side (see _visible_db_rows)
+        include_inactive = category.lower() in ALL_ROW_FLAGS
+        self._dbtab.no_all = False
+        outcome = await self._run_odoo_db(category, db, port, host, ident, include_inactive)
+        if outcome is None:
+            return
+
+        rows, raw = outcome
+        if rows is None and include_inactive and "no such option" in raw.lower():
+            # this host's odoo-db needs updating for --all -- retry plain so
+            # the tab still gets its rows; toggle_show_all explains the rest.
+            self._dbtab.no_all = True
+            outcome = await self._run_odoo_db(category, db, port, host, ident, include_inactive=False)
+            if outcome is None:
+                return
+
+            rows, raw = outcome
+
+        self._handle_rows(rows, raw)
+
+    async def _run_odoo_db(
+        self,
+        category: str,
+        db: str,
+        port: str | None,
+        host: Host,
+        ident: tuple[str, str],
+        include_inactive: bool,
+    ) -> tuple[list[dict] | None, str] | None:
+        """One odoo-db run for `category`. None when there's nothing to show
+        for it: no odoo-db, timed out, or the tab moved on meanwhile (the
+        first two report themselves in the body)."""
         proc = await to_thread(
             start_odoo_db,
             category.lower(),
@@ -1001,11 +1069,12 @@ class ActivityPane(Vertical):
             port,
             host,
             include_sensitive_information=self.app.include_sensitive_information,
+            include_inactive=include_inactive,
         )
         if proc is None:
             if ident == self._dbtab.ident:
                 self._log_body("(odoo-db not found on PATH)")
-            return
+            return None
 
         self._dbtab.proc = proc
 
@@ -1019,16 +1088,15 @@ class ActivityPane(Vertical):
         result = await to_thread(_wait)
 
         if ident != self._dbtab.ident:
-            return  # superseded by a newer tab selection; this result is stale
+            return None  # superseded by a newer tab selection; this result is stale
 
         self._dbtab.proc = None
 
         if result is None:
             self._log_body("(odoo-db timed out after 90s)")
-            return
+            return None
 
-        rows, raw = parse_odoo_db_output(*result)
-        self._handle_rows(rows, raw)
+        return parse_odoo_db_output(*result)
 
     def _handle_rows(self, rows: list[dict] | None, raw: str = "") -> None:
         if rows is None:
@@ -1037,7 +1105,7 @@ class ActivityPane(Vertical):
             self._log_body("(empty)")
         else:
             self._dbtab.rows = rows
-            self._show_datatable(rows)
+            self._show_datatable()
 
     _BODY_WIDGETS: ClassVar = {
         "log": ("#acbody", RichLog),
@@ -1061,7 +1129,36 @@ class ActivityPane(Vertical):
         for i, (label, _sig) in enumerate(self.TOOLBOX_TOOLS):
             table.add_row(label, key=str(i))
 
-    def _show_datatable(self, rows: list[dict]) -> None:
+    def _visible_db_rows(self) -> list[tuple[int, dict]]:
+        """(original index, row) for the db rows passing the active-flag and
+        search filters.
+
+        The index is the row's position in `_dbtab.rows` — it becomes the
+        DataTable row key, so drilling into a row's raw json still lands on
+        the right row under a filter (see on_data_table_row_selected)."""
+        flag = self._all_row_flag()
+
+        pairs = []
+        for i, row in enumerate(self._dbtab.rows):
+            if flag is not None and not self._show_all and not row.get(flag, True):
+                continue
+            if self._row_query and not row_matches(row, self._row_query):
+                continue
+
+            pairs.append((i, row))
+
+        return pairs
+
+    def _show_datatable(self) -> None:
+        if not self._dbtab.rows:
+            return  # nothing loaded yet (error/(empty)) -- don't clobber that message
+
+        self._showing_raw = False
+        pairs = self._visible_db_rows()
+        if not pairs:
+            self._log_body(f"(no match: {self._row_query})" if self._row_query else "(empty)")
+            return
+
         # Unlike Top (re-rendered every 0.5s poll, so a wrong width
         # self-corrects within a tick), db tabs render once — reveal the
         # table first so layout can size it, then measure it, instead of
@@ -1069,11 +1166,12 @@ class ActivityPane(Vertical):
         # width and being stuck that way until an actual terminal resize.
         self.query_one("#actable", DataTable).clear(columns=True)  # drop stale rows before the reveal
         self._use("table")
-        self.call_after_refresh(self._populate_datatable, rows)
+        self.call_after_refresh(self._populate_datatable, pairs)
 
-    def _populate_datatable(self, rows: list[dict]) -> None:
+    def _populate_datatable(self, pairs: list[tuple[int, dict]]) -> None:
         table = self.query_one("#actable", DataTable)
         table.clear(columns=True)
+        rows = [row for _i, row in pairs]
         columns = table_columns(rows)
 
         # "code" (crons' --include-code) and "value" (params) are blobs, not
@@ -1089,14 +1187,7 @@ class ActivityPane(Vertical):
             )
             table.add_column(wrap_col.upper(), width=max(20, (table.size.width or 80) - other_width))
 
-        # key must stay the index into the *unfiltered* list: on_data_table_row_selected
-        # drills into self._dbtab.rows by it, so a filtered-out row can't shift another's key.
-        visible = [(i, r) for i, r in enumerate(rows) if not self._row_query or row_matches(r, self._row_query)]
-        if not visible:
-            self._log_body(f"(no match: {self._row_query})")
-            return
-
-        for i, row in visible:
+        for i, row in pairs:
             cells: list[str | Text] = [stringify(row.get(c, "")) for c in fixed]
             if wrap_col:
                 cells.append(Text(str(row.get(wrap_col, "")), no_wrap=False))

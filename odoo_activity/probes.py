@@ -1661,6 +1661,13 @@ def tail(path: Path, lines: int = 200, host: Host = LOCAL) -> str:
         return f"(no log: {exc})"
 
 
+# odoo-db commands whose `--all` reveals hidden rows, mapped to the column
+# that flags them (the key `--all` adds to that command's rows). The one
+# place that needs to know both facts -- start_odoo_db (which flag to pass)
+# and detail.py (which column to filter on) both key off this dict.
+ALL_ROW_FLAGS: dict[str, str] = {"crons": "active", "modules": "installed", "users": "active"}
+
+
 def start_odoo_db(
     command: str,
     db: str,
@@ -1668,6 +1675,7 @@ def start_odoo_db(
     host: Host = LOCAL,
     *,
     include_sensitive_information: bool = False,
+    include_inactive: bool = False,
 ) -> subprocess.Popen[str] | None:
     """Start `odoo-db --output-format json <command> <db>`, on `port` if the
     instance's cluster isn't the default one (odoo-db has no --port flag of
@@ -1693,6 +1701,10 @@ def start_odoo_db(
     `oa-mcp-multi` default it to False — a tool call has no such reader, and
     the plaintext would land in the agent's context — but expose it as a
     per-call opt-in.
+
+    `include_inactive` asks the commands that have it for the rows they hide
+    by default (uninstalled modules, inactive crons/users) plus the status
+    column that tells them apart, so the TUI's `A` can toggle client-side.
     """
     cmd = ["env", f"PGPORT={port}"] if port else []
     cmd += ["odoo-db", "--output-format", "json"]
@@ -1703,6 +1715,10 @@ def start_odoo_db(
     if command == "crons":
         # show scheduled actions' code
         cmd += ["--include-code"]
+    if include_inactive and command in ALL_ROW_FLAGS:
+        # the rows odoo-db filters out by default, plus the status column
+        # (see ALL_ROW_FLAGS) to filter them on ourselves
+        cmd += ["--all"]
     cmd += [db]
 
     try:
