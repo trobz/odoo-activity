@@ -556,8 +556,10 @@ class OdooActivity(App):
         if action in ("kill_process", "quit_process"):
             return self.query_one(ActivityPane).is_top_active()
 
+        # a db row resolves to its owning instance (see _row_owner), so these
+        # two need the mode as well to stay out of database mode
         if action in ("dumpstacks", "copy_shell_command"):
-            return self.current_instance() is not None
+            return self.query_one(ActivityPane).is_instance_mode() and self.current_instance() is not None
 
         if action == "toggle_config_mode":
             return self.query_one(ActivityPane).is_config_active()

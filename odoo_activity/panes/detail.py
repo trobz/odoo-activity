@@ -266,6 +266,9 @@ class ActivityPane(Vertical):
         tabs = self.TABS[self._mode]
         return tabs[self._tab % len(tabs)]
 
+    def is_instance_mode(self) -> bool:
+        return self._mode == "instance"
+
     def is_logs_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Logs"
 

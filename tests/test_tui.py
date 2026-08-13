@@ -145,6 +145,34 @@ def test_instance_action_waits_for_confirmation(monkeypatch):
     asyncio.run(go())
 
 
+def test_instance_only_shortcuts_are_hidden_in_database_mode(monkeypatch):
+    # regression guard: a db row resolves to its owning instance, so D/S have
+    # an instance to act on there too -- mode is what must keep them hidden
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda *_: (["demo"], None))
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert pilot.app.check_action("dumpstacks", ()) is True
+            assert pilot.app.check_action("copy_shell_command", ()) is True
+
+            await pilot.press("down")  # onto the nested db row -> database mode
+            await pilot.pause()
+            assert pilot.app.check_action("dumpstacks", ()) is False
+            assert pilot.app.check_action("copy_shell_command", ()) is False
+
+            await pilot.press("up")
+            await pilot.pause()
+            assert pilot.app.check_action("dumpstacks", ()) is True
+
+    asyncio.run(go())
+
+
 def test_leaving_a_late_db_tab_for_an_instance_row(monkeypatch):
     # regression guard: database mode has more tabs than instance mode, so
     # navigating off one of the extra ones (Crons) back up to an instance row
