@@ -19,6 +19,7 @@ import socket
 import subprocess
 import time
 from collections import Counter
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -1768,7 +1769,7 @@ def stringify(value: object, max_cell: int = 80) -> str:
     return text if len(text) <= max_cell else text[: max_cell - 1] + "…"
 
 
-def row_matches(row: dict, needle: str) -> bool:
+def row_matches(row: Mapping[str, object], needle: str) -> bool:
     """True if any of `row`'s cell values contains `needle`, case-insensitively.
 
     Values only, never the column names -- matching those would make a search

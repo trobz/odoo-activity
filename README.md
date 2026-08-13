@@ -44,7 +44,7 @@ by default — you already have a shell on this host. Pass
 | `e` | cycle compact/explain/expand/clean (Config tab) |
 | `A` | show all rows, inactive ones included |
 | enter | run the selected tool (Toolbox tab, confirm popup) / open a row's raw json (db tabs) |
-| `/` | search (Logs and Config; Users, Crons, Modules and Params tables) |
+| `/` | search |
 | `R` | refresh the active tab now |
 | `q` | quit |
 

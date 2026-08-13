@@ -199,7 +199,7 @@ def test_db_tab_search_and_show_all_gating(monkeypatch):
 
             pane.select_tab_by_name("Locks")
             await pilot.pause()
-            assert pilot.app.check_action("search", ()) is False
+            assert pilot.app.check_action("search", ()) is True  # every db table searches
             assert pilot.app.check_action("toggle_show_all", ()) is False
 
     asyncio.run(go())
@@ -338,11 +338,57 @@ def test_visible_db_rows_filters_by_active_flag_and_query(monkeypatch):
 
             # indexes stay the ones into _dbtab.rows, so enter still opens the
             # right row's raw json
-            pane._row_query = "vacuum"
+            pane._filters["Crons"] = "vacuum"
             assert [i for i, _row in pane._visible_db_rows()] == [1]
 
             pane._show_all = False
             assert pane._visible_db_rows() == []
+
+    asyncio.run(go())
+
+
+def test_selected_process_follows_the_filtered_table(monkeypatch):
+    """`K`/`L` signal whatever selected_process() returns, so under a Top
+    filter it must read the cursor's row *key*, not its position — those
+    differ as soon as a row is filtered out."""
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda *_: ([], None))
+
+    def _row(pid: str, cmd: str) -> probes.ProcRow:
+        return {"pid": pid, "ppid": "1", "user": "odoo", "mem": "0.1", "nice": "0", "cmd": cmd}
+
+    # the Top tab's own periodic refresh (tick()) re-fetches on a real timer,
+    # so it must return the same fixed rows every time -- anything live (the
+    # real `ps`) would make the table's contents, and this test, a coin flip
+    odoo_rows = [_row("101", "odoo-bin"), _row("103", "odoo-bin")]
+    pg_rows = [_row("102", "postgres: demo")]
+    monkeypatch.setattr(detail_mod, "instance_procs", lambda *_: (odoo_rows, pg_rows))
+    monkeypatch.setattr(detail_mod, "proc_cpu_ticks_many", lambda *_: {})
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            assert pane.is_top_active()
+            await pilot.app.workers.wait_for_complete()  # the Top tab's own initial fetch
+            await pilot.pause()
+
+            pane.open_search()
+            await pilot.pause()
+            await pilot.press(*"postgres")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            table = pilot.app.query_one("#actable", DataTable)
+            assert table.row_count == 1
+            table.move_cursor(row=0)
+            selected = pane.selected_process()
+            assert selected is not None
+            assert selected["pid"] == "102"
 
     asyncio.run(go())
 
@@ -478,10 +524,10 @@ def test_on_resize_does_not_clobber_instance_log_with_leftover_params_filter(mon
             pane._tab = pane.TABS["instance"].index("Logs")
 
             # leftover from an earlier Params visit that no longer matches --
-            # abandon() doesn't clear _dbtab.rows, and _row_query is only
-            # reset by _load_db_tab, which instance mode never calls.
+            # abandon() doesn't clear _dbtab.rows, and _filters["Params"] is
+            # only popped by _load_db_tab, which instance mode never calls.
             pane._dbtab.rows = [{"key": "a", "value": "1"}]
-            pane._row_query = "zzz"
+            pane._filters["Params"] = "zzz"
             pane._showing_raw = False
 
             calls = []
@@ -526,6 +572,6 @@ def test_p_selects_params_in_database_mode_and_top_in_instance_mode(monkeypatch)
 
             pane.select_tab_by_name("Jobs")
             await pilot.pause()
-            assert pane.has_search() is False  # Jobs is a db tab with no row filter
+            assert pane.has_search() is True
 
     asyncio.run(go())
