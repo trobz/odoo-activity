@@ -16,6 +16,7 @@ from typing import ClassVar
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.theme import Theme
 from textual.widgets import Footer, Label, ListItem, ListView, Static
 
@@ -132,6 +133,7 @@ class OdooActivity(App):
         ("[", "prev_tab", "Prev tab"),
         ("]", "next_tab", "Next tab"),
         ("p", "select_tab('Top')", "Top"),
+        ("p", "select_tab('Params')", "Params"),
         ("l", "select_tab('Logs')", "Logs"),
         ("l", "select_tab('Locks')", "Locks"),
         ("c", "select_tab('Config')", "Config"),
@@ -434,7 +436,11 @@ class OdooActivity(App):
     def _pulse_running(self) -> None:
         """Redraw the running dots in place — a cheap re-render off the
         cached state, no process polling (that's poll_instances' job)."""
-        for item in self.query_one("#instances", ListView).children:
+        try:
+            listview = self.query_one("#instances", ListView)
+        except NoMatches:  # the 0.2s tick can land mid-shutdown, after the tree unmounts
+            return
+        for item in listview.children:
             inst = self._instances.get(item.name or "")
             if inst is None:  # a db row, not an instance row
                 continue

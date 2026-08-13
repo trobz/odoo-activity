@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pyperclip
@@ -120,3 +121,32 @@ def test_logfile_falls_back_to_redirected_stdout(monkeypatch):
 
     monkeypatch.setattr(probes, "_proc_link", lambda *_: "/dev/pts/5")
     assert probes.logfile_of(inst, Host()) is None
+
+
+def test_row_matches_values_only_case_insensitive():
+    row = {"key": "database.secret", "value": "********"}
+    assert probes.row_matches(row, "SECRET") is True  # case-insensitive
+    assert probes.row_matches(row, "key") is False  # column *names* never match
+    assert probes.row_matches({"value": None}, "any") is False  # SQL NULL doesn't raise
+
+
+def test_start_odoo_db_builds_params_argv(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: captured.update(cmd=cmd))
+
+    probes.start_odoo_db("params", "demo", None, Host())
+    assert captured["cmd"] == ["odoo-db", "--output-format", "json", "params", "demo"]  # no --include-code
+
+    probes.start_odoo_db("params", "demo", "5433", Host())
+    assert captured["cmd"] == ["env", "PGPORT=5433", "odoo-db", "--output-format", "json", "params", "demo"]
+
+    # a *global* odoo-db option: after the subcommand Typer would reject it
+    probes.start_odoo_db("params", "demo", None, Host(), include_sensitive=True)
+    assert captured["cmd"] == [
+        "odoo-db",
+        "--output-format",
+        "json",
+        "--include-sensitive-information",
+        "params",
+        "demo",
+    ]

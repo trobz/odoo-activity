@@ -1661,7 +1661,9 @@ def tail(path: Path, lines: int = 200, host: Host = LOCAL) -> str:
         return f"(no log: {exc})"
 
 
-def start_odoo_db(command: str, db: str, port: str | None = None, host: Host = LOCAL) -> subprocess.Popen[str] | None:
+def start_odoo_db(
+    command: str, db: str, port: str | None = None, host: Host = LOCAL, *, include_sensitive: bool = False
+) -> subprocess.Popen[str] | None:
     """Start `odoo-db --output-format json <command> <db>`, on `port` if the
     instance's cluster isn't the default one (odoo-db has no --port flag of
     its own, but honors PGPORT like any libpq client — set via an `env`
@@ -1678,9 +1680,19 @@ def start_odoo_db(command: str, db: str, port: str | None = None, host: Host = L
 
     None if `odoo-db` isn't on PATH (degrade like render_config does for
     odoo-config, instead of crashing the app on a host that lacks it).
+
+    `include_sensitive` drops odoo-db's masking of secret-looking values
+    (params' `********`), so the caller gets plaintext. The TUI always sets
+    it — its reader is a human who already has a shell on this host. The MCP
+    server never does: a tool call has no such reader, and the plaintext
+    would land in the agent's context.
     """
     cmd = ["env", f"PGPORT={port}"] if port else []
-    cmd += ["odoo-db", "--output-format", "json", command]
+    cmd += ["odoo-db", "--output-format", "json"]
+    if include_sensitive:
+        # odoo-db's global PII master switch -- must precede the subcommand.
+        cmd += ["--include-sensitive-information"]
+    cmd += [command]
     if command == "crons":
         # show scheduled actions' code
         cmd += ["--include-code"]
@@ -1731,6 +1743,16 @@ def stringify(value: object, max_cell: int = 80) -> str:
     text = json.dumps(value, ensure_ascii=False) if isinstance(value, dict | list) else str(value)
 
     return text if len(text) <= max_cell else text[: max_cell - 1] + "…"
+
+
+def row_matches(row: dict, needle: str) -> bool:
+    """True if any of `row`'s cell values contains `needle`, case-insensitively.
+
+    Values only, never the column names -- matching those would make a search
+    for "value" hit every row of a key/value table.
+    """
+    needle = needle.lower()
+    return any(needle in str(value).lower() for value in row.values())
 
 
 _LOGO = r"""

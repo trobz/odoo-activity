@@ -1,8 +1,12 @@
 import asyncio
+import json
 from types import SimpleNamespace
+
+from textual.widgets import DataTable
 
 from odoo_activity import probes, tui
 from odoo_activity.host import Host
+from odoo_activity.panes import detail as detail_mod
 
 
 def test_bar_colors_by_htop_thresholds():
@@ -166,5 +170,160 @@ def test_leaving_a_late_db_tab_for_an_instance_row(monkeypatch):
 
             assert pane._mode == "instance"
             assert pane._active_tab() in pane.TABS["instance"]
+
+    asyncio.run(go())
+
+
+_PARAMS_ROWS = [
+    {"key": "base.url", "value": "http://example"},
+    {"key": "database.secret", "value": "********"},
+]
+
+
+class _FakeOdooDbProc:
+    """Stands in for the odoo-db subprocess.Popen `start_odoo_db` returns --
+    `_fetch_db_tab` only ever calls .communicate()/.kill() on it."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        return json.dumps(self._rows), ""
+
+    def kill(self) -> None:
+        pass
+
+
+def _params_setup(monkeypatch):
+    """One instance with one db, `odoo-db params` stubbed to _PARAMS_ROWS."""
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda *_: (["demo"], None))
+    monkeypatch.setattr(detail_mod, "db_port_of", lambda *_a, **_k: None)
+
+    monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeOdooDbProc(_PARAMS_ROWS))
+
+
+async def _settle(pilot) -> None:
+    await pilot.app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+async def _open_params(pilot) -> "detail_mod.ActivityPane":
+    await _settle(pilot)
+    await pilot.press("down")  # onto the nested db row -> database mode
+    await pilot.pause()
+    pane = pilot.app.query_one(tui.ActivityPane)
+    pane.select_tab_by_name("Params")
+    await pilot.pause()
+    await _settle(pilot)  # the fetch worker, then the call_after_refresh that populates the table
+    return pane
+
+
+def test_params_filter_keeps_original_row_index_as_key(monkeypatch):
+    """Regression guard: _populate_datatable used to key rows by their
+    position in the *filtered* list, so filtering down to one row and
+    opening it could show the wrong row's raw json."""
+    _params_setup(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            pane = await _open_params(pilot)
+
+            pane.open_search()
+            await pilot.pause()
+            await pilot.press(*"secret")  # matches only _PARAMS_ROWS[1]
+            await pilot.press("enter")
+            await pilot.pause()
+
+            table = pilot.app.query_one("#actable", DataTable)
+            assert table.row_count == 1
+            assert next(iter(table.rows)).value == "1"  # index into the unfiltered list, not 0
+
+            shown = []
+            orig_show_raw = pane._show_raw
+            monkeypatch.setattr(pane, "_show_raw", lambda row: (shown.append(row), orig_show_raw(row)))
+
+            await pilot.press("enter")  # open the surviving row's raw json
+            await pilot.pause()
+
+            assert shown == [_PARAMS_ROWS[1]]  # row 1, not row 0
+            assert pane._showing_raw is True
+
+    asyncio.run(go())
+
+
+def test_on_resize_does_not_clobber_instance_log_with_leftover_params_filter(monkeypatch):
+    """Regression guard for the on_resize hazard: _DbTab.abandon() (called by
+    show_instance) drops .proc/.ident but not .rows, so a Params filter left
+    over from an earlier database-mode visit stays around. Without the
+    `self._mode == "database"` guard, on_resize would re-run
+    _populate_datatable on that leftover state and, finding no match, call
+    _log_body("(no match: ...)") -- clobbering the Logs/Config body on every
+    terminal resize while sitting in instance mode."""
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane._mode = "instance"
+            pane._tab = pane.TABS["instance"].index("Logs")
+
+            # leftover from an earlier Params visit that no longer matches --
+            # abandon() doesn't clear _dbtab.rows, and _row_query is only
+            # reset by _load_db_tab, which instance mode never calls.
+            pane._dbtab.rows = [{"key": "a", "value": "1"}]
+            pane._row_query = "zzz"
+            pane._showing_raw = False
+
+            calls = []
+            monkeypatch.setattr(pane, "_log_body", lambda text: calls.append(text))
+
+            await pilot.resize_terminal(80, 30)
+            await pilot.pause()
+
+            assert calls == []  # on_resize must leave #acbody alone outside database mode
+
+    asyncio.run(go())
+
+
+def test_p_selects_params_in_database_mode_and_top_in_instance_mode(monkeypatch):
+    """`p` is bound to both select_tab('Top') and select_tab('Params') --
+    check_action's has_tab() gate (see tui.py) is what makes only one of them
+    actually fire per mode, the same fallthrough Logs/Locks (`l`) and
+    Config/Crons (`c`) already rely on."""
+    _params_setup(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            app = pilot.app
+            pane = app.query_one(tui.ActivityPane)
+
+            assert app.check_action("select_tab", ("Top",)) is True
+            assert app.check_action("select_tab", ("Params",)) is False
+
+            await pilot.press("down")  # onto the nested db row -> database mode
+            await pilot.pause()
+
+            assert app.check_action("select_tab", ("Top",)) is False
+            assert app.check_action("select_tab", ("Params",)) is True
+
+            await pilot.press("p")
+            await pilot.pause()
+            assert pane._active_tab() == "Params"
+            assert pane.has_search() is True
+
+            pane.select_tab_by_name("Modules")
+            await pilot.pause()
+            assert pane.has_search() is False
 
     asyncio.run(go())

@@ -126,7 +126,7 @@ class StackDump(TypedDict):
     workers: list[Worker]
 
 
-DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks"]
+DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks", "params"]
 
 
 # Discovery is 8 ssh round trips (~620ms remote) behind every tool. Only the
@@ -437,13 +437,14 @@ def db_query(
     target: Host,
 ) -> list[dict] | str:
     """Run an `odoo-db` diagnostic command against `db` — a scoped subset:
-    modules, crons, jobs, users, locks. Stats/bloat/attachments/studio and
-    the audit-oriented commands (they write a `$db.json` file to disk) are
-    out of scope here.
+    modules, crons, jobs, users, locks, params. Stats/bloat/attachments/studio
+    and the audit-oriented commands (they write a `$db.json` file to disk) are
+    out of scope here. `params` returns `ir_config_parameter` rows, with
+    secret-looking values already masked by odoo-db.
 
     Args:
         db: database name.
-        command: modules, crons, jobs, users, or locks.
+        command: modules, crons, jobs, users, locks, or params.
         port: postgres port, if the instance's cluster isn't the default one.
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
