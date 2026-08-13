@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.14.0 (2026-08-13)
+
+### Features
+
+- Make ir_config_parameter unmasking an explicit, opt-in flag
+  ([`16ab744`](https://github.com/trobz/odoo-activity/commit/16ab74464030f49111a148835ab1698284d6e7d1))
+
+
 ## v0.13.0 (2026-08-13)
 
 ### Bug Fixes
