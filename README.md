@@ -32,6 +32,8 @@ by default — you already have a shell on this host. Pass
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` | move through instances and their nested dbs |
+| enter | open the highlighted row's tabs (from the instances list) |
+| `←`/`→` | switch tab (while the tab strip has focus) |
 | `s` / `r` | start/stop toggle / restart (confirm popup) |
 | `[` / `]` | switch tab in the detail pane |
 | `f` | maximize/minimize the focused pane |
@@ -55,6 +57,31 @@ and **Modules** (database mode).
 `A` asks `odoo-db` for the rows it filters out by default (its `--all`
 flag). Against a host whose `odoo-db` predates that flag, the tab falls
 back to the default rows and `A` says so instead of doing nothing.
+
+### Moving around
+
+Three zones, walked with the arrow keys: the instances list, the tab strip,
+and the tab body.
+
+```
+instances list  ──enter, or ↓ off the last row──►  tab strip  ──↓──►  tab body
+       ▲                                              ▲  │              │
+       └──────────────────── ↑ ───────────────────────┘  └───── ↑ ──────┘
+                                                          (at its top row)
+```
+
+`enter` is the way in rather than `↓`, because the list is a tree: an
+instance with databases nested under it is never the last row, and `↓` there
+belongs to the row below it — which is a database, carrying the other mode's
+tabs. On the strip, `←`/`→` move between tabs and `↑` goes back to the list;
+in the body, `↑` at the top row goes back to the strip, and anywhere else it
+scrolls as usual.
+
+While the pane is maximized (`f`) the strip keeps `↑` to itself — the list
+isn't on screen to go back to, and `f` is what leaves that view.
+
+The letter shortcuts and `[`/`]` still jump straight to a tab from anywhere,
+and `Tab`/`Shift+Tab` still cycle focus.
 
 Toolbox (`t`) offers four tools:
 - Spin a worker up (`SIGTTIN`) or down (`SIGTTOU`).
