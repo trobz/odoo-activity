@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.15.0 (2026-08-14)
+
+### Bug Fixes
+
+- **tui**: Hide D/S while a database row is highlighted
+  ([`6dd2539`](https://github.com/trobz/odoo-activity/commit/6dd25395b322f439657bbd3dade2c8837845e511))
+
+### Features
+
+- **tui**: Add search and show-all for Users, Crons, Modules
+  ([`3dfb838`](https://github.com/trobz/odoo-activity/commit/3dfb838da902c647253a0381e48eb13d6675e058))
+
+- **tui**: Search the process table, the stack dump and every db table
+  ([`41f3b93`](https://github.com/trobz/odoo-activity/commit/41f3b93c5a4de179858ea46982b89ff403c1ca7b))
+
+
 ## v0.14.0 (2026-08-13)
 
 ### Features
