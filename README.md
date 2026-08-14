@@ -42,14 +42,19 @@ by default — you already have a shell on this host. Pass
 | `D` | dump stacks of all workers, then jump to Stacks |
 | `S` | copy the instance's `odoo shell` launch command to the clipboard |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
+| `A` | show all rows, inactive ones included |
 | enter | run the selected tool (Toolbox tab, confirm popup) / open a row's raw json (db tabs) |
-| `/` | search (Logs, Config, and Params tabs) |
+| `/` | search |
 | `R` | refresh the active tab now |
 | `q` | quit |
 
 Two tabs on each side have no letter shortcut — cycle to them with
 `[`/`]` or click: **Processes** and **Stacks** (instance mode), **Queries**
 and **Modules** (database mode).
+
+`A` asks `odoo-db` for the rows it filters out by default (its `--all`
+flag). Against a host whose `odoo-db` predates that flag, the tab falls
+back to the default rows and `A` says so instead of doing nothing.
 
 Toolbox (`t`) offers four tools:
 - Spin a worker up (`SIGTTIN`) or down (`SIGTTOU`).

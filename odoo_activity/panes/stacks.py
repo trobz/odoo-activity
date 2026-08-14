@@ -7,6 +7,7 @@ tab body like #acbody/#actable/#acraw, not a separate focus target.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 from textual.widgets import Tree
 from textual.widgets.tree import TreeNode
@@ -23,6 +24,33 @@ def _short(path: str, workdir: Path) -> str:
         return str(Path(path).relative_to(workdir))
     except ValueError:
         return path.rsplit("/", 1)[-1]
+
+
+def filter_workers(workers: list[Worker], needle: str) -> list[Worker]:
+    """`workers` keeping only the threads matching `needle` (case-insensitive
+    substring of the thread's name/db/url or of any frame's func/file), and
+    only the workers left with a thread.
+
+    A matching thread keeps all its frames — a stack cut down to the matching
+    lines is no longer a stack.
+    """
+    needle = needle.lower()
+    out: list[Worker] = []
+
+    for worker in workers:
+        threads = [t for t in worker["threads"] if _thread_matches(t, needle)]
+        if threads:
+            # cast, not Worker(pid=..., threads=...): a plain **-rebuild carries
+            # along whatever fields Worker grows later instead of dropping them
+            out.append(cast(Worker, {**worker, "threads": threads}))
+
+    return out
+
+
+def _thread_matches(thread: Thread, needle: str) -> bool:
+    fields = [thread["name"], thread["db"], thread["url"]]
+    fields += [part for frame in thread["frames"] for part in (frame["func"], frame["file"])]
+    return any(needle in field.lower() for field in fields if field)
 
 
 def render_stacks(tree: Tree, workers: list[Worker], workdir: Path) -> bool:

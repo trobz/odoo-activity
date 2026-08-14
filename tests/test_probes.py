@@ -150,3 +150,22 @@ def test_start_odoo_db_builds_params_argv(monkeypatch):
         "params",
         "demo",
     ]
+
+
+def test_start_odoo_db_asks_for_every_row_only_when_told(monkeypatch):
+    """`--all` is what brings the inactive/uninstalled rows (and the status
+    column the TUI filters on) — and only odoo-db commands that have the flag
+    may be handed it."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(Host, "popen", lambda self, argv, **_: seen.append(argv) or "proc")
+
+    for command in ("crons", "modules", "users"):
+        probes.start_odoo_db(command, "demo", include_inactive=True)
+        assert "--all" in seen[-1], command
+
+        probes.start_odoo_db(command, "demo")
+        assert "--all" not in seen[-1], command
+
+    # a command with no such flag must never be handed it
+    probes.start_odoo_db("locks", "demo", include_inactive=True)
+    assert "--all" not in seen[-1]
