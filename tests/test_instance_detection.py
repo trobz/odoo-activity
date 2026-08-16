@@ -88,6 +88,8 @@ def test_detects_any_runner_not_just_odoo_bin():
     assert probes._looks_like_odoo("postgres: 16/main: openerp demo ::1(42678) idle") is False
     assert probes._looks_like_odoo("/usr/lib/postgresql/16/bin/psql -U odoo postgres") is False
     assert probes._looks_like_odoo("docker exec -it pg-16 bash -c psql -U odoo -d odoo_demo") is False
+    assert probes._looks_like_odoo("sshd-session: odoo [priv]") is False
+    assert probes._looks_like_odoo("sshd: odoo@pts/0") is False
 
 
 def test_skips_roots_owned_by_a_manager(monkeypatch):
