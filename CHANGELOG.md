@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.15.1 (2026-08-16)
+
+### Bug Fixes
+
+- **probes**: Stop misclassifying sshd sessions as odoo instances
+  ([`0db36a5`](https://github.com/trobz/odoo-activity/commit/0db36a53ada1109f252e51158b4d67c9745cc677))
+
+
 ## v0.15.0 (2026-08-14)
 
 ### Bug Fixes
