@@ -462,6 +462,9 @@ _VERSION_DIR_RE = re.compile(r"^\d+\.\d+$")
 def _looks_like_odoo(cmd: str) -> bool:
     """True if `cmd` is an odoo server process (any runner: `odoo-bin`, an
     egg-installed `odoo` console script, a venv wrapper around either)."""
+    # ps title, not argv (`sshd-session: odoo [priv]`) -- "odoo" there is the user
+    if cmd.split(" ", 1)[0].endswith(":"):
+        return False
     if cmd.startswith("postgres:") or not _is_odoo(cmd) or any(tool in cmd for tool in _OUR_TOOLS):
         return False
 
@@ -1186,8 +1189,10 @@ def _proc_link(pid: str, name: str, host: Host) -> str | None:
         except OSError:
             return None
 
-    out = host.run(["readlink", "-f", f"/proc/{pid}/{name}"]).stdout.strip()
-    return out or None
+    target = f"/proc/{pid}/{name}"
+    out = host.run(["readlink", "-f", target]).stdout.strip()
+    # unreadable symlink: `-f` echoes the query back instead of failing
+    return out if out and out != target else None
 
 
 def _exe_of(pid: str, host: Host) -> str | None:
