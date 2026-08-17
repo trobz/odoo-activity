@@ -34,6 +34,12 @@ def main(
     debug: bool = typer.Option(
         False, "--debug", help=f"log keypress/loop-lag diagnostics to {DEBUG_LOG_PATH} (tail -f it from elsewhere)."
     ),
+    enable_odooly: bool = typer.Option(
+        False,
+        "--enable-odooly",
+        help="Experimental: match each database against ~/odooly.ini and enable the actions that need "
+        "a login (Database > Toolbox, Jobs > Create test job).",
+    ),
     include_sensitive_information: bool = typer.Option(
         True,
         "--include-sensitive-information/--no-include-sensitive-information",
@@ -48,7 +54,11 @@ def main(
     target = Host(alias=host, port=port)
     code = 0
     try:
-        OdooActivity(host=target, include_sensitive_information=include_sensitive_information).run()
+        OdooActivity(
+            host=target,
+            include_sensitive_information=include_sensitive_information,
+            enable_odooly=enable_odooly,
+        ).run()
     except BaseException:
         traceback.print_exc()
         code = 1

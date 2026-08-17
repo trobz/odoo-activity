@@ -32,8 +32,10 @@ from odoo_activity.probes import (
     instance_status,
     instance_workdir,
     list_instances,
+    match_odooly_env,
     read_cpu_times,
     read_host_stats,
+    read_odooly_envs,
     signal_process,
 )
 
@@ -77,15 +79,31 @@ def _display_name(inst: Instance) -> str:
     return inst["name"].removesuffix(".service")
 
 
-def _db_label(db: str, port: str | None, name_width: int, uptime_width: int, indent: int) -> str:
-    """`dbname            port` — port's right edge lands on the same column
-    as the instance rows' uptime right edge (dot + space + name_width + space
-    + the uptime field) regardless of `indent`, not a fixed column."""
-    if not port:
-        return db
+def _db_field_width(name_width: int, uptime_width: int, indent: int) -> int:
+    """How wide a db row's `dbname ... port` field is, so its right edge lands
+    on the same column as the instance rows' uptime right edge (dot + space +
+    name_width + space + the uptime field) regardless of `indent`."""
+    return max(0, name_width + uptime_width + 1 - indent)
 
-    pad = max(1, name_width + uptime_width + 1 - indent - len(db) - len(port))
+
+def _db_label(db: str, port: str | None, name_width: int, uptime_width: int, indent: int) -> str:
+    """`dbname            port`, filling the field width above — not a fixed
+    column. Padded even without a port, so whatever follows starts where the
+    instance rows' status does."""
+    width = _db_field_width(name_width, uptime_width, indent)
+    if not port:
+        return f"{db:<{width}}"
+
+    pad = max(1, width - len(db) - len(port))
     return f"{db}{' ' * pad}[dim]{port}[/]"
+
+
+def _odooly_marker(env: str | None) -> str:
+    """The `ODOOLY` tag every db row carries once `--enable-odooly` is on:
+    green when a section can reach it, red when none can. Both are shown —
+    an absent marker reads as the flag not being passed, which is the one
+    thing the tag exists to tell apart."""
+    return "[green]ODOOLY[/]" if env else "[red]ODOOLY[/]"
 
 
 def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50) -> str:
@@ -152,10 +170,20 @@ class OdooActivity(App):
         ("R", "refresh", "Refresh"),
     ]
 
-    def __init__(self, host: Host | None = None, *, include_sensitive_information: bool = True) -> None:
+    def __init__(
+        self,
+        host: Host | None = None,
+        *,
+        include_sensitive_information: bool = True,
+        enable_odooly: bool = False,
+    ) -> None:
         super().__init__()
         self.host = host or Host()
         self.include_sensitive_information = include_sensitive_information
+        self.enable_odooly = enable_odooly
+        # read once, at startup: the file is the user's own and small, and a
+        # row's marker must not depend on when it happened to be rendered
+        self.odooly_envs = read_odooly_envs() if enable_odooly else []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="body"):
@@ -354,14 +382,32 @@ class OdooActivity(App):
         names, port = cached
         items = []
 
+        instance_name = self._instances[key]["name"] if key in self._instances else ""
+
         for db in names:
             db_key = f"{key}::db::{db}"
             self._row_owner[db_key] = key
             self._row_db[db_key] = db
-            label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}"
+            # two spaces off the filled field, the gap the instance rows put
+            # between their uptime and their status: the tag reads as that
+            # same column rather than as a ragged suffix of the db name
+            marker = f"  {_odooly_marker(self.odooly_env_for(instance_name, db))}" if self.enable_odooly else ""
+            label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}{marker}"
             items.append(ListItem(Label(label), name=db_key))
 
         return items
+
+    def odooly_env_for(self, instance_name: str, db: str) -> str | None:
+        """The odooly env serving `db` on `instance_name`, or None when there
+        is no match (or `--enable-odooly` was not passed, which leaves
+        `odooly_envs` empty and every lookup unmatched)."""
+        return match_odooly_env(instance_name, db, self.odooly_envs) if self.odooly_envs else None
+
+    def highlighted_odooly_env(self) -> str | None:
+        """The odooly env of the highlighted database row, if it has one."""
+        hit = self.highlighted_db()
+
+        return self.odooly_env_for(hit[0]["name"], hit[1]) if hit is not None else None
 
     def _highlighted_owner(self) -> str | None:
         item = self.query_one("#instances", ListView).highlighted_child

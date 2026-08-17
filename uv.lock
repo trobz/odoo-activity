@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -752,6 +752,7 @@ version = "0.16.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
+    { name = "odooly" },
     { name = "pyperclip" },
     { name = "textual" },
     { name = "typer" },
@@ -775,6 +776,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mcp", extras = ["cli"], specifier = ">=1.28.1,<2.0.0" },
+    { name = "odooly", specifier = ">=2.6" },
     { name = "pyperclip", specifier = ">=1.11.0" },
     { name = "textual", specifier = ">=8" },
     { name = "typer", specifier = ">=0.20" },
@@ -790,6 +792,15 @@ dev = [
     { name = "python-semantic-release", specifier = ">=10.5.3" },
     { name = "ruff", specifier = ">=0.11.5" },
     { name = "ty", specifier = ">=0.0.1a16" },
+]
+
+[[package]]
+name = "odooly"
+version = "2.6.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/80/294d47eecc4b3d05ca08b348d26c02963196e6d33dfc7d6047fb745a3072/odooly-2.6.5.tar.gz", hash = "sha256:ad5131033efe8599e3ad9a237a4e25a79bc8255cd3f78f6b9fc4e92a5f8f2e95", size = 68701, upload-time = "2026-04-12T19:12:03.504Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f1/d1/ce775e8f60f965a08ae40f23719ed7344fa9279911a124590e7cd1ab3751/odooly-2.6.5-py3-none-any.whl", hash = "sha256:b7e407ab2f8fe3d6793ef6f4c1743e8de0800c2689dbe23e7ebb7f620ef94cd6", size = 32791, upload-time = "2026-04-12T19:12:01.867Z" },
 ]
 
 [[package]]

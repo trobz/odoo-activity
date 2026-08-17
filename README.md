@@ -86,6 +86,44 @@ client port. An instance on a unix socket reports no port and can't be traced
 that way; if nothing can account for it, the runner just stays under HTTP
 Worker.
 
+### Odooly (experimental)
+
+`oa --enable-odooly` reads `~/odooly.ini` at startup and matches each
+database against it. Every database then carries an `ODOOLY` tag in the
+instance rows' status column — green where an environment reaches it, and
+the actions that need a login appear with it; red where none does, so a
+database missing from the ini is visible rather than silent.
+
+Matching is by name: the instance's, stripped of what only a process manager
+adds (`openerp-acme18-integration.service` → `acme18-integration`), against
+the section names — spelled either way (`-integration` / `-int`, `-staging` /
+`-stag`, `-production` / `-prod`), and with a suffix allowed, since a
+multi-db instance is usually configured one section per database
+(`acme18-int-db1`). A section that names a `database` only matches that one.
+
+Database > Toolbox then offers:
+- Open odooly — copies `odooly -c ~/odooly.ini --env <env>` to the clipboard
+  (`-c`, because odooly's own CLI looks for the ini in the working directory).
+- Restore app icons — for a database restored without its filestore, where
+  the apps menu comes up blank. It rewrites `web_icon` on the menus whose
+  icon data is missing, which is what makes Odoo recompute the image from
+  the module's own file; the ones that are fine are left alone, so running
+  it twice is a no-op.
+
+and Jobs grows a **Create test job** button next to Requeue, which queues one
+of queue_job's own test jobs to see whether a runner picks it up.
+
+Both scripts live in `odoo_activity/scripts/` and run on their own too:
+
+```bash
+python -m odoo_activity.scripts.restore_app_icons --env acme18-int
+python -m odoo_activity.scripts.create_test_job --env acme18-int
+```
+
+They always run on **this** machine, even when `oa` is watching a remote
+host: odooly reaches the instance over the network, using the `~/odooly.ini`
+that is here, not there.
+
 Toolbox (`t`) offers four tools:
 - Spin a worker up (`SIGTTIN`) or down (`SIGTTOU`).
 - Open shell — which copies the launch command instead of signaling, so it needs
@@ -164,6 +202,7 @@ odoo_activity/
 ├── panes/detail.py    # ActivityPane: the one stateful rendering widget
 ├── panes/processes.py   # Processes tab: workers grouped by role
 ├── panes/stacks.py    # Stacks tab: parsed dumpstacks, busy-first
+├── scripts/           # odooly actions the Toolbox shells out to (network, not host)
 └── tui.py             # app shell: layout, list, timers, actions
 ```
 
@@ -195,7 +234,7 @@ odoo_activity/
 - **Instance mode** — an instance row is highlighted. Tabs: Top,
   Processes, Stacks, Logs, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
-  Queries, Users, Locks, Jobs, Crons, Modules, Params.
+  Queries, Users, Locks, Jobs, Crons, Modules, Params, Toolbox.
 
 Both modes share the same tab strip and Log/DataTable widgets (just a
 `_mode` flag), and several letter-key shortcuts are reused across them for
