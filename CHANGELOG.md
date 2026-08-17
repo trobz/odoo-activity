@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.16.0 (2026-08-17)
+
+### Features
+
+- **jobs**: Group jobs by function, requeue them, find the runner
+  ([`821f138`](https://github.com/trobz/odoo-activity/commit/821f1381663bb2595f455317d6c6a07fbae6ec81))
+
+
 ## v0.15.1 (2026-08-16)
 
 ### Bug Fixes
