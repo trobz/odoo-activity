@@ -31,6 +31,7 @@ from odoo_activity.panes.stacks import filter_workers, render_stacks
 from odoo_activity.probes import (
     ALL_ROW_FLAGS,
     CLK_TCK,
+    ODOOLY_CONFIG,
     Instance,
     ProcRow,
     Worker,
@@ -53,6 +54,7 @@ from odoo_activity.probes import (
     render_config,
     requeue_jobs,
     row_matches,
+    run_odooly_script,
     session_count,
     session_dir_of,
     shell_command,
@@ -87,6 +89,7 @@ def _inst_key(inst: Instance | None) -> str | None:
 # `on_button_pressed`. Tab-wide, not row-scoped: they act on the database,
 # whatever the cursor happens to be on.
 _REQUEUE_ACTION = ("requeue-jobs", "⟳  Requeue jobs")
+_TEST_JOB_ACTION = ("create-test-job", "+  Create test job")
 
 
 def _first_line(text: str) -> str:
@@ -176,7 +179,7 @@ class ActivityPane(Vertical):
 
     TABS: ClassVar = {
         "instance": ["Top", "Processes", "Stacks", "Logs", "Config", "Toolbox"],
-        "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules", "Params"],
+        "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules", "Params", "Toolbox"],
     }
 
     # (label, signal) -- an int sends that signal to the instance's master
@@ -186,6 +189,14 @@ class ActivityPane(Vertical):
         ("Spin down worker (SIGTTOU)", signal.SIGTTOU),
         ("Open shell (copy command)", None),
         ("Count sessions", "count_sessions"),
+    ]
+    # (label, script) for the database-mode Toolbox -- `None` copies the
+    # odooly command instead of running anything. Every one of them needs a
+    # login, so the tab only lists them for a db odooly can reach (see
+    # _render_db_toolbox).
+    DB_TOOLBOX_TOOLS: ClassVar = [
+        ("Open odooly (copy command)", None),
+        ("Restore app icons", "restore_app_icons"),
     ]
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
 
@@ -322,6 +333,11 @@ class ActivityPane(Vertical):
     def is_toolbox_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Toolbox"
 
+    def is_db_toolbox_active(self) -> bool:
+        """The database-mode Toolbox — `is_toolbox_active` is the instance
+        one, and the two share a tab name but nothing else."""
+        return self._mode == "database" and self._active_tab() == "Toolbox"
+
     def is_jobs_active(self) -> bool:
         return self._mode == "database" and self._active_tab() == "Jobs"
 
@@ -428,6 +444,10 @@ class ActivityPane(Vertical):
             self.run_worker(self._run_toolbox_tool(idx))
             return
 
+        if self.is_db_toolbox_active():
+            self.run_worker(self._run_db_toolbox_tool(idx))
+            return
+
         if self.is_top_active():
             self.run_worker(self._jump_from_process_row(idx))
             return
@@ -477,6 +497,8 @@ class ActivityPane(Vertical):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == _REQUEUE_ACTION[0]:
             self.run_worker(self._confirm_requeue())
+        elif event.button.id == _TEST_JOB_ACTION[0]:
+            self.run_worker(self._run_odooly_script("create_test_job", "Create test job"))
 
     async def _confirm_requeue(self) -> None:
         """Put every started/enqueued job back to pending, on confirmation.
@@ -907,6 +929,8 @@ class ActivityPane(Vertical):
                 # live pid set anyway. Dropping it made every tab switch show
                 # 0.0% until a second refresh -- remotely, a second `R`.
                 self._render_top()
+        elif active == "Toolbox":
+            self._render_db_toolbox()
         else:
             self._load_db_tab(active, keep_group)
 
@@ -1330,6 +1354,8 @@ class ActivityPane(Vertical):
         # offered even with nothing to show: a queue whose jobs are all stuck
         # is exactly when the table above is unhelpful
         self._dbtab.actions = [_REQUEUE_ACTION]
+        if self.app.highlighted_odooly_env() is not None:
+            self._dbtab.actions.append(_TEST_JOB_ACTION)
         self._dbtab.numbered = True  # both depths are lists to count: groups, then jobs
         self._handle_rows(rows, _first_line(error))
         self._render_actions()
@@ -1357,6 +1383,79 @@ class ActivityPane(Vertical):
         or the Processes tree in the pane body."""
         for name, (selector, widget_type) in self._BODY_WIDGETS.items():
             self.query_one(selector, widget_type).display = name == which
+
+    def _render_db_toolbox(self) -> None:
+        """The database-mode Toolbox: what odooly can do to this database.
+
+        Every tool here logs in, so the tab says why it is empty rather than
+        listing tools that would only fail — no `--enable-odooly`, or no env
+        in `~/odooly.ini` matching this instance and database.
+        """
+        self._dbtab.actions = []
+        self._render_actions()
+
+        if self._db is None:
+            self._log_body("(no database)")
+            return
+
+        env = self.app.highlighted_odooly_env()
+        if env is None:
+            self._log_body(
+                "(no odooly env for this database)\n\n"
+                "Odooly actions need a section in ~/odooly.ini whose name matches this instance "
+                "and whose database matches this one, and `oa --enable-odooly` to look for it."
+            )
+            return
+
+        table = self.query_one("#actable", DataTable)
+        table.clear(columns=True)
+        self._use("table")
+        table.add_column(f"TOOL — odooly env: {env}")
+        for i, (label, _script) in enumerate(self.DB_TOOLBOX_TOOLS):
+            table.add_row(label, key=str(i))
+
+    async def _run_db_toolbox_tool(self, idx: int) -> None:
+        """Run the selected database Toolbox row: copy the odooly command, or
+        shell out to one of the packaged scripts."""
+        if not (0 <= idx < len(self.DB_TOOLBOX_TOOLS)):
+            return
+
+        label, script = self.DB_TOOLBOX_TOOLS[idx]
+        env = self.app.highlighted_odooly_env()
+        if env is None:
+            return
+
+        if script is None:
+            # `-c`, because odooly's CLI looks for `odooly.ini` in the working
+            # directory, not the home one -- the bare command only works if
+            # you happen to paste it while sitting in the right folder
+            command = f"odooly -c {ODOOLY_CONFIG} --env {env}"
+            if try_local_clipboard(command):
+                self.app.notify("Copied: " + command, timeout=3)
+            else:
+                self.app.notify(command, title="Copy manually", timeout=10)
+            return
+
+        await self._run_odooly_script(script, label)
+
+    async def _run_odooly_script(self, script: str, label: str) -> None:
+        """Run one of the packaged odooly scripts against the highlighted
+        database's env, on confirmation, and show its output in the body.
+
+        Always local, even against a remote host: odooly reaches the instance
+        over the network, from this machine's own `~/odooly.ini` — the script
+        would not find that file on the far end (see scripts/__init__.py).
+        """
+        env = self.app.highlighted_odooly_env()
+        if env is None:
+            return
+
+        if not await self.app.push_screen_wait(ConfirmScreen(f"{label} — odooly env {env}?")):
+            return
+
+        self._log_body(f"Running {label} on {env}…")
+        result = await to_thread(run_odooly_script, script, env)
+        self._log_body(result or "(no output)")
 
     def _render_toolbox(self) -> None:
         table = self.query_one("#actable", DataTable)
