@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.17.0 (2026-08-17)
+
+### Features
+
+- **odooly**: Match databases to odooly envs, behind --enable-odooly
+  ([`3c58b83`](https://github.com/trobz/odoo-activity/commit/3c58b83f1b2d285a3c5330dd6cb15774b97af26a))
+
+
 ## v0.16.0 (2026-08-17)
 
 ### Features
