@@ -21,7 +21,7 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import DataTable, Input, RichLog, Static, Tree
+from textual.widgets import Button, DataTable, Input, RichLog, Static, Tree
 from textual.widgets.data_table import RowDoesNotExist
 
 from odoo_activity.host import Host, to_thread
@@ -41,6 +41,9 @@ from odoo_activity.probes import (
     instance_procs,
     instance_version,
     instance_workers,
+    job_groups,
+    jobrunner_pids,
+    jobs_in_group,
     logfile_of,
     long_queries,
     odoo_pid_for_port,
@@ -48,6 +51,7 @@ from odoo_activity.probes import (
     pg_client_port,
     proc_cpu_ticks_many,
     render_config,
+    requeue_jobs,
     row_matches,
     session_count,
     session_dir_of,
@@ -79,15 +83,32 @@ def _inst_key(inst: Instance | None) -> str | None:
     return f"{inst['manager']}:{inst['name']}" if inst else None
 
 
+# db-tab actions, as (id, label) -- the id is the Button's, dispatched by
+# `on_button_pressed`. Tab-wide, not row-scoped: they act on the database,
+# whatever the cursor happens to be on.
+_REQUEUE_ACTION = ("requeue-jobs", "⟳  Requeue jobs")
+
+
+def _first_line(text: str) -> str:
+    """A postgres error's first line — the rest is the offending SQL echoed
+    back with a caret, which is ours, not the user's, to read."""
+    return text.strip().splitlines()[0] if text.strip() else ""
+
+
 class _DbTab:
     """The pane's one db-tab fetch/result — one pane shows one db tab at a
     time, so there's never more than one to track."""
 
     def __init__(self) -> None:
-        self.ident: tuple[str, str] | None = None  # (category, db) most recently requested
+        # (category, db, jobs group) most recently requested -- the group is
+        # part of it because the two Jobs depths are two different fetches of
+        # the same tab, and a stale one must not land on the other
+        self.ident: tuple[str, str, tuple[str, str] | None] | None = None
         self.proc: subprocess.Popen[str] | None = None  # its still-running odoo-db, if any
         self.rows: list[dict] = []  # raw (untruncated) rows behind #actable, outlives the fetch
         self.no_all = False  # this host's odoo-db rejected --all (see _fetch_db_tab)
+        self.actions: list[tuple[str, str]] = []  # (id, label) of the tab's own actions
+        self.numbered = False  # prefix rows with a 1..n column, for counting long lists by eye
 
     def abandon(self) -> None:
         """Kill a still-running fetch and forget it. Its process (and the
@@ -141,6 +162,10 @@ class ActivityPane(Vertical):
     #acraw { background: transparent; display: none; }
     #acstacks { background: transparent; display: none; }
     #acprocesses { background: transparent; display: none; }
+    /* db-tab actions: a strip of buttons under the body, shown only for a
+       tab that has any (see _render_actions) */
+    #acactions { height: auto; display: none; padding-top: 1; }
+    #acactions Button { margin-right: 2; }
     """
 
     # ALLOW_MAXIMIZE makes maximizing a focused child (DataTable/Log/Input)
@@ -186,6 +211,7 @@ class ActivityPane(Vertical):
             yield Static(id="acraw-body")
         yield Tree("stacks", id="acstacks")
         yield Tree("processes", id="acprocesses")
+        yield Horizontal(id="acactions")
 
     def on_mount(self) -> None:
         self._mode = "instance"
@@ -206,6 +232,8 @@ class ActivityPane(Vertical):
         self._inflight: dict[str, object] = {}  # key -> ident of the run in progress
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
         self._dbtab = _DbTab()
+        self._jobs_group: tuple[str, str] | None = None  # (function, state) the Jobs tab drilled into
+        self._actions_shown: list[str] = []  # action ids currently mounted in #acactions
         self._showing_raw = False  # viewing one row's raw json in #acbody
         self._stacks_cache: dict[str, tuple[list[Worker], Path]] = {}  # instance key -> its last dump
         self.query_one("#acstacks", Tree).show_root = False
@@ -294,6 +322,9 @@ class ActivityPane(Vertical):
     def is_toolbox_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Toolbox"
 
+    def is_jobs_active(self) -> bool:
+        return self._mode == "database" and self._active_tab() == "Jobs"
+
     def has_search(self) -> bool:
         """Logs and Config render plain text into #acbody with a substring
         filter (see _render_log); every database table filters its rows the
@@ -334,11 +365,19 @@ class ActivityPane(Vertical):
         self._show_all = not self._show_all
         self._show_datatable()
 
-    def selected_process(self) -> ProcDisplayRow | None:
-        """The process under the Top tab's table cursor, if any.
+    def selected_process(self) -> ProcDisplayRow | ProcRow | None:
+        """The process under the cursor of whichever tab shows processes:
+        the Top tab's table, or the Processes tab's tree (whose leaves carry
+        their row as node data — group nodes carry none, and select nothing).
 
-        Read through the row key, not the cursor's position: under a filter
-        the two differ, and `K`/`L` signalling the wrong pid is unforgivable."""
+        In the table, read through the row key, not the cursor's position:
+        under a filter the two differ, and `K`/`L` signalling the wrong pid
+        is unforgivable.
+        """
+        if self.is_processes_active():
+            node = self.query_one("#acprocesses", Tree).cursor_node
+            return node.data if node is not None else None
+
         if not self.is_top_active() or not self._proc_rows:
             return None
 
@@ -372,6 +411,12 @@ class ActivityPane(Vertical):
             self._showing_raw = False
             self._use("table")
             event.stop()
+            return
+
+        if event.key == "escape" and self.is_jobs_active() and self._jobs_group is not None:
+            self._jobs_group = None  # back out of one group, to all of them
+            self._reload_jobs()
+            event.stop()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.row_key.value is None:
@@ -391,8 +436,79 @@ class ActivityPane(Vertical):
         if self._mode != "database":
             return
 
-        if idx < len(self._dbtab.rows):
-            self._show_raw(self._dbtab.rows[idx])
+        if idx >= len(self._dbtab.rows):
+            return
+
+        row = self._dbtab.rows[idx]
+
+        # in Jobs, a row is a group of jobs until it is one job: the first
+        # enter opens the group, the next opens that job's raw json
+        if self.is_jobs_active() and self._jobs_group is None:
+            self._jobs_group = (str(row.get("function", "")), str(row.get("state", "")))
+            self._reload_jobs()
+            return
+
+        self._show_raw(row)
+
+    def _render_actions(self) -> None:
+        """Rebuild the action strip under the body from the active tab's own
+        actions, and hide it entirely for a tab that has none.
+
+        A dedicated zone rather than a row in the table: these act on the
+        database, not on whatever the cursor is on, and a table row reads as
+        data (it sorts, it numbers, enter drills into it). More of them are
+        expected here — "Create test job" next.
+        """
+        bar = self.query_one("#acactions", Horizontal)
+        bar.display = bool(self._dbtab.actions)
+
+        # every tab load calls this, and a Jobs reload (drilling in, backing
+        # out, requeueing) asks for the same buttons it already has: rebuild
+        # only on an actual change, so they don't blink under the cursor
+        wanted = [action_id for action_id, _label in self._dbtab.actions]
+        if self._actions_shown == wanted:
+            return
+
+        self._actions_shown = wanted
+        bar.remove_children()
+        for action_id, label in self._dbtab.actions:
+            bar.mount(Button(label, id=action_id, variant="warning", compact=True))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == _REQUEUE_ACTION[0]:
+            self.run_worker(self._confirm_requeue())
+
+    async def _confirm_requeue(self) -> None:
+        """Put every started/enqueued job back to pending, on confirmation.
+
+        Confirmed like the Toolbox's signals are: it writes to the db, and
+        `started` rows belonging to a *live* worker are reset too, so a
+        runner that is merely slow has its jobs picked up a second time.
+        """
+        if self._db is None:
+            return
+
+        inst, db = self._db
+        confirmed = await self.app.push_screen_wait(
+            ConfirmScreen(
+                f"Requeue every started/enqueued job on {db} back to pending?\n"
+                "Jobs a live worker is still running are reset too, and will run again."
+            )
+        )
+        if not confirmed:
+            return
+
+        host = self.app.host
+        port = await to_thread(db_port_of, inst, host)
+        rows, error = await to_thread(requeue_jobs, db, port, host)
+
+        if error:
+            self.app.notify(_first_line(error), severity="warning", timeout=5)
+            return
+
+        self.app.notify(f"{db}: {rows} job(s) requeued", timeout=3)
+        if self.is_jobs_active():
+            self._reload_jobs()
 
     async def _run_toolbox_tool(self, idx: int) -> None:
         """Run the selected Toolbox row -- signals go to the master pid
@@ -535,6 +651,7 @@ class ActivityPane(Vertical):
     def show_instance(self, inst: Instance | None) -> None:
         """Switch to instance mode for `inst`."""
         self._dbtab.abandon()  # leaving database mode; don't leave a fetch running unseen
+        self._jobs_group = None  # nothing to back out of once the db is gone
         self._mode = "instance"
         if _inst_key(inst) != _inst_key(self._instance):
             # another instance's processes/threads
@@ -641,8 +758,11 @@ class ActivityPane(Vertical):
 
     def refresh_active(self) -> None:
         """Manual re-fetch of whatever the active tab shows — the only way
-        to update Top on a remote host now that `tick` skips it."""
-        self._render_active()
+        to update Top on a remote host now that `tick` skips it.
+
+        A refresh stays where the user is: on Jobs that means the group they
+        drilled into, which a plain `_render_active` would back out of."""
+        self._render_active(keep_group=self.is_jobs_active())
 
     def _stop_log_stream(self) -> None:
         if self._log_proc is not None:
@@ -725,7 +845,7 @@ class ActivityPane(Vertical):
         strip.remove_children()
         strip.mount_all(ActivityTab(name, i, active=(i == self._tab)) for i, name in enumerate(names))
 
-    def _render_active(self) -> None:
+    def _render_active(self, keep_group: bool = False) -> None:
         tabs = self.TABS[self._mode]
 
         self._tab %= len(tabs)
@@ -745,6 +865,11 @@ class ActivityPane(Vertical):
             search.display = False
 
         if self._mode == "instance":
+            # instance-mode tabs have no db actions; leaving the strip up
+            # would offer the last database's ones against nothing
+            self._dbtab.actions = []
+            self._render_actions()
+
             if active == "Logs":
                 # clear whatever the prior tab left in #acbody (e.g.
                 # Top' "Loading top…") instead of leaving it
@@ -783,7 +908,7 @@ class ActivityPane(Vertical):
                 # 0.0% until a second refresh -- remotely, a second `R`.
                 self._render_top()
         else:
-            self._load_db_tab(active)
+            self._load_db_tab(active, keep_group)
 
     def _load_log(self, inst: Instance | None) -> None:
         self._coalesce("log", _inst_key(inst), lambda: self._do_load_log(inst))
@@ -929,11 +1054,15 @@ class ActivityPane(Vertical):
 
         host = self.app.host
         master, rows = await to_thread(instance_workers, inst, host)
+        # one postgres lookup for the whole tree, and only to label a role:
+        # an unreachable db just leaves the runner under "HTTP Worker"
+        port = await to_thread(db_port_of, inst, host)
+        jobrunners = await to_thread(jobrunner_pids, port, host)
 
         if self._instance is not inst or not self.is_processes_active():
             return  # instance or tab changed while this was fetching; the result is stale
 
-        render_processes(self.query_one("#acprocesses", Tree), rows, master)
+        render_processes(self.query_one("#acprocesses", Tree), rows, master, frozenset(jobrunners))
 
     def _render_top(self) -> None:
         self._coalesce("top", _inst_key(self._instance), self._do_render_top)
@@ -1053,8 +1182,27 @@ class ActivityPane(Vertical):
         table.move_cursor(row=restore)
         table.scroll_to(x=scroll_x, y=scroll_y, animate=False)
 
-    def _load_db_tab(self, category: str) -> None:
+    def _reload_jobs(self) -> None:
+        """Re-fetch the Jobs tab at its current depth, keeping focus in the
+        pane.
+
+        The table is rebuilt from scratch by the reload, and the widget the
+        focus was on goes with it — leaving focus outside the pane, where
+        `escape` (backing out of a group) never reaches `on_key`.
+        """
+        self._load_db_tab("Jobs", keep_group=True)
+        self.focus_active()
+
+    def _load_db_tab(self, category: str, keep_group: bool = False) -> None:
         self._showing_raw = False
+        if not keep_group:
+            # a Jobs reload (drilling in, backing out, requeueing) is the same
+            # tab with the same actions -- only a real tab change clears them
+            self._jobs_group = None
+            self._dbtab.actions = []
+            self._dbtab.numbered = False
+            self._render_actions()
+
         self._log_body(f"Loading {category.lower()}…")  # clear any prior tab's table while this one loads
 
         if self._db is None:
@@ -1062,7 +1210,7 @@ class ActivityPane(Vertical):
             return
 
         _inst, db = self._db
-        ident = (category, db)
+        ident = (category, db, self._jobs_group)
         if ident == self._dbtab.ident and self._dbtab.proc is not None:
             return  # already fetching this exact tab; let it finish rather than restart
 
@@ -1076,7 +1224,7 @@ class ActivityPane(Vertical):
         self._dbtab.ident = ident
         self.run_worker(self._fetch_db_tab(category, db, ident), group="dbtab")
 
-    async def _fetch_db_tab(self, category: str, db: str, ident: tuple[str, str]) -> None:
+    async def _fetch_db_tab(self, category: str, db: str, ident: tuple[str, str, tuple[str, str] | None]) -> None:
         host = self.app.host
         port = await to_thread(db_port_of, self._db[0], host) if self._db else None
 
@@ -1087,6 +1235,10 @@ class ActivityPane(Vertical):
                 return
 
             self._handle_rows(rows)
+            return
+
+        if category == "Jobs":
+            await self._fetch_jobs(db, port, ident, host)
             return
 
         # fetch the flagged-off rows too, so `A` toggles client-side (see _visible_db_rows)
@@ -1115,7 +1267,7 @@ class ActivityPane(Vertical):
         db: str,
         port: str | None,
         host: Host,
-        ident: tuple[str, str],
+        ident: tuple[str, str, tuple[str, str] | None],
         include_inactive: bool,
     ) -> tuple[list[dict] | None, str] | None:
         """One odoo-db run for `category`. None when there's nothing to show
@@ -1157,10 +1309,36 @@ class ActivityPane(Vertical):
 
         return parse_odoo_db_output(*result)
 
+    async def _fetch_jobs(
+        self, db: str, port: str | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
+    ) -> None:
+        """The Jobs tab, in its two depths: every function/state group, or
+        the individual jobs inside the one that's open.
+
+        odoo-db's `jobs` counts by state alone, which says a queue is backed
+        up without saying what's stuck in it (see job_groups).
+        """
+        if self._jobs_group is None:
+            rows, error = await to_thread(job_groups, db, port, host)
+        else:
+            function, state = self._jobs_group
+            rows, error = await to_thread(jobs_in_group, db, function, state, port, host)
+
+        if ident != self._dbtab.ident:
+            return  # superseded by a newer tab selection; this result is stale
+
+        # offered even with nothing to show: a queue whose jobs are all stuck
+        # is exactly when the table above is unhelpful
+        self._dbtab.actions = [_REQUEUE_ACTION]
+        self._dbtab.numbered = True  # both depths are lists to count: groups, then jobs
+        self._handle_rows(rows, _first_line(error))
+        self._render_actions()
+
     def _handle_rows(self, rows: list[dict] | None, raw: str = "") -> None:
         if rows is None:
             self._log_body(raw or "(no output)")
         elif not rows:
+            self._dbtab.rows = []  # or a re-render (resize, `A`, a search) repaints the last tab's rows
             self._log_body("(empty)")
         else:
             self._dbtab.rows = rows
@@ -1240,6 +1418,8 @@ class ActivityPane(Vertical):
         # stringify's 80-char clip, same as the Top tab's COMMAND column.
         wrap_col = next((c for c in ("code", "value") if c in columns), None)
         fixed = [c for c in columns if c != wrap_col]
+        if self._dbtab.numbered:
+            table.add_column("#")
         table.add_columns(*(c.upper() for c in fixed))
         if wrap_col:
             other_width = sum(
@@ -1248,10 +1428,13 @@ class ActivityPane(Vertical):
             )
             table.add_column(wrap_col.upper(), width=max(20, (table.size.width or 80) - other_width))
 
-        for i, row in pairs:
+        for n, (i, row) in enumerate(pairs, start=1):
             cells: list[str | Text] = [stringify(row.get(c, "")) for c in fixed]
             if wrap_col:
                 cells.append(Text(str(row.get(wrap_col, "")), no_wrap=False))
+            if self._dbtab.numbered:
+                # counts what's on screen, so a filtered list still reads 1..n
+                cells.insert(0, Text(str(n), style="dim"))
             table.add_row(*cells, key=str(i), height=None)
 
     def _log_body(self, text: str) -> None:

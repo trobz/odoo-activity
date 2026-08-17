@@ -554,7 +554,13 @@ class OdooActivity(App):
         if action == "search":
             return self.query_one(ActivityPane).has_search()
 
-        if action in ("kill_process", "quit_process"):
+        if action == "kill_process":
+            # Top lists processes as a table, Processes as a tree; both can
+            # name the pid under the cursor, so both can kill it
+            pane = self.query_one(ActivityPane)
+            return pane.is_top_active() or pane.is_processes_active()
+
+        if action == "quit_process":
             return self.query_one(ActivityPane).is_top_active()
 
         # a db row resolves to its owning instance (see _row_owner), so these
@@ -646,13 +652,32 @@ class OdooActivity(App):
         self.poll_instances()  # re-label in place; keeps selection, no flicker
 
     def action_kill_process(self) -> None:
-        proc = self.query_one(ActivityPane).selected_process()
-        if proc is None or proc.get("kind") == "pg":
+        pane = self.query_one(ActivityPane)
+        proc = pane.selected_process()
+        if proc is None:
+            # the Processes tree groups its leaves by role: a group node (or
+            # the "Loading…" placeholder) names no pid, and `K` there would
+            # otherwise look like a dead key
+            if pane.is_processes_active():
+                self.notify("Select a process, not a group", severity="warning", timeout=3)
+            return
+
+        if proc.get("kind") == "pg":
             return
 
         async def on_confirm(confirmed: bool | None) -> None:
-            if confirmed:
-                await to_thread(signal_process, proc["pid"], signal.SIGKILL, self.host)
+            if not confirmed:
+                return
+
+            await to_thread(signal_process, proc["pid"], signal.SIGKILL, self.host)
+            # Processes only, and deliberately: it is a snapshot taken when
+            # the tab was opened, so the pid just killed would sit there
+            # until reopened. Top re-polls every tick on its own, and
+            # re-rendering it here would blank its table back to
+            # "Loading top…" for a poll — a step backwards, not a refresh.
+            pane = self.query_one(ActivityPane)
+            if pane.is_processes_active():
+                pane.refresh_active()
 
         self.push_screen(ConfirmScreen(f"Kill PID {proc['pid']}?"), on_confirm)
 

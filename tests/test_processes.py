@@ -22,3 +22,19 @@ def test_role_classification():
     # after gevent, so a (hypothetical) 'gevent' hit is decided first --
     # pin that order since it's the one place the two branches could race
     assert _role(_row("5", "10", "odoo-bin --gevent-port=8072"), master) == "gevent"
+
+
+def test_a_postgres_guess_never_outranks_what_argv_and_nice_state(monkeypatch):
+    """`jobrunners` comes from matching statements on pg_stat_activity, which
+    can name a worker that merely touched the queue_job table. gevent and
+    cron identify themselves out of argv/nice and cannot be wrong, so the
+    guess only gets to label what they didn't claim."""
+    master = "1"
+    runners = frozenset({"2", "3", "4"})
+
+    assert _role(_row("2", "10", "odoo-bin"), master, runners) == "cron"
+    assert _role(_row("3", "0", "odoo-bin --gevent-port=8072"), master, runners) == "gevent"
+    assert _role(_row("4", "0", "odoo-bin"), master, runners) == "jobrunner"
+
+    # odoo's own label (setproctitle installed) is not a guess -- it wins
+    assert _role(_row("5", "10", "odoo: WorkerJobRunner 5"), master) == "jobrunner"

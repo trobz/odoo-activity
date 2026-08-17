@@ -448,6 +448,10 @@ _ODOO_FLAGS = {"--config", "--addons-path"}
 # our own toolchain: every one has "odoo" in its name and is typically run
 # from a shell, so each would otherwise look like an instance root
 _OUR_TOOLS = ("odoo-activity", "odoo-config", "odoo-db", "odoo-addons-path")
+# odoo's own process title, when setproctitle is installed: `odoo: WorkerHTTP
+# 1234`. It replaces argv wholesale, so none of the entry-point/flag tests
+# below match it -- the prefix is the whole evidence, and it is odoo's own.
+_ODOO_TITLE_PREFIX = "odoo: "
 # a root owned by one of these is already listed by that manager
 _MANAGER_PARENTS = ("systemd --user", "supervisord")
 # containerized odoo is its own manager (separate ticket); until then it is
@@ -527,6 +531,17 @@ def _odoo_master(pid: str, by_pid: dict[str, ProcRow], children: dict[str, list[
         pid = kids[0]
 
     return pid
+
+
+def _is_odoo_process(cmd: str) -> bool:
+    """True if `cmd` belongs to odoo, by argv or by odoo's own process title.
+
+    `_looks_like_odoo` reads argv, which setproctitle overwrites: a worker
+    renamed to `odoo: WorkerJobRunner 1234` carries neither an entry point
+    nor a flag any more, and would otherwise read as "not odoo" — which is
+    backwards, since that title is odoo naming itself.
+    """
+    return cmd.startswith(_ODOO_TITLE_PREFIX) or _looks_like_odoo(cmd)
 
 
 def _containerized(pid: str, by_pid: dict[str, ProcRow]) -> bool:
@@ -1072,6 +1087,256 @@ def long_queries(db: str, port: str | None = None, host: Host = LOCAL) -> list[d
         return json.loads(out.strip()) or []
     except (json.JSONDecodeError, ValueError):
         return []
+
+
+def _psql_json(
+    sql: str, db: str, params: dict[str, str], port: str | None, host: Host
+) -> tuple[list[dict] | None, str]:
+    """Run a `SELECT json_agg(...)` on `db` and decode it.
+
+    `(rows, error)`: rows is None only when the query didn't run — the
+    caller shows `error` (postgres's own message, e.g. queue_job's table
+    missing on a db without the module) instead of a table. `json_agg` over
+    no rows is SQL NULL, which psql prints as nothing, so an empty result is
+    `([], "")` rather than a decode failure.
+
+    Values arrive as psql variables (`-v`, expanded by `:'name'`) rather
+    than interpolated into the SQL, so a job function or state out of the db
+    can't reshape the statement.
+    """
+    # ON_ERROR_STOP or a failed statement exits 0 with the error on stderr
+    # only, and a missing queue_job table would read as "no jobs"
+    cmd = ["psql", "-d", db, "-v", "ON_ERROR_STOP=1"]
+    if port:
+        cmd += ["-p", port]
+
+    for name, value in params.items():
+        cmd += ["-v", f"{name}={value}"]
+
+    cmd += ["-tA", "-f", "-"]
+    result = host.run(cmd, input_text=sql)
+    out = result.stdout.strip()
+
+    if result.returncode != 0:
+        return None, result.stderr.strip() or f"psql exited {result.returncode}"
+
+    if not out:
+        return [], ""
+
+    try:
+        return json.loads(out) or [], ""
+    except (json.JSONDecodeError, ValueError):
+        return None, out
+
+
+# `func_string` names the records too (`res.partner(1,).action()`), so it
+# groups into near-singletons — model+method is the function itself.
+_JOB_FUNCTION = "coalesce(model_name || '.' || method_name, method_name, '(unknown)')"
+
+# queue_job's dates are `timestamp without time zone` holding UTC (odoo's
+# convention -- its runner writes `now() at time zone 'utc'`), while `now()`
+# is a timestamptz postgres renders in the *session* timezone. Ageing one
+# against the other offsets every wait/run by the server's UTC offset: hours
+# of phantom "stuck" on a server not set to UTC, negative intervals west of it.
+_UTC_NOW = "(now() at time zone 'utc')"
+
+# the only interpolation is _JOB_FUNCTION, a constant defined right above;
+# every value the caller passes goes through psql's own `-v` (see _psql_json)
+_JOB_GROUPS_SQL = (
+    "SELECT json_agg(t) FROM ("  # noqa: S608
+    f"SELECT {_JOB_FUNCTION} AS function, state, count(*) AS jobs, "
+    "min(date_created) AS oldest, "
+    f"max(age({_UTC_NOW}, date_created)) AS waiting, "
+    f"max(age({_UTC_NOW}, date_started)) AS running "
+    "FROM queue_job GROUP BY 1, 2 ORDER BY 1, 2"
+    ") t"
+)
+
+_JOBS_IN_GROUP_SQL = (
+    "SELECT json_agg(t) FROM ("  # noqa: S608 -- see _JOB_GROUPS_SQL
+    "SELECT uuid, name, state, priority, date_created, date_started, "
+    f"age({_UTC_NOW}, date_created) AS waiting, age({_UTC_NOW}, date_started) AS running "
+    f"FROM queue_job WHERE {_JOB_FUNCTION} = :'function' AND state = :'state' "
+    "ORDER BY date_created LIMIT 500"
+    ") t"
+)
+
+# exactly the states a job can be stuck in: `pending` is already queued and
+# `done`/`failed`/`cancelled` are finished, so neither is ours to touch
+_REQUEUABLE_STATES = ("started", "enqueued")
+_REQUEUABLE_IN = ", ".join(f"'{state}'" for state in _REQUEUABLE_STATES)
+# the dates come off with the state, as queue_job's own `set_pending` does:
+# a job left with its `date_started` reads as running for as long as it sits
+# in the queue, which is the very signal the Jobs tab exists to give
+_REQUEUE_SQL = (
+    # the only interpolation is _REQUEUABLE_IN, built from the constant above
+    "UPDATE queue_job SET state = 'pending', "  # noqa: S608
+    "date_started = NULL, date_enqueued = NULL, worker_pid = NULL "
+    f"WHERE state IN ({_REQUEUABLE_IN})"
+)
+
+
+def job_groups(db: str, port: str | None = None, host: Host = LOCAL) -> tuple[list[dict] | None, str]:
+    """queue_job rows on `db` grouped by function and state, with the oldest
+    creation date and the longest wait/run in each group.
+
+    odoo-db's `jobs` counts by state alone, which says a queue is backed up
+    but not what's stuck in it: `waiting`/`running` are what a job sitting in
+    `started` for hours shows up as.
+    """
+    return _psql_json(_JOB_GROUPS_SQL, db, {}, port, host)
+
+
+def jobs_in_group(
+    db: str, function: str, state: str, port: str | None = None, host: Host = LOCAL
+) -> tuple[list[dict] | None, str]:
+    """The individual jobs behind one `job_groups` row, oldest first (capped
+    at 500 — a backed-up queue runs to tens of thousands, and the ones that
+    explain it are the oldest)."""
+    return _psql_json(_JOBS_IN_GROUP_SQL, db, {"function": function, "state": state}, port, host)
+
+
+def requeue_jobs(db: str, port: str | None = None, host: Host = LOCAL) -> tuple[int, str]:
+    """Put every `started`/`enqueued` job back to `pending`, returning
+    `(rows, error)`.
+
+    What a job runner does for its own dead jobs on startup, run on demand:
+    a worker killed mid-job leaves the row `started` forever, since nothing
+    else revisits it.
+    """
+    cmd = ["psql", "-d", db, "-v", "ON_ERROR_STOP=1"]
+    if port:
+        cmd += ["-p", port]
+
+    cmd += ["-tA", "-f", "-"]
+    result = host.run(cmd, input_text=_REQUEUE_SQL)
+
+    if result.returncode != 0:
+        return 0, result.stderr.strip() or f"psql exited {result.returncode}"
+
+    # psql echoes the tag ("UPDATE 8") for a statement that changed rows
+    tag = result.stdout.strip().rpartition(" ")[2]
+
+    return (int(tag) if tag.isdigit() else 0), ""
+
+
+# Odoo names its postgres connections after the worker that opened them
+# (`odoo-<pid>`, service/db.py), which is what makes a backend traceable back
+# to a process without lsof. The runner's own connection is then the one
+# whose last statement is part of its loop: `LISTEN queue_job`, its named
+# `select_jobs` cursor, or the bare `SELECT 1` it keeps the connection alive
+# with between polls (`keep_alive` in queue_job's runner — nothing in odoo
+# itself issues that).
+_JOBRUNNER_SQL = (
+    "SELECT json_agg(t) FROM ("
+    "SELECT DISTINCT application_name AS app, client_port AS port FROM pg_stat_activity "
+    # `odoo-<pid>` from 16.0 on (odoo/odoo f6c13d7); before that odoo never
+    # set application_name at all, so an unnamed connection has to stay in --
+    # a named one that isn't odoo's (psql, pgAdmin) is what this excludes
+    "WHERE (application_name ~ '^odoo-[0-9]+$' OR application_name = '') AND ("
+    # the channel it waits on, its own `select_jobs` cursor (unquoted table
+    # name -- the ORM quotes its identifiers, so a worker that merely read
+    # or enqueued a job doesn't collide), and its keepalive
+    "query ILIKE 'listen%queue_job%' "
+    "OR query ILIKE '%from queue_job where%' "
+    # the keepalive names queue_job nowhere, so it is only a candidate here:
+    # pgbouncer and monitoring ping the same way. jobrunner_pids drops
+    # whatever doesn't turn out to be an odoo process.
+    "OR btrim(query, ' ;') = 'SELECT 1'"
+    ")"
+    ") t"
+)
+
+# `ss -tnpH` prints one connection per line, the holder as
+# `users:(("python3",pid=123,fd=7))` -- and only when we may see it (our own
+# processes, or running as root), which is the same limit lsof has below.
+_SS_CONN_RE = re.compile(r"\S+:(?P<local>\d+)\s+\S+:(?P<peer>\d+)")
+_SS_PID_RE = re.compile(r"pid=(?P<pid>\d+)")
+_DEFAULT_PG_PORT = "5432"
+
+
+def _pids_by_client_port(ports: list[str], pg_port: str | None = None, host: Host = LOCAL) -> dict[str, str]:
+    """client port -> the OS pid holding it, for each postgres connection in
+    `ports`.
+
+    One `ss` call for the lot (a remote host would otherwise pay a round trip
+    per port), falling back to `lsof` per port for whatever `ss` couldn't
+    answer -- neither is guaranteed to be installed, and a port nobody can
+    account for is simply left out.
+
+    Only connections *to postgres* count. A port number means nothing on its
+    own: it is unique per host, and one postgres can serve several, so a
+    port another host reported may well be live here on something unrelated
+    (a browser socket is as likely as anything). Matching the far end keeps
+    that from naming the wrong process.
+    """
+    if not ports:
+        return {}
+
+    wanted = set(ports)
+    pg_port = pg_port or _DEFAULT_PG_PORT
+    found: dict[str, str] = {}
+
+    try:
+        out = host.run(["ss", "-tnpH"]).stdout
+    except FileNotFoundError:
+        out = ""
+
+    for line in out.splitlines():
+        conn = _SS_CONN_RE.search(line)
+        pid = _SS_PID_RE.search(line)
+        if conn is None or pid is None:
+            continue
+
+        if conn["local"] in wanted and conn["peer"] == pg_port:
+            found[conn["local"]] = pid["pid"]
+
+    # lsof names both ends of `-i :port`, and excludes postgres's own side by
+    # process name (see odoo_pid_for_port) -- the port pins the connection
+    for port in wanted - set(found):
+        if (pid_ := odoo_pid_for_port(port, host)) is not None:
+            found[port] = pid_
+
+    return found
+
+
+def jobrunner_pids(port: str | None = None, host: Host = LOCAL) -> set[str]:
+    """Pids of the queue_job runner workers, from their postgres backends.
+
+    Odoo only labels a worker in `ps` when `setproctitle` is installed —
+    without it every prefork worker carries the master's argv verbatim, so
+    argv can't tell a job runner from an HTTP one. Its postgres connection
+    can, in two ways:
+
+    - `application_name` is `odoo-<pid>` from Odoo 16.0 on (odoo/odoo
+      f6c13d7), which names the pid outright.
+    - Before that odoo left it unset, so the connection has to be traced by
+      its TCP endpoint instead: postgres reports the client port, and the
+      host says which process holds it. Costs a second command, and only
+      works over TCP — an instance on a unix socket reports no port, and
+      stays unreachable either way.
+
+    Empty when nothing matches (queue_job absent, runner disabled, postgres
+    unreachable, or nothing able to account for the port), which just leaves
+    those workers under "HTTP".
+    """
+    rows, _error = _psql_json(_JOBRUNNER_SQL, "postgres", {}, port, host)
+
+    pids = {row["app"].removeprefix("odoo-") for row in rows or [] if row["app"]}
+    # `client_port` is -1 for a unix socket and null for a background worker
+    ports = [str(row["port"]) for row in rows or [] if not row["app"] and (row["port"] or -1) > 0]
+    pids |= set(_pids_by_client_port(ports, port, host).values())
+
+    if not pids:
+        return pids
+
+    # last gate, for both routes: the bare `SELECT 1` above is the runner's
+    # keepalive but also pgbouncer's and every monitor's ping, and a pid
+    # traced through a port is only as good as what is holding that port.
+    # Whatever isn't an odoo process was never a job runner.
+    by_pid, _children = _ps_snapshot(host)
+
+    return {pid for pid in pids if pid in by_pid and _is_odoo_process(by_pid[pid]["cmd"])}
 
 
 def _parse_cpu_ticks(data: str) -> int | None:
