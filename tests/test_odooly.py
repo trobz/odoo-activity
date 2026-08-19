@@ -98,6 +98,32 @@ def test_scripts_run_in_this_interpreter_and_report_what_they_printed(monkeypatc
     assert seen["argv"][0] == probes.sys.executable
 
 
+def test_run_odooly_script_appends_extra_args_after_env(monkeypatch):
+    """send_test_mail needs a --to the caller supplies -- appended after
+    --env, in the order the standalone CLI itself expects."""
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return SimpleNamespace(
+            stdout="Test mail sent on acme18-int: mail.mail #9, to a@example.com\n", stderr="", returncode=0
+        )
+
+    monkeypatch.setattr(probes.subprocess, "run", fake_run)
+
+    result = probes.run_odooly_script("send_test_mail", "acme18-int", "--to", "a@example.com")
+
+    assert "mail.mail #9" in result
+    assert seen["argv"][1:] == [
+        "-m",
+        "odoo_activity.scripts.send_test_mail",
+        "--env",
+        "acme18-int",
+        "--to",
+        "a@example.com",
+    ]
+
+
 def test_a_failing_script_shows_its_error_rather_than_nothing(monkeypatch):
     monkeypatch.setattr(
         probes.subprocess,
@@ -198,6 +224,121 @@ def test_a_matched_database_is_marked_and_offers_the_odooly_tools(monkeypatch):
     asyncio.run(go())
 
 
+_MAIL_AUDIT = {
+    "config_parameters": [{"key": "mail.catchall.domain", "value": "example.com", "explanation": ""}],
+    "alias_domains": None,
+    "addresses": [],
+    "mail_servers": [],
+    "modules": [],
+}
+
+
+class _FakeMailProc:
+    """Stands in for the odoo-db subprocess `mail` command's output."""
+
+    def communicate(self, timeout=None):
+        import json
+
+        return json.dumps(_MAIL_AUDIT), ""
+
+    def kill(self) -> None:
+        pass
+
+
+def test_mail_tab_offers_send_test_mail_only_with_a_matching_odooly_env(monkeypatch):
+    """Same gating as Jobs' Create test job -- the button needs a login, so
+    it only appears once odooly can actually reach this database. Pressing
+    it prompts for a recipient (a plain yes/no confirm can't collect one) and
+    only then runs the script, with the typed address passed through."""
+    import asyncio
+
+    from odoo_activity import tui
+    from odoo_activity.panes import detail as detail_mod
+    from odoo_activity.panes.confirm import PromptScreen
+
+    _odooly_pilot(monkeypatch, [{"name": "demo-int", "db": "demo_db"}])
+    monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeMailProc())
+
+    sent = []
+
+    def fake_run_odooly_script(*args, **_kwargs):
+        sent.append(args)
+        return "Test mail sent on demo-int: mail.mail #9, to a@example.com"
+
+    monkeypatch.setattr(detail_mod, "run_odooly_script", fake_run_odooly_script)
+
+    async def go():
+        async with tui.OdooActivity(enable_odooly=True).run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("down")  # onto the db row
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Mail")
+            for _ in range(20):
+                await pilot.pause()
+
+            bar = pane.query_one("#acactions", detail_mod.Horizontal)
+            assert bar.display is True
+            buttons = list(bar.query(detail_mod.Button))
+            assert [b.id for b in buttons] == ["check-port-25", "send-test-mail"]
+
+            buttons[1].press()
+            await pilot.pause()
+
+            assert isinstance(pilot.app.screen, PromptScreen)
+            assert sent == []  # nothing runs before an address is given
+
+            pilot.app.screen.query_one("#prompt-input", detail_mod.Input).value = "a@example.com"
+            await pilot.click("#prompt-ok")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert sent == [("send_test_mail", "demo-int", "--to", "a@example.com")]
+
+    asyncio.run(go())
+
+
+def test_send_test_mail_button_is_cancelled_by_an_empty_prompt(monkeypatch):
+    """Cancel, escape, or just pressing Send with nothing typed all read the
+    same: nothing to send to, so nothing runs."""
+    import asyncio
+
+    from odoo_activity import tui
+    from odoo_activity.panes import detail as detail_mod
+    from odoo_activity.panes.confirm import PromptScreen
+
+    _odooly_pilot(monkeypatch, [{"name": "demo-int", "db": "demo_db"}])
+    monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeMailProc())
+
+    sent = []
+    monkeypatch.setattr(detail_mod, "run_odooly_script", lambda *args, **_k: sent.append(args))
+
+    async def go():
+        async with tui.OdooActivity(enable_odooly=True).run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Mail")
+            for _ in range(20):
+                await pilot.pause()
+
+            pane.query_one("#send-test-mail", detail_mod.Button).press()
+            await pilot.pause()
+            assert isinstance(pilot.app.screen, PromptScreen)
+
+            await pilot.click("#prompt-cancel")
+            await pilot.pause()
+
+            assert sent == []
+
+    asyncio.run(go())
+
+
 def test_without_a_match_the_marker_turns_red_and_nothing_odooly_is_offered(monkeypatch):
     """No section for this database: the marker is still there, in red, and a
     Toolbox that says why instead of listing tools that would only fail."""
@@ -288,3 +429,150 @@ def test_only_the_menus_whose_icon_is_actually_gone_are_rewritten():
     client = _client([dict(menu, web_icon_data="aVZCT1J3MEs=") for menu in menus])
     assert restore_app_icons(client) == (0, 3)
     assert client.env["ir.ui.menu"].written == []
+
+
+class _FakeMailRecord:
+    """Stands in for odooly's `Record` -- what `create()` already returns
+    (see `_FakeMailModel.create`), carrying `.id` and a `.send()` bound to
+    this one record, same as the real thing."""
+
+    def __init__(self, model: "_FakeMailModel", record_id: int) -> None:
+        self._model = model
+        self.id = record_id
+
+    def send(self):
+        self._model.sent_ids.append(self.id)
+        return True
+
+
+class _FakeMailModel:
+    """Stands in for one `client.env[model]` — `search_read` returns canned
+    rows; `create` returns a `_FakeMailRecord` exactly like odooly's own
+    `create()` does (it calls `browse()` internally and returns the
+    `Record`, not a plain id). `browse()` itself raises: calling it on what
+    `create()` already returned is the real bug this fixture is shaped to
+    catch (odooly's `RecordList.__init__` asserts an int and raises
+    `AssertionError: <Record 'mail.mail,N'>` on that call, caught live
+    against a real host -- see send_test_mail.py's `send_test_mail`)."""
+
+    def __init__(self, rows=(), *, send_state="sent", failure_reason=None):
+        self._rows = rows
+        self.created = []
+        self.sent_ids: list[int] = []
+        self._next_id = 7
+        # What the post-send() search_read([...], ["state", "failure_reason"])
+        # in send_test_mail() reads back -- distinct from `rows`, which this
+        # same fixture class also serves for res.users/res.company lookups.
+        self._send_state = send_state
+        self._failure_reason = failure_reason
+
+    def search_read(self, _domain, fields):
+        if fields == ["state", "failure_reason"]:
+            return [{"state": self._send_state, "failure_reason": self._failure_reason}]
+        return self._rows
+
+    def with_context(self, **_kwargs):
+        return self
+
+    def create(self, values):
+        self.created.append(values)
+        record = _FakeMailRecord(self, self._next_id)
+        self._next_id += 1
+        return record
+
+    def browse(self, _id):
+        msg = "browse() should not be called on what create() already returned as a Record"
+        raise AssertionError(msg)
+
+
+class _FakeEnv(dict):
+    """Stands in for odooly's `Env` -- subscriptable by model name, like a
+    dict, but also carries the connected `.uid` odooly sets there (not on
+    the client itself)."""
+
+    def __init__(self, models: dict, uid: int) -> None:
+        super().__init__(models)
+        self.uid = uid
+
+
+def _mail_client(company_email="acme@example.com", *, send_state="sent", failure_reason=None):
+    users = _FakeMailModel([{"company_id": [3, "Acme"]}])
+    company_rows = [{"email": company_email}] if company_email is not None else []
+    env = _FakeEnv(
+        {
+            "res.users": users,
+            "res.company": _FakeMailModel(company_rows),
+            "mail.mail": _FakeMailModel(send_state=send_state, failure_reason=failure_reason),
+        },
+        uid=42,
+    )
+    return SimpleNamespace(env=env)
+
+
+def test_company_email_reads_the_connecting_users_own_company():
+    """`from` needs no asking: it's the same address a real notification from
+    this login would carry."""
+    from odoo_activity.scripts.send_test_mail import _company_email
+
+    assert _company_email(_mail_client("acme@example.com")) == "acme@example.com"
+    assert _company_email(_mail_client(company_email=None)) is None
+
+
+def test_send_test_mail_creates_and_sends_one_mail():
+    from odoo_activity.scripts.send_test_mail import send_test_mail
+
+    client = _mail_client("acme@example.com")
+
+    assert send_test_mail(client, "you@example.com") == 7
+    assert client.env["mail.mail"].created == [
+        {
+            "email_from": "acme@example.com",
+            "email_to": "you@example.com",
+            "subject": "This is a test email from Trobz",
+            "body_html": "Please ignore",
+            "auto_delete": False,
+        }
+    ]
+    assert client.env["mail.mail"].sent_ids == [7]
+
+
+def test_send_test_mail_omits_email_from_when_the_company_has_none():
+    # Passing the key with None is not the same as omitting it: Odoo only
+    # fills a field's default when it's *absent* from values, so an explicit
+    # None here would suppress mail.message.default_get's own sender
+    # fallback and the mail would go out with no `from` address at all.
+    from odoo_activity.scripts.send_test_mail import send_test_mail
+
+    client = _mail_client(company_email=None)
+
+    send_test_mail(client, "you@example.com")
+
+    (created,) = client.env["mail.mail"].created
+    assert "email_from" not in created
+
+
+def test_send_test_mail_raises_when_the_record_ends_in_exception_state():
+    # mail.send() defaults to raise_exception=False -- a failed delivery is
+    # recorded on the mail (state='exception' + failure_reason) rather than
+    # raised, so without reading it back a failed send would still return
+    # normally and be reported as sent, the one outcome this script exists
+    # to catch.
+    import pytest
+
+    from odoo_activity.scripts.send_test_mail import send_test_mail
+
+    client = _mail_client(send_state="exception", failure_reason="Connection refused")
+
+    with pytest.raises(RuntimeError, match="Connection refused"):
+        send_test_mail(client, "you@example.com")
+
+
+def test_send_test_mail_raises_a_generic_message_when_no_failure_reason_recorded():
+    import pytest
+
+    from odoo_activity.scripts.send_test_mail import send_test_mail
+
+    client = _mail_client(send_state="exception", failure_reason=None)
+
+    with pytest.raises(RuntimeError, match="no reason recorded"):
+        send_test_mail(client, "you@example.com")

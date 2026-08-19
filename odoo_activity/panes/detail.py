@@ -25,7 +25,8 @@ from textual.widgets import Button, DataTable, Input, RichLog, Static, Tree
 from textual.widgets.data_table import RowDoesNotExist
 
 from odoo_activity.host import Host, to_thread
-from odoo_activity.panes.confirm import ConfirmScreen
+from odoo_activity.panes.confirm import ConfirmScreen, PromptScreen
+from odoo_activity.panes.mail import render_mail
 from odoo_activity.panes.processes import render_processes
 from odoo_activity.panes.stacks import filter_workers, render_stacks
 from odoo_activity.probes import (
@@ -90,6 +91,8 @@ def _inst_key(inst: Instance | None) -> str | None:
 # whatever the cursor happens to be on.
 _REQUEUE_ACTION = ("requeue-jobs", "⟳  Requeue jobs")
 _TEST_JOB_ACTION = ("create-test-job", "+  Create test job")
+_SEND_TEST_MAIL_ACTION = ("send-test-mail", "✉  Send test mail")
+_CHECK_PORT_25_ACTION = ("check-port-25", "🔌 Check port 25")
 
 
 def _first_line(text: str) -> str:
@@ -179,7 +182,7 @@ class ActivityPane(Vertical):
 
     TABS: ClassVar = {
         "instance": ["Top", "Processes", "Stacks", "Logs", "Config", "Toolbox"],
-        "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Modules", "Params", "Toolbox"],
+        "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Mail", "Modules", "Params", "Toolbox"],
     }
 
     # (label, signal) -- an int sends that signal to the instance's master
@@ -499,6 +502,10 @@ class ActivityPane(Vertical):
             self.run_worker(self._confirm_requeue())
         elif event.button.id == _TEST_JOB_ACTION[0]:
             self.run_worker(self._run_odooly_script("create_test_job", "Create test job"))
+        elif event.button.id == _SEND_TEST_MAIL_ACTION[0]:
+            self.run_worker(self._run_send_test_mail())
+        elif event.button.id == _CHECK_PORT_25_ACTION[0]:
+            self.run_worker(self._run_check_port_25())
 
     async def _confirm_requeue(self) -> None:
         """Put every started/enqueued job back to pending, on confirmation.
@@ -1265,6 +1272,10 @@ class ActivityPane(Vertical):
             await self._fetch_jobs(db, port, ident, host)
             return
 
+        if category == "Mail":
+            await self._fetch_mail(db, port, ident, host)
+            return
+
         # fetch the flagged-off rows too, so `A` toggles client-side (see _visible_db_rows)
         include_inactive = category.lower() in ALL_ROW_FLAGS
         self._dbtab.no_all = False
@@ -1358,6 +1369,35 @@ class ActivityPane(Vertical):
             self._dbtab.actions.append(_TEST_JOB_ACTION)
         self._dbtab.numbered = True  # both depths are lists to count: groups, then jobs
         self._handle_rows(rows, _first_line(error))
+        self._render_actions()
+
+    async def _fetch_mail(
+        self, db: str, port: str | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
+    ) -> None:
+        """The Mail tab: odoo-db's `mail` audit, rendered as separate tables
+        per section (see panes/mail.py) rather than through the generic
+        row-list DataTable -- it answers one nested object, unlike every
+        other db-tab command, and the sections don't share columns, so
+        flattening them into one table (tagged by a `section` column) read
+        as mostly blank cells on a real host.
+        """
+        outcome = await self._run_odoo_db("Mail", db, port, host, ident, include_inactive=False)
+        if outcome is None:
+            return
+
+        rows, raw = outcome
+        if rows is None:
+            self._handle_rows(None, raw)
+            return
+
+        # Check port 25 always shows -- a plain network probe, not an
+        # authenticated Odoo action, so it doesn't need an odooly env.
+        self._dbtab.actions = [_CHECK_PORT_25_ACTION]
+        if self.app.highlighted_odooly_env() is not None:
+            self._dbtab.actions.append(_SEND_TEST_MAIL_ACTION)
+        self._dbtab.rows = []  # not table-backed -- stale rows from a prior tab shouldn't feed `/` search here
+        self._use("log")
+        render_mail(self.query_one("#acbody", RichLog), rows[0] if rows else {})
         self._render_actions()
 
     def _handle_rows(self, rows: list[dict] | None, raw: str = "") -> None:
@@ -1456,6 +1496,50 @@ class ActivityPane(Vertical):
         self._log_body(f"Running {label} on {env}…")
         result = await to_thread(run_odooly_script, script, env)
         self._log_body(result or "(no output)")
+
+    async def _run_send_test_mail(self) -> None:
+        """Send test mail needs a recipient, which a plain yes/no confirm
+        can't collect -- PromptScreen asks for it instead, and typing an
+        address in and pressing Send *is* the confirmation: there's no
+        separate step after it.
+        """
+        env = self.app.highlighted_odooly_env()
+        if env is None:
+            return
+
+        to = await self.app.push_screen_wait(PromptScreen(f"Send a real test email via odooly env {env} — to address:"))
+        if not to:
+            return
+
+        self._log_body(f"Sending test mail via {env} to {to}…")
+        result = await to_thread(run_odooly_script, "send_test_mail", env, "--to", to)
+        self._log_body(result or "(no output)")
+
+    async def _run_check_port_25(self) -> None:
+        """Whether *something* is listening for SMTP on the target host at
+        all -- the question that matters once `mail_servers` is empty and
+        Odoo falls back to `localhost:25` (see odoo-db's own `get_mail_servers`
+        "none defined" case). No odooly env needed, unlike Send test mail --
+        this is a plain network check, not an authenticated Odoo action.
+
+        `-z` (scan, no data exchange) plus a short timeout: without them, a
+        successful connection to an *open* port would leave `nc` sitting
+        there waiting for input, and this action hung with no result ever
+        shown -- worse than the failure case it exists to diagnose.
+        """
+        host = self.app.host
+        self._log_body("Checking port 25 (nc -z -w 3 localhost 25)…")
+        try:
+            result = await to_thread(host.run, ["nc", "-z", "-w", "3", "localhost", "25"])
+        except FileNotFoundError:
+            self._log_body("(nc not found on PATH)")
+            return
+
+        if result.returncode == 0:
+            self._log_body("Port 25 is open — something is listening for SMTP.")
+        else:
+            detail = result.stderr.strip() or result.stdout.strip()
+            self._log_body(f"Port 25 is not reachable (exit {result.returncode}){f': {detail}' if detail else ''}.")
 
     def _render_toolbox(self) -> None:
         table = self.query_one("#actable", DataTable)

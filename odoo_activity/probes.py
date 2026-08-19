@@ -2034,7 +2034,15 @@ def table_columns(rows: list[dict]) -> list[str]:
 
 def stringify(value: object, max_cell: int = 80) -> str:
     """Render a cell: nested values (dict/list, e.g. `attachments`) as compact
-    JSON, clipped to `max_cell`."""
+    JSON, clipped to `max_cell`; `None` (a field a row genuinely has but left
+    unset, e.g. crons' `code` when there's none, or every one of Mail's
+    `config_parameters` rows for a key that isn't in `ir_config_parameter`)
+    as a blank cell rather than the literal string "None" -- caught live
+    against a real host's Mail tab, where every unset config-parameter row
+    read "None" instead of blank."""
+    if value is None:
+        return ""
+
     text = json.dumps(value, ensure_ascii=False) if isinstance(value, dict | list) else str(value)
 
     return text if len(text) <= max_cell else text[: max_cell - 1] + "…"
@@ -2164,7 +2172,7 @@ def match_odooly_env(instance_name: str, db: str, envs: list[OdoolyEnv]) -> str 
     return min(matches)[3] if matches else None
 
 
-def run_odooly_script(script: str, env: str, timeout: int = 300) -> str:
+def run_odooly_script(script: str, env: str, *extra_args: str, timeout: int = 300) -> str:
     """Run one of `odoo_activity.scripts` against odooly env `env`, and
     return what it printed (stdout, then stderr).
 
@@ -2175,8 +2183,11 @@ def run_odooly_script(script: str, env: str, timeout: int = 300) -> str:
     `sys.executable -m` rather than a console script, so it is the
     interpreter running odoo-activity -- the one odooly is installed in --
     whatever `PATH` says.
+
+    `extra_args` is appended verbatim after `--env <env>`, for a script
+    that needs more than the env to run (e.g. send_test_mail's `--to`).
     """
-    argv = [sys.executable, "-m", f"odoo_activity.scripts.{script}", "--env", env]
+    argv = [sys.executable, "-m", f"odoo_activity.scripts.{script}", "--env", env, *extra_args]
 
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
