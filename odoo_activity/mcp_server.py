@@ -6,6 +6,12 @@ the TUI). The server itself always runs locally. `oa-mcp [host]` pins every
 tool call to that one target (local if omitted) -- the counterpart to `oa
 [host]`. `oa-mcp-multi` instead leaves the target per-call, gated by
 --host-filter.
+
+`--enable-odooly` adds the one non-read-only exception: list_odooly_envs,
+instance_odooly_env and odooly_run_script, matching a database against
+~/odooly.ini and running the packaged scripts -- the same actions the TUI's
+`oa --enable-odooly` offers a human through the Toolbox, now offered to the
+agent directly.
 """
 
 import functools
@@ -43,6 +49,10 @@ _pinned_target: Host | None = None
 # on the oa-mcp/oa-mcp-multi command line, i.e. by the human starting the
 # server.
 _include_sensitive_information = False
+# Same launch-time-only spirit as _include_sensitive_information, but the
+# risk here is action rather than disclosure: odooly logs in and can write
+# to the database it matches. Set solely by --enable-odooly.
+_enable_odooly = False
 
 
 def _allowed(alias: str | None) -> bool:
@@ -56,6 +66,12 @@ def _allowed(alias: str | None) -> bool:
 def _check_host(alias: str | None) -> None:
     if not _allowed(alias):
         msg = f"host {alias!r} rejected by --host-filter"
+        raise ValueError(msg)
+
+
+def _check_odooly_enabled() -> None:
+    if not _enable_odooly:
+        msg = "odooly support disabled -- restart the server with --enable-odooly"
         raise ValueError(msg)
 
 
@@ -130,6 +146,7 @@ class StackDump(TypedDict):
 
 
 DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks", "params"]
+OdoolyScript = Literal["create_test_job", "restore_app_icons"]
 
 
 # Discovery is 8 ssh round trips (~620ms remote) behind every tool. Only the
@@ -510,6 +527,56 @@ def mail_audit(db: str, port: str | None = None, *, target: Host) -> dict | str:
     return rows[0] if rows else {}
 
 
+@mcp.tool()
+def list_odooly_envs() -> list[str]:
+    """Every environment section name in ~/odooly.ini -- what `env` on
+    `odooly_run_script` accepts, and the set `instance_odooly_env` matches
+    against. Requires --enable-odooly.
+    """
+    _check_odooly_enabled()
+    return [env["name"] for env in probes.read_odooly_envs()]
+
+
+@mcp.tool()
+def instance_odooly_env(name: str, db: str) -> str | None:
+    """The odooly env (a section of ~/odooly.ini) that serves `db` on
+    instance `name`, or None if none matches. Requires --enable-odooly.
+
+    Always resolved locally against this machine's own ~/odooly.ini,
+    independent of any `host`/`ssh_port` used to discover the instance
+    itself -- odooly reaches the instance over the network, not over ssh.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        db: database name, as `instance_databases` reports it.
+    """
+    _check_odooly_enabled()
+    return probes.match_odooly_env(name, db, probes.read_odooly_envs())
+
+
+@mcp.tool()
+def odooly_run_script(script: OdoolyScript, env: str) -> str:
+    """Run one of odoo-activity's packaged odooly scripts against `env`, and
+    return what it printed (stdout, then stderr). Requires --enable-odooly.
+
+    create_test_job: queue one of queue_job's own test jobs, to check
+        whether a runner picks it up.
+    restore_app_icons: rewrite the apps-menu icons a restore-without-
+        filestore leaves blank.
+
+    Always local, even against a remote `host`: odooly reaches the instance
+    over the network from wherever this server runs, using its own
+    ~/odooly.ini -- never over ssh.
+
+    Args:
+        script: create_test_job or restore_app_icons.
+        env: odooly env, e.g. from `instance_odooly_env` or
+            `list_odooly_envs`.
+    """
+    _check_odooly_enabled()
+    return probes.run_odooly_script(script, env)
+
+
 @app.command()
 def main(
     host: str | None = typer.Argument(
@@ -528,14 +595,22 @@ def main(
         "-- no tool call can turn this on itself; set it only if every caller of this server should see "
         "plaintext secrets.",
     ),
+    enable_odooly: bool = typer.Option(
+        False,
+        "--enable-odooly",
+        help="Expose list_odooly_envs/instance_odooly_env/odooly_run_script, matching databases against "
+        "~/odooly.ini the same way `oa --enable-odooly` does. Launch-time only -- no tool call can turn "
+        "this on itself; set it only if the agent should be able to log in and act on a matched database.",
+    ),
 ) -> None:
     """oa-mcp — MCP server exposing odoo-activity's read-only capacities,
     pinned to a single host: the counterpart to `oa host`, so a human on
     `oa host` and their agent on `oa-mcp host` are always looking at the
     same target. Omit `host` to pin to local, matching bare `oa`."""
-    global _pinned_target, _include_sensitive_information
+    global _pinned_target, _include_sensitive_information, _enable_odooly
     _pinned_target = Host(alias=host, port=port)
     _include_sensitive_information = include_sensitive_information
+    _enable_odooly = enable_odooly
 
     if transport == "streamable-http":
         mcp.settings.host = bind_host
@@ -566,9 +641,16 @@ def main_multi(
         "-- no tool call can turn this on itself; set it only if every caller of this server should see "
         "plaintext secrets.",
     ),
+    enable_odooly: bool = typer.Option(
+        False,
+        "--enable-odooly",
+        help="Expose list_odooly_envs/instance_odooly_env/odooly_run_script, matching databases against "
+        "~/odooly.ini the same way `oa --enable-odooly` does. Launch-time only -- no tool call can turn "
+        "this on itself; set it only if the agent should be able to log in and act on a matched database.",
+    ),
 ) -> None:
     """oa-mcp-multi — same tools as oa-mcp, capped by --host-filter."""
-    global _host_filter, _host_file, _include_sensitive_information
+    global _host_filter, _host_file, _include_sensitive_information, _enable_odooly
     if transport == "streamable-http":
         mcp.settings.host = bind_host
         mcp.settings.port = bind_port
@@ -576,6 +658,7 @@ def main_multi(
     _host_filter = re.compile(host_filter) if host_filter else None
     _host_file = host_file
     _include_sensitive_information = include_sensitive_information
+    _enable_odooly = enable_odooly
 
     mcp.run(transport=transport)
 

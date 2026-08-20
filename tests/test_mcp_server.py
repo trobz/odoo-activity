@@ -1,6 +1,8 @@
 import inspect
 import re
 
+import pytest
+
 from odoo_activity import mcp_server
 
 
@@ -94,6 +96,35 @@ def test_mail_audit_reports_when_odoo_db_is_not_on_path(monkeypatch):
     monkeypatch.setattr(mcp_server.probes, "start_odoo_db", lambda *_a, **_kw: None)
 
     assert mcp_server.mail_audit("demo") == "(odoo-db not found on PATH)"
+
+
+def test_odooly_tools_refuse_without_the_launch_time_flag(monkeypatch):
+    """No tool call can turn odooly support on itself -- only the
+    --enable-odooly CLI flag can, mirroring _include_sensitive_information."""
+    monkeypatch.setattr(mcp_server, "_enable_odooly", False)
+
+    with pytest.raises(ValueError, match="--enable-odooly"):
+        mcp_server.list_odooly_envs()
+    with pytest.raises(ValueError, match="--enable-odooly"):
+        mcp_server.instance_odooly_env("openerp-acme18-integration", "acme18_int")
+    with pytest.raises(ValueError, match="--enable-odooly"):
+        mcp_server.odooly_run_script("restore_app_icons", "acme18-int")
+
+
+def test_odooly_tools_delegate_to_probes_once_enabled(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_enable_odooly", True)
+    monkeypatch.setattr(mcp_server.probes, "read_odooly_envs", lambda: [{"name": "acme18-int", "db": "acme18_int"}])
+
+    assert mcp_server.list_odooly_envs() == ["acme18-int"]
+    assert mcp_server.instance_odooly_env("openerp-acme18-integration", "acme18_int") == "acme18-int"
+    assert mcp_server.instance_odooly_env("openerp-acme18-integration", "nope") is None
+
+    captured = {}
+    monkeypatch.setattr(
+        mcp_server.probes, "run_odooly_script", lambda script, env: captured.update(script=script, env=env) or "ok"
+    )
+    assert mcp_server.odooly_run_script("create_test_job", "acme18-int") == "ok"
+    assert captured == {"script": "create_test_job", "env": "acme18-int"}
 
 
 def test_mcp_tools_do_not_crash():
