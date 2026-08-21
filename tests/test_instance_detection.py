@@ -262,3 +262,136 @@ def test_instance_status_promotes_ambiguous_stopped_but_not_explicit_failure(mon
 
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     assert probes.instance_status(_inst("stopped")) == "stopped"
+
+
+# --- docker ---------------------------------------------------------------
+
+_DOODBA_CMD = "/opt/odoo/common/entrypoint odoo --workers=0 --dev=reload,qweb"
+
+
+def _ps_line(name, state, image, command, project, service, workdir="/srv/p"):
+    return "\t".join((name, state, image, command, project, service, workdir))
+
+
+def _docker_host(monkeypatch, ps_output, ran=None):
+    """A Host whose `docker ps` answers `ps_output`; everything else is a
+    no-op success, so a test only has to describe the containers."""
+
+    def fake_run(self, argv, input_text=None):
+        if ran is not None:
+            ran.append(argv)
+        stdout = ps_output if argv[:2] == ["docker", "ps"] else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(Host, "run", fake_run)
+    monkeypatch.setattr(probes, "_odoo_master_in", lambda *_: "1")
+    monkeypatch.setattr(probes, "_proc_uptime", lambda *_: 90.0)
+    return Host()
+
+
+def test_docker_instances_are_one_row_per_compose_project(monkeypatch):
+    """A compose project is the instance: odoo and its postgres are two
+    halves of one, and the project name is what the developer calls it.
+    Containers with no compose project are skipped -- nothing to run
+    `invoke`/`docker compose` against."""
+    host = _docker_host(
+        monkeypatch,
+        "\n".join((
+            _ps_line("acme-odoo-1", "running", "acme-odoo", _DOODBA_CMD, "acme", "odoo", "/srv/acme"),
+            _ps_line("acme-db-1", "running", "postgres:16", "docker-entrypoint.sh postgres", "acme", "db", "/srv/acme"),
+            _ps_line("acme-smtp-1", "running", "mailhog/mailhog", "MailHog", "acme", "smtp", "/srv/acme"),
+            _ps_line("loose-odoo", "running", "odoo:18", "odoo", "", ""),  # no compose project
+        )),
+    )
+
+    found = probes.docker_instances(host)
+
+    assert found == [
+        {
+            "name": "acme",
+            "status": "running",
+            "uptime": "0:01:30",
+            "manager": "docker",
+            "container": "acme-odoo-1",
+            "command": _DOODBA_CMD,
+            "workdir": "/srv/acme",
+            "db_container": "acme-db-1",
+        }
+    ]
+
+
+def test_docker_instances_finds_postgres_by_image_when_the_service_was_renamed(monkeypatch):
+    """The `db` service name is a convention, the postgres image is
+    evidence -- either is enough, so a renamed service still resolves."""
+    host = _docker_host(
+        monkeypatch,
+        "\n".join((
+            _ps_line("p-odoo-1", "running", "p-odoo", _DOODBA_CMD, "p", "odoo"),
+            _ps_line("p-pg-1", "running", "ghcr.io/tecnativa/postgres-autoconf:16", "postgres", "p", "warehouse"),
+        )),
+    )
+
+    assert probes.docker_instances(host)[0]["db_container"] == "p-pg-1"
+
+
+def test_docker_instances_lists_a_stopped_project_with_no_uptime(monkeypatch):
+    """A stopped instance still has to be listed, the way a stopped systemd
+    unit is -- `s` starting it is the whole point. `restarting` is a crash
+    loop, not a healthy start, so it reads as failed."""
+    host = _docker_host(
+        monkeypatch,
+        "\n".join((
+            _ps_line("a-odoo-1", "exited", "a-odoo", _DOODBA_CMD, "a", "odoo"),
+            _ps_line("b-odoo-1", "restarting", "b-odoo", _DOODBA_CMD, "b", "odoo"),
+        )),
+    )
+
+    assert [(i["name"], i["status"], i["uptime"]) for i in probes.docker_instances(host)] == [
+        ("a", "stopped", "-"),
+        ("b", "failed", "-"),
+    ]
+
+
+def test_docker_instances_names_a_second_odoo_service_apart(monkeypatch):
+    """One project, two odoo services (an http one and a longpolling/cron
+    one): both are listed, and `<project>/<service>` keeps them apart."""
+    host = _docker_host(
+        monkeypatch,
+        "\n".join((
+            _ps_line("m-odoo-1", "running", "m-odoo", _DOODBA_CMD, "m", "odoo"),
+            _ps_line("m-cron-1", "running", "m-odoo", _DOODBA_CMD, "m", "odoo_cron"),
+        )),
+    )
+
+    assert [i["name"] for i in probes.docker_instances(host)] == ["m/odoo", "m/odoo_cron"]
+
+
+def test_docker_instances_ignores_a_project_with_no_odoo_in_it(monkeypatch):
+    """A compose project is not an odoo instance by virtue of existing --
+    the same argv test every other manager uses decides."""
+    host = _docker_host(
+        monkeypatch,
+        _ps_line("web-nginx-1", "running", "nginx", "nginx -g daemon off;", "web", "nginx"),
+    )
+
+    assert probes.docker_instances(host) == []
+
+
+def test_docker_ps_drops_the_quotes_docker_wraps_the_command_in(monkeypatch):
+    """`docker ps` prints .Command quoted; left in, the quote sits in front
+    of the entrypoint path and _is_odoo_process never sees a program name."""
+    host = _docker_host(monkeypatch, _ps_line("q-odoo-1", "running", "q", f'"{_DOODBA_CMD}"', "q", "odoo"))
+
+    assert probes._docker_ps(host)[0]["command"] == _DOODBA_CMD
+    assert probes.docker_instances(host)[0]["name"] == "q"
+
+
+def test_docker_instances_are_empty_without_docker(monkeypatch):
+    """No docker on the box: degrade to "no instances", the same way a
+    missing supervisorctl does -- not a crash."""
+
+    def no_docker(self, argv, input_text=None):
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(Host, "run", no_docker)
+    assert probes.docker_instances(Host()) == []
