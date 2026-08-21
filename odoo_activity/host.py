@@ -14,7 +14,7 @@ import shlex
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import TypeVar
@@ -76,16 +76,47 @@ _NO_STDIN = subprocess.DEVNULL
 @dataclass(frozen=True)
 class Host:
     """`alias=None` is this box; otherwise an ssh destination (`user@host`
-    or a `~/.ssh/config` alias), optionally on a non-default `port`."""
+    or a `~/.ssh/config` alias), optionally on a non-default `port`.
+
+    `container` runs every command inside that docker container instead of
+    on the box itself -- `docker exec` first, then the ssh wrapper if
+    there's also an `alias`, so a container on a remote host is just both
+    at once. It deliberately makes `is_local` False: everything that would
+    otherwise touch the filesystem directly (`read_text`, `stat_size`,
+    `glob`, ...) has to go out as argv for a container the same way it does
+    for a remote box, and the pid a signal names has to be the one the
+    container's own pid namespace uses.
+    """
 
     alias: str | None = None
     port: int | None = None
+    container: str | None = None
 
     @property
     def is_local(self) -> bool:
-        return self.alias is None
+        """This process can act on the target directly -- same filesystem,
+        same pid namespace. False for ssh *and* for a container (see the
+        class docstring)."""
+        return self.alias is None and self.container is None
+
+    @property
+    def on_box(self) -> Host:
+        """The same target with the container stripped off -- for the few
+        tools that must run on the box itself (`docker cp`, `docker logs`)
+        even though the thing they act on lives in a container."""
+        return self if self.container is None else replace(self, container=None)
+
+    def in_container(self, container: str | None) -> Host:
+        """The same target, but inside `container` (unchanged if None, so a
+        caller can pass an instance's container name without branching)."""
+        return self if container is None else replace(self, container=container)
 
     def _argv(self, argv: list[str]) -> list[str]:
+        if self.container is not None:
+            # -i is deliberate and -t deliberately absent: probes pipe
+            # stdin/stdout, they never sit on a tty (see shell_invocation
+            # for the interactive counterpart).
+            argv = ["docker", "exec", self.container, *argv]
         if self.alias is None:
             return argv
         port_opts = ["-p", str(self.port)] if self.port else []
@@ -99,7 +130,12 @@ class Host:
         Deliberately skips our own `_SSH_OPTS` -- `BatchMode=yes` is right
         for a headless probe, wrong for a session the user is about to sit
         in front of and possibly type a password into.
+
+        A container gets `-it` here, unlike `_argv`'s exec: this one *is*
+        the interactive session.
         """
+        if self.container is not None:
+            cmd = shlex.join(["docker", "exec", "-it", self.container, "sh", "-lc", cmd])
         if self.alias is None:
             return cmd
         port_opts = ["-p", str(self.port)] if self.port else []

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import ipaddress
 import itertools
 import json
 import os
@@ -21,6 +22,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -151,13 +153,19 @@ def _is_odoo(*text: str) -> bool:
 
 
 def list_instances(host: Host = LOCAL) -> list[Instance]:
-    """All Odoo instances on `host`, from systemd --user, supervisor, odoo.sh
-    and directly-run processes.
+    """All Odoo instances on `host`, from systemd --user, supervisor, odoo.sh,
+    docker compose and directly-run processes.
 
     Each row carries its `manager` so actions route to the right controller;
     managers can even expose the same name (e.g. odoo-demo).
     """
-    return systemd_instances(host) + supervisor_instances(host) + odoosh_instances(host) + local_instances(host)
+    return (
+        systemd_instances(host)
+        + supervisor_instances(host)
+        + odoosh_instances(host)
+        + docker_instances(host)
+        + local_instances(host)
+    )
 
 
 def instance_status(inst: Instance, host: Host = LOCAL) -> str:
@@ -455,10 +463,11 @@ _OUR_TOOLS = ("odoo-activity", "odoo-config", "odoo-db", "odoo-addons-path")
 _ODOO_TITLE_PREFIX = "odoo: "
 # a root owned by one of these is already listed by that manager
 _MANAGER_PARENTS = ("systemd --user", "supervisord")
-# containerized odoo is its own manager (separate ticket); until then it is
-# excluded, and ODOO_ACTIVITY_DOCKER=1 lists it as a plain local instance
+# a containerized odoo is `docker_instances`' to list, not this manager's:
+# it needs the container's own pid namespace and filesystem, and a compose
+# project to act on (see docker_instances). Excluded here so it isn't
+# listed twice, once with half the features working.
 _CONTAINER_RUNTIMES = ("containerd-shim", "dockerd", "podman", "runc", "crun")
-SHOW_DOCKER = os.environ.get("ODOO_ACTIVITY_DOCKER") == "1"
 
 # `<project>/18.0` is a version directory, not an instance name
 _VERSION_DIR_RE = re.compile(r"^\d+\.\d+$")
@@ -679,7 +688,7 @@ def local_instances(host: Host = LOCAL) -> list[Instance]:
         if parent is not None and _owned_by_manager(parent, cgroups.get(root)):
             continue
 
-        if not SHOW_DOCKER and _containerized(root, by_pid):
+        if _containerized(root, by_pid):
             continue
 
         pid = _odoo_master(root, by_pid, children)
@@ -735,15 +744,280 @@ def _abspath(path: str | None, cwd: str | None) -> str | None:
     return str(Path(cwd) / path) if cwd else None
 
 
-def instance_action(unit: str, action: str, manager: str = "systemd", host: Host = LOCAL) -> str:
+# docker compose stamps these on every container it creates, and they are
+# the whole identity model here: one compose project is one instance, the
+# way one unit is for systemd. Reading them off `docker ps` costs one call
+# for every container on the box -- `docker inspect` would be one more
+# round trip for the same three strings.
+_COMPOSE_PROJECT = "com.docker.compose.project"
+_COMPOSE_SERVICE = "com.docker.compose.service"
+_COMPOSE_WORKDIR = "com.docker.compose.project.working_dir"
+
+# Tab-separated: a container's command has spaces in it, its name never
+# does, so splitting on tabs keeps the command whole without quoting.
+_DOCKER_PS_FORMAT = "\t".join((
+    "{{.Names}}",
+    "{{.State}}",
+    "{{.Image}}",
+    "{{.Command}}",
+    f'{{{{.Label "{_COMPOSE_PROJECT}"}}}}',
+    f'{{{{.Label "{_COMPOSE_SERVICE}"}}}}',
+    f'{{{{.Label "{_COMPOSE_WORKDIR}"}}}}',
+))
+
+# The service a doodba project runs postgres as, plus the image any compose
+# file would use for it -- either is enough, so a project that renamed the
+# service still resolves as long as the image is recognisable.
+_DB_SERVICES = ("db", "postgres", "database")
+_DB_IMAGE_MARKER = "postgres"
+
+
+class _ContainerRow(TypedDict):
+    name: str
+    state: str
+    image: str
+    command: str
+    project: str
+    service: str
+    workdir: str
+
+
+def _docker_ps(host: Host = LOCAL) -> list[_ContainerRow]:
+    """Every compose-managed container on `host`, running or not.
+
+    `-a`: a stopped instance still has to be listed, so `s` can start it —
+    same as a stopped systemd unit. Containers with no compose project
+    label are dropped: a hand-run `docker run odoo` has no project
+    directory to run `invoke`/`docker compose` in, so it can't be
+    controlled, and this manager's identity is the project name.
+
+    `--no-trunc`: `docker ps` otherwise clips `.Command` to 20-odd
+    characters, which is shorter than doodba's entrypoint path alone —
+    `_is_odoo_process` would then never see the `odoo` token it matches on.
+    """
+    try:
+        out = host.run(["docker", "ps", "-a", "--no-trunc", "--format", _DOCKER_PS_FORMAT])
+    except FileNotFoundError:
+        return []  # no docker on this box, same degradation as a missing supervisorctl
+
+    rows: list[_ContainerRow] = []
+    for line in out.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 7:
+            continue
+
+        name, state, image, command, project, service, workdir = fields
+        if not project:
+            continue
+
+        # `docker ps` quotes .Command; the quotes are its formatting, not
+        # part of the argv, and would otherwise sit in front of the
+        # entrypoint path where _is_odoo_process looks for a program name.
+        rows.append({
+            "name": name,
+            "state": state,
+            "image": image,
+            "command": command.strip('"'),
+            "project": project,
+            "service": service,
+            "workdir": workdir,
+        })
+
+    return rows
+
+
+def _docker_status(state: str) -> str:
+    """A container state as one of our three: `restarting` is a crash loop
+    (odoo exits, docker restarts it) rather than a healthy start, so it
+    reads as a failure the way systemd's own `failed` does."""
+    if state == "running":
+        return "running"
+    if state in ("restarting", "dead"):
+        return "failed"
+    return "stopped"
+
+
+def docker_instances(host: Host = LOCAL) -> list[Instance]:
+    """One instance per docker compose project running odoo.
+
+    A project, not a container: `invoke`/`docker compose` act on the
+    project, the odoo container and its postgres are two halves of the same
+    instance, and the project name is what a developer already calls it.
+    A project running several odoo services (rare) contributes one row per
+    service, named `<project>/<service>` so they stay apart.
+
+    Probing runs *inside* the odoo container (`Host.in_container`) rather
+    than against the host's own pid namespace and filesystem. Both would
+    half-work locally on Linux — container processes do show up in the host's
+    `ps` — but the container's pids are what its logs quote and what a
+    signal has to name, its filesystem is where the config lives, and none
+    of it is visible at all from a Docker Desktop VM. One rule, one code
+    path.
+    """
+    containers = _docker_ps(host)
+    if not containers:
+        return []
+
+    by_project: dict[str, list[_ContainerRow]] = {}
+    for row in containers:
+        by_project.setdefault(row["project"], []).append(row)
+
+    instances: list[Instance] = []
+    for project, rows in sorted(by_project.items()):
+        odoo_rows = [row for row in rows if _is_odoo_process(row["command"])]
+        db_row = next(
+            (row for row in rows if row["service"] in _DB_SERVICES or _DB_IMAGE_MARKER in row["image"]),
+            None,
+        )
+
+        for odoo_row in odoo_rows:
+            status = _docker_status(odoo_row["state"])
+            uptime = "-"
+            if status == "running":
+                container = host.in_container(odoo_row["name"])
+                if (pid := _odoo_master_in(container)) is not None and (
+                    secs := _proc_uptime(pid, container)
+                ) is not None:
+                    uptime = format_duration(secs)
+
+            inst: Instance = {
+                "name": project if len(odoo_rows) == 1 else f"{project}/{odoo_row['service']}",
+                "status": status,
+                "uptime": uptime,
+                "manager": "docker",
+                "container": odoo_row["name"],
+                "command": odoo_row["command"],
+                "workdir": odoo_row["workdir"],
+            }
+            if db_row is not None:
+                inst["db_container"] = db_row["name"]
+            instances.append(inst)
+
+    return instances
+
+
+def _odoo_master_in(container: Host) -> str | None:
+    """The odoo master's pid *inside* `container` — normally 1, but doodba's
+    entrypoint is pid 1 in some images and odoo its child, so it's found the
+    same argv way as everywhere else rather than assumed."""
+    roots = _odoo_roots(_ps_snapshot(container)[0])
+    return roots[0] if roots else None
+
+
+def _copy_out_of_container(container: str, path: str | Path, box: Host = LOCAL) -> str | None:
+    """Copy `path` out of `container` to a temporary file on `box`, and
+    return that path (the caller removes it). None if it isn't there.
+
+    `docker cp` rather than `docker exec cat`, because it works on a
+    **stopped** container too -- and a config is exactly what someone wants
+    to read when an instance won't start. It's also the only way to hand a
+    container's file to a tool that lives on the box and takes a path
+    (odoo-config, see render_config).
+    """
+    tmp = box.run(["mktemp"]).stdout.strip()
+    if not tmp:
+        return None
+
+    if box.run(["docker", "cp", f"{container}:{path}", tmp]).returncode != 0:
+        box.run(["rm", "-f", tmp])
+        return None
+
+    return tmp
+
+
+def _read_out_of_container(container: str, path: str | Path, box: Host = LOCAL) -> str | None:
+    """The contents of `path` inside `container`, or None if it isn't there
+    -- running or stopped (see `_copy_out_of_container`)."""
+    tmp = _copy_out_of_container(container, path, box)
+    if tmp is None:
+        return None
+
+    try:
+        return box.read_text(tmp)
+    finally:
+        box.run(["rm", "-f", tmp])
+
+
+def container_host(inst: Instance, host: Host = LOCAL) -> Host:
+    """`host` narrowed to the instance's own container, or unchanged for
+    every other manager — so a caller can probe without branching."""
+    return host.in_container(inst.get("container"))
+
+
+def db_container_host(inst: Instance, host: Host = LOCAL) -> Host:
+    """`host` narrowed to the instance's *postgres* container. Only the
+    Top tab's backend list needs this: everything else reaches postgres
+    over TCP (see `pg_target_of`), not by running commands next to it."""
+    return host.in_container(inst.get("db_container"))
+
+
+# doodba ships a tasks.py with start/stop/restart, and a developer running
+# that project drives it with `invoke` -- so that's what we drive too, and
+# a project keeps whatever its own tasks do around those calls (`start`
+# waits for the services, `restart` touches only the odoo containers and
+# skips the 10s stop timeout). Plain compose is the fallback for a project
+# without tasks.py, or a box without invoke (a server usually has neither).
+#
+# `stop` is deliberately NOT in here: doodba's is `docker compose down
+# --remove-orphans`, which deletes the containers rather than stopping
+# them. The row would then vanish from `docker ps -a` entirely instead of
+# reading `stopped`, leaving no instance to press `s` on to start it again
+# -- so stopping goes through compose, which leaves the containers exited
+# and listed. (Data is safe either way: doodba only removes volumes with
+# an explicit --purge.)
+_INVOKE_ACTIONS = ("start", "restart")
+
+
+def _docker_action(action: str, host: Host = LOCAL, workdir: str | None = None) -> str:
+    """start/stop/restart a compose project, via `invoke` when the project
+    has tasks for it, else `docker compose`."""
+    if not workdir:
+        return "no compose project directory on this row — nothing to act on"
+
+    attempts: list[list[str]] = []
+    if action in _INVOKE_ACTIONS and host.is_file(f"{workdir}/tasks.py"):
+        # -r: run the project's tasks.py from wherever we happen to be,
+        # since a probe has no cwd on the target box (and none at all
+        # remotely).
+        attempts.append(["invoke", "-r", workdir, action])
+
+    # --project-directory rather than a `cd`: the argv goes through ssh's
+    # own shell quoting (see Host._argv), where a chained `cd x && ...`
+    # would be one opaque string instead of a command with arguments.
+    attempts.append(["docker", "compose", "--project-directory", workdir, action])
+
+    error = ""
+    for cmd in attempts:
+        try:
+            out = host.run(cmd)
+        except FileNotFoundError:
+            error = f"{cmd[0]} not found on PATH"
+            continue
+
+        if out.returncode == 0:
+            return ""
+        error = out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
+
+    return error
+
+
+def instance_action(
+    unit: str, action: str, manager: str = "systemd", host: Host = LOCAL, workdir: str | None = None
+) -> str:
     """start/stop/restart an instance via its process manager.
 
-    Odoo instances run under systemd --user, supervisor or odoo.sh; the
-    caller passes the `manager` recorded at discovery time so the right
-    controller is used. Returns "" on success, else the controller's error
-    output (so the UI can show why nothing happened instead of failing
-    silently).
+    Odoo instances run under systemd --user, supervisor, odoo.sh or docker
+    compose; the caller passes the `manager` recorded at discovery time so
+    the right controller is used. Returns "" on success, else the
+    controller's error output (so the UI can show why nothing happened
+    instead of failing silently).
+
+    `workdir` is docker's alone: compose acts on a project directory, not on
+    a name the way a unit does.
     """
+    if manager == "docker":
+        return _docker_action(action, host, workdir)
+
     if manager == "local":
         return "no process manager — a directly-run instance can't be started or stopped from here"
 
@@ -786,9 +1060,132 @@ def instance_action(unit: str, action: str, manager: str = "systemd", host: Host
 # owned by `openerp`); unset, the role is the instance name.
 DB_ROLE = os.environ.get("ODOO_ACTIVITY_DB_ROLE", "")
 
+
+@dataclass(frozen=True)
+class PgTarget:
+    """Where an instance's postgres is, for every psql/odoo-db call below.
+
+    A bare `port` is all the other managers ever need: their postgres runs
+    on the same box as the odoo process, reachable over the default socket
+    or localhost. A container's does not — it sits on the compose network
+    with its own address, role and password — so those three ride along
+    here rather than being re-derived at each call site.
+
+    Values go out as an `env K=V` prefix rather than subprocess's `env=`
+    kwarg, so one argv works local or over ssh (`start_odoo_db` already
+    did this for PGPORT alone). The password is then visible in that box's
+    own `ps` while the call runs: it was read out of an odoo.conf sitting
+    on that same box, readable by the same user, and the alternative
+    (PGPASSFILE) means writing a secret to disk there.
+    """
+
+    port: str | None = None
+    host: str | None = None
+    user: str | None = None
+    password: str | None = None
+
+    @classmethod
+    def of(cls, port: str | PgTarget | None) -> PgTarget:
+        """Accepts what callers already pass — a port string, None, or a
+        target — so adding docker didn't have to touch every signature's
+        callers (mcp_server hands over a port it got as a tool argument)."""
+        return port if isinstance(port, PgTarget) else cls(port=port)
+
+    @property
+    def env_prefix(self) -> list[str]:
+        pairs = [
+            f"{key}={value}"
+            for key, value in (
+                ("PGHOST", self.host),
+                ("PGPORT", self.port),
+                ("PGUSER", self.user),
+                ("PGPASSWORD", self.password),
+            )
+            if value
+        ]
+        return ["env", *pairs] if pairs else []
+
+    def psql(self, *args: str) -> list[str]:
+        """`psql` with this target's connection settings applied.
+
+        `-w`: without it psql prompts for a password it can never receive
+        (probes run with stdin closed, see host._NO_STDIN) and the call
+        hangs until it gives up, instead of failing with the reason.
+        """
+        return [*self.env_prefix, "psql", "-w", *args]
+
+
+def _container_ip(container: str | None, host: Host = LOCAL) -> str | None:
+    """A container's address on its compose network.
+
+    Postgres in a compose project is normally not published to the host at
+    all (doodba's devel.yaml publishes pgweb and mailhog, never the db), so
+    its container address is how a client outside the network reaches it.
+    Works because the container shares the box's kernel and its bridge is
+    routable there — which also means it is only reachable from that box,
+    hence `host` runs `docker inspect` on the same target the psql call
+    will run on.
+    """
+    if container is None:
+        return None
+
+    out = host.run([
+        "docker",
+        "inspect",
+        "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+        container,
+    ]).stdout
+
+    # Parsed, not just "first non-empty word": a stopped container has no
+    # address and docker fills the field with the literal text `invalid IP`
+    # (seen on docker 28), which would otherwise be handed to libpq as a
+    # hostname -- and a hostname that fails to resolve looks like a network
+    # problem rather than "the container isn't running".
+    for token in out.split():
+        with contextlib.suppress(ValueError):
+            return str(ipaddress.ip_address(token))
+
+    return None
+
+
+def pg_target_of(inst: Instance, host: Host = LOCAL) -> PgTarget:
+    """The instance's postgres, as the db-tab probes need it.
+
+    Every manager but docker resolves to a port on the local cluster (see
+    `db_port_of`). Docker's postgres is a container: the address comes from
+    the compose network, the role and password from the odoo config that
+    the odoo container is itself connecting with — so the TUI reaches the
+    database exactly the way the instance does.
+    """
+    if inst["manager"] != "docker":
+        return PgTarget(port=db_port_of(inst, host))
+
+    _workdir, parser = instance_config(inst, host)
+    db_container = inst.get("db_container")
+    # A stopped project has no address to connect to -- and leaving PGHOST
+    # unset is not "no database", it is *this box's* cluster, so a stale db
+    # row would quietly report the host's databases as the container's
+    # (exactly the mix-up the old ODOO_ACTIVITY_DOCKER hatch produced).
+    # `.invalid` is reserved by RFC 2606 and never resolves, so the attempt
+    # fails on the spot, naming the container that isn't up.
+    address = _container_ip(db_container, host) or f"{db_container or 'db'}.invalid"
+    return PgTarget(
+        host=address,
+        port=_opt(parser, "db_port"),
+        user=_opt(parser, "db_user"),
+        password=_opt(parser, "db_password"),
+    )
+
+
+# `postgres` is the cluster's own maintenance database, never an instance's.
+# It only needs excluding since docker arrived: postgres-autoconf makes
+# POSTGRES_USER (odoo) the bootstrap superuser, so that role owns `postgres`
+# as well as the real databases, where on a host cluster `postgres` belongs
+# to the `postgres` role and an instance's own role never matches it.
 _DB_BY_ROLE_SQL = (
     "SELECT d.datname FROM pg_database d JOIN pg_roles r ON d.datdba = r.oid "
-    "WHERE r.rolname = :'role' AND NOT d.datistemplate ORDER BY 1"
+    "WHERE r.rolname = :'role' AND NOT d.datistemplate AND d.datname <> 'postgres' ORDER BY 1"
 )
 
 
@@ -807,6 +1204,17 @@ def instance_workdir(inst: Instance, host: Host = LOCAL) -> Path:
     $HOME on odoo.sh)."""
     if inst["manager"] in ("supervisor", "local"):
         return Path(inst.get("directory") or ".")
+
+    if inst["manager"] == "docker":
+        # the container's cwd, not the compose project directory on the
+        # host: this is the base every *path* here is resolved against
+        # (config, logfile, data_dir) and those all live inside. The
+        # project directory is `workdir` on the row, used only to run
+        # invoke/docker compose (see instance_action).
+        at = container_host(inst, host)
+        if (pid := instance_pid(inst, at)) is not None and (cwd := _proc_link(pid, "cwd", at)) is not None:
+            return Path(cwd)
+        return Path("/")
 
     if inst["manager"] == "odoosh":
         if host.is_local:
@@ -868,6 +1276,11 @@ def _cli_options(cmd: str) -> dict[str, str]:
     return options
 
 
+# Where an odoo container image renders its config, most specific first:
+# doodba's generated one, then the official image's packaged default.
+_DOCKER_CONFIG_PATHS = ("/opt/odoo/auto/odoo.conf", "/etc/odoo/odoo.conf")
+
+
 def _config_names(instance_name: str) -> list[str]:
     """Config filenames to try, in order.
 
@@ -884,8 +1297,31 @@ def _config_file(inst: Instance, host: Host = LOCAL) -> Path | None:
     """The config file named on a directly-run instance's own command line,
     the fixed `~/.config/odoo/odoo.conf` odoo.sh always writes, or the first
     `<workdir>/config/` file matching `_config_names`."""
+    host = container_host(inst, host)
+
     if path := inst.get("config"):
         return Path(path) if host.is_file(path) else None
+
+    if inst["manager"] == "docker":
+        # An image puts the config where it likes, so there is no workdir
+        # convention to walk: doodba renders one at /opt/odoo/auto/odoo.conf,
+        # the official image ships /etc/odoo/odoo.conf, and anything else
+        # names it on the command line (handled by the `config` key above,
+        # filled from argv like a directly-run instance's).
+        #
+        # Probed with `docker cp`, not `host.is_file`'s exec: exec needs a
+        # running container, and a config is exactly what you want to read
+        # when an instance won't start (verified: with the container
+        # stopped, the exec probe reported no config at all).
+        box, container = host.on_box, host.container
+        for candidate in _DOCKER_CONFIG_PATHS:
+            if container is None:
+                break
+            tmp = _copy_out_of_container(container, candidate, box)
+            if tmp is not None:
+                box.run(["rm", "-f", tmp])
+                return Path(candidate)
+        return None
 
     if inst["manager"] == "odoosh":
         path = instance_workdir(inst, host) / ".config" / "odoo" / "odoo.conf"
@@ -919,14 +1355,23 @@ def instance_config(inst: Instance, host: Host = LOCAL) -> tuple[Path, configpar
     """
     workdir = instance_workdir(inst, host)
     path = _config_file(inst, host)
-    if path is None and inst["manager"] != "local":
+    host = container_host(inst, host)  # the file lives in the container, if there is one
+    if path is None and inst["manager"] not in ("local", "docker"):
         return workdir, None
 
     parser = configparser.RawConfigParser()  # odoo configs may contain `%`
     if path is not None:
-        parser.read_string(host.read_text(path))
+        text = (
+            _read_out_of_container(host.container, path, host.on_box)
+            if host.container is not None
+            else host.read_text(path)
+        )
+        parser.read_string(text or "")
 
-    if inst["manager"] == "local":
+    if inst["manager"] in ("local", "docker"):
+        # compose's `command:` is argv the same way a shell-run instance's
+        # is, and doodba puts real settings there (--workers, --dev), so it
+        # layers over the file for both.
         if not parser.has_section("options"):
             parser.add_section("options")
         for key, value in _cli_options(inst.get("command", "")).items():
@@ -1042,20 +1487,27 @@ def databases_of(inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | N
     if inst["manager"] == "local" and (pinned := _opt(parser, "db_name")):
         return [name.strip() for name in pinned.split(",") if name.strip()], port
 
+    if inst["manager"] == "docker":
+        # ODOO_ACTIVITY_DB_ROLE is about *this box's* cluster convention
+        # (locally every db is owned by `openerp`); a container's cluster is
+        # its own, and the role odoo connects as is right there in its
+        # config -- so the env override deliberately doesn't apply here.
+        target = pg_target_of(inst, host)
+        if target.host is None or target.host.endswith(".invalid"):
+            return [], None  # postgres isn't up; nothing to list, and nothing to mistake for it
+
+        return databases_by_role(target.user or "odoo", target, host), target.port
+
     role = DB_ROLE or _opt(parser, "db_user") or inst["name"].removesuffix(".service")
     return databases_by_role(role, port, host), port
 
 
-def databases_by_role(role: str, port: str | None = None, host: Host = LOCAL) -> list[str]:
+def databases_by_role(role: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> list[str]:
     """Non-template databases owned by `role`, via psql on `port`. Empty if
     postgres is unreachable (so the UI degrades instead of crashing)."""
     # SQL comes in on stdin (-f -) so psql expands :'role' and quotes it safely;
     # -c does no variable interpolation.
-    cmd = ["psql", "-d", "postgres"]
-    if port:
-        cmd += ["-p", port]
-
-    cmd += ["-v", f"role={role}", "-tA", "-f", "-"]
+    cmd = PgTarget.of(port).psql("-d", "postgres", "-v", f"role={role}", "-tA", "-f", "-")
     out = host.run(cmd, input_text=_DB_BY_ROLE_SQL).stdout
 
     return [line.strip() for line in out.splitlines() if line.strip()]
@@ -1071,17 +1523,13 @@ _LONG_QUERIES_SQL = (
 )
 
 
-def long_queries(db: str, port: str | None = None, host: Host = LOCAL) -> list[dict]:
+def long_queries(db: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> list[dict]:
     """Non-idle queries on `db`, longest-running first, via psql on `port`.
 
     odoo-db has no equivalent command; this queries pg_stat_activity
     directly instead, the same way databases_by_role reads pg_database.
     """
-    cmd = ["psql", "-d", "postgres"]
-    if port:
-        cmd += ["-p", port]
-
-    cmd += ["-v", f"db={db}", "-tA", "-f", "-"]
+    cmd = PgTarget.of(port).psql("-d", "postgres", "-v", f"db={db}", "-tA", "-f", "-")
     out = host.run(cmd, input_text=_LONG_QUERIES_SQL).stdout
 
     try:
@@ -1091,7 +1539,7 @@ def long_queries(db: str, port: str | None = None, host: Host = LOCAL) -> list[d
 
 
 def _psql_json(
-    sql: str, db: str, params: dict[str, str], port: str | None, host: Host
+    sql: str, db: str, params: dict[str, str], port: str | PgTarget | None, host: Host
 ) -> tuple[list[dict] | None, str]:
     """Run a `SELECT json_agg(...)` on `db` and decode it.
 
@@ -1107,10 +1555,7 @@ def _psql_json(
     """
     # ON_ERROR_STOP or a failed statement exits 0 with the error on stderr
     # only, and a missing queue_job table would read as "no jobs"
-    cmd = ["psql", "-d", db, "-v", "ON_ERROR_STOP=1"]
-    if port:
-        cmd += ["-p", port]
-
+    cmd = PgTarget.of(port).psql("-d", db, "-v", "ON_ERROR_STOP=1")
     for name, value in params.items():
         cmd += ["-v", f"{name}={value}"]
 
@@ -1177,7 +1622,22 @@ _REQUEUE_SQL = (
 )
 
 
-def job_groups(db: str, port: str | None = None, host: Host = LOCAL) -> tuple[list[dict] | None, str]:
+# What postgres says when a database never installed queue_job:
+# `ERROR:  relation "queue_job" does not exist`, with psql's own
+# `psql:<stdin>:1:` prefix and a `LINE 1: ...^` excerpt after it. That is by
+# far the most common reason the Jobs tab has nothing to show -- most
+# databases don't run the module -- and as phrased it reads like something
+# broke. Every other psql error is passed through verbatim: those are rarer,
+# and their exact text is the diagnosis.
+_NO_QUEUE_JOB_RE = re.compile(r'relation "queue_job" does not exist')
+_NO_QUEUE_JOB = "(queue_job is not installed on this database)"
+
+
+def _job_error(error: str) -> str:
+    return _NO_QUEUE_JOB if _NO_QUEUE_JOB_RE.search(error) else error
+
+
+def job_groups(db: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> tuple[list[dict] | None, str]:
     """queue_job rows on `db` grouped by function and state, with the oldest
     creation date and the longest wait/run in each group.
 
@@ -1185,19 +1645,21 @@ def job_groups(db: str, port: str | None = None, host: Host = LOCAL) -> tuple[li
     but not what's stuck in it: `waiting`/`running` are what a job sitting in
     `started` for hours shows up as.
     """
-    return _psql_json(_JOB_GROUPS_SQL, db, {}, port, host)
+    rows, error = _psql_json(_JOB_GROUPS_SQL, db, {}, port, host)
+    return rows, _job_error(error)
 
 
 def jobs_in_group(
-    db: str, function: str, state: str, port: str | None = None, host: Host = LOCAL
+    db: str, function: str, state: str, port: str | PgTarget | None = None, host: Host = LOCAL
 ) -> tuple[list[dict] | None, str]:
     """The individual jobs behind one `job_groups` row, oldest first (capped
     at 500 — a backed-up queue runs to tens of thousands, and the ones that
     explain it are the oldest)."""
-    return _psql_json(_JOBS_IN_GROUP_SQL, db, {"function": function, "state": state}, port, host)
+    rows, error = _psql_json(_JOBS_IN_GROUP_SQL, db, {"function": function, "state": state}, port, host)
+    return rows, _job_error(error)
 
 
-def requeue_jobs(db: str, port: str | None = None, host: Host = LOCAL) -> tuple[int, str]:
+def requeue_jobs(db: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> tuple[int, str]:
     """Put every `started`/`enqueued` job back to `pending`, returning
     `(rows, error)`.
 
@@ -1205,15 +1667,11 @@ def requeue_jobs(db: str, port: str | None = None, host: Host = LOCAL) -> tuple[
     a worker killed mid-job leaves the row `started` forever, since nothing
     else revisits it.
     """
-    cmd = ["psql", "-d", db, "-v", "ON_ERROR_STOP=1"]
-    if port:
-        cmd += ["-p", port]
-
-    cmd += ["-tA", "-f", "-"]
+    cmd = PgTarget.of(port).psql("-d", db, "-v", "ON_ERROR_STOP=1", "-tA", "-f", "-")
     result = host.run(cmd, input_text=_REQUEUE_SQL)
 
     if result.returncode != 0:
-        return 0, result.stderr.strip() or f"psql exited {result.returncode}"
+        return 0, _job_error(result.stderr.strip()) or f"psql exited {result.returncode}"
 
     # psql echoes the tag ("UPDATE 8") for a statement that changed rows
     tag = result.stdout.strip().rpartition(" ")[2]
@@ -1256,7 +1714,7 @@ _SS_PID_RE = re.compile(r"pid=(?P<pid>\d+)")
 _DEFAULT_PG_PORT = "5432"
 
 
-def _pids_by_client_port(ports: list[str], pg_port: str | None = None, host: Host = LOCAL) -> dict[str, str]:
+def _pids_by_client_port(ports: list[str], pg_port: str | PgTarget | None = None, host: Host = LOCAL) -> dict[str, str]:
     """client port -> the OS pid holding it, for each postgres connection in
     `ports`.
 
@@ -1275,7 +1733,11 @@ def _pids_by_client_port(ports: list[str], pg_port: str | None = None, host: Hos
         return {}
 
     wanted = set(ports)
-    pg_port = pg_port or _DEFAULT_PG_PORT
+    # Docker callers carry all libpq settings in a PgTarget. Socket
+    # matching only needs its numeric server port; comparing ss's string
+    # output with the PgTarget object would never match and would force the
+    # less reliable lsof fallback for every pre-Odoo-16 job runner.
+    pg_port = PgTarget.of(pg_port).port or _DEFAULT_PG_PORT
     found: dict[str, str] = {}
 
     try:
@@ -1301,7 +1763,7 @@ def _pids_by_client_port(ports: list[str], pg_port: str | None = None, host: Hos
     return found
 
 
-def jobrunner_pids(port: str | None = None, host: Host = LOCAL) -> set[str]:
+def jobrunner_pids(port: str | PgTarget | None = None, host: Host = LOCAL) -> set[str]:
     """Pids of the queue_job runner workers, from their postgres backends.
 
     Odoo only labels a worker in `ps` when `setproctitle` is installed —
@@ -1387,6 +1849,13 @@ def instance_pid(inst: Instance, host: Host = LOCAL) -> str | None:
     """
     if inst["manager"] == "odoosh":
         return _odoosh_master_pid(host)
+
+    if inst["manager"] == "docker":
+        # compose has no MainPID to ask for, and the pid is the container's
+        # own (see docker_instances) -- so it comes from a ps inside it.
+        # Not cached on the row: a container that restarted keeps its name
+        # and gets a fresh pid, which a cached one would miss.
+        return _odoo_master_in(container_host(inst, host))
 
     if inst["manager"] == "local":
         # nothing to re-ask for a MainPID; `list_instances` re-runs on a timer,
@@ -1507,6 +1976,7 @@ def shell_command(inst: Instance, host: Host = LOCAL) -> str | None:
     Builds from the live process argv, absolutizing argv[0] to ensure execution
     outside the process context. Appends `shell --no-http` if not already present.
     """
+    host = container_host(inst, host)
     procs = procs_of(inst, host)
     if not procs:
         return None
@@ -1551,6 +2021,7 @@ def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
     """The instance's master process plus every descendant (prefork
     workers), read purely from ps by walking the ppid tree down from the
     manager-reported master pid."""
+    host = container_host(inst, host)
     master = instance_pid(inst, host)
     if master is None:
         return []
@@ -1566,16 +2037,24 @@ def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], l
     Postgres process titles vary by cluster configuration, so backends are
     matched by db-name membership rather than a fixed token position.
     """
-    master = instance_pid(inst, host)
     dbs = set(databases_of(inst, host)[0])
 
-    by_pid, children = _ps_snapshot(host)
+    odoo_at = container_host(inst, host)
+    master = instance_pid(inst, odoo_at)
+    by_pid, children = _ps_snapshot(odoo_at)
+    odoo_rows = _descendants(master, by_pid, children) if master is not None else []
+
+    # postgres lives in its own container under docker, so its backends are
+    # in a different ps entirely -- one more call there, and only there
+    # (db_container_host is a no-op for every other manager, which would
+    # otherwise pay a second identical `ps`).
+    pg_at = db_container_host(inst, host)
+    pg_by_pid = by_pid if pg_at == odoo_at else _ps_snapshot(pg_at)[0]
     pg_rows = [
         row
-        for row in by_pid.values()
+        for row in pg_by_pid.values()
         if dbs and row["cmd"].startswith("postgres:") and dbs.intersection(row["cmd"].split())
     ]
-    odoo_rows = _descendants(master, by_pid, children) if master is not None else []
 
     return odoo_rows, pg_rows
 
@@ -1584,6 +2063,7 @@ def instance_workers(inst: Instance, host: Host = LOCAL) -> tuple[str | None, li
     """(master_pid, odoo_top) for the Processes tab's worker tree --
     same ppid-walk as instance_procs' odoo side, without paying for its
     postgres-backend matching (unused here)."""
+    host = container_host(inst, host)
     master = instance_pid(inst, host)
     if master is None:
         return None, []
@@ -1677,6 +2157,12 @@ class Instance(_InstanceRequired, total=False):
     version: str
     config: str
     pid: str
+    # docker only: the odoo container to run probes in, the postgres one to
+    # reach its cluster, and the compose project directory on the host
+    # (where `invoke`/`docker compose` have to be run from)
+    container: str
+    db_container: str
+    workdir: str
 
 
 class ProcRow(TypedDict):
@@ -1806,6 +2292,50 @@ def stacks_by_activity(workers: list[Worker]) -> list[Worker]:
     ]
 
 
+def _read_until_dumped(reader: subprocess.Popen, expected: set[str]) -> str:
+    """Read `reader` until every pid in `expected` has a dump header, or ~2s
+    passes — the streaming counterpart to the local branch's poll loop in
+    `dump_and_parse_stacks`. Doesn't kill `reader`; its caller owns it."""
+    data = b""
+    text = ""
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        data += _read_new_bytes(reader)
+        text = _untty(data.decode(errors="replace"))
+        seen = {m["pid"] for m in _DUMP_HEADER_RE.finditer(text)}
+        if expected <= seen:
+            break
+        time.sleep(0.1)
+
+    return text
+
+
+def _dump_via_stream(inst: Instance, procs: list[ProcRow], host: Host = LOCAL) -> tuple[str, list[Worker]]:
+    """`dump_and_parse_stacks` for an instance whose log is a stream, not a
+    file (see log_stream).
+
+    The reader is attached *before* the signal: there is no offset to seek
+    back to afterwards, so output produced before it starts is simply gone
+    -- the opposite of the file branches, which read from a saved size.
+    """
+    reader = log_stream(inst, host)
+    if reader is None:
+        return "(no log stream)", []
+
+    at = container_host(inst, host)  # whose pids these are, so whose namespace the signal goes to
+    try:
+        for proc in procs:
+            signal_process(proc["pid"], signal.SIGQUIT, at)
+        text = _read_until_dumped(reader, {proc["pid"] for proc in procs})
+    finally:
+        reader.kill()
+
+    if not text.strip():
+        return "(dump did not appear in the log)", []
+
+    return "", parse_stack_dump(text)
+
+
 def dump_and_parse_stacks(inst: Instance, host: Host = LOCAL) -> tuple[str, list[Worker]]:
     """SIGQUIT all instance top, read new log output, and parse stack dumps.
 
@@ -1815,20 +2345,24 @@ def dump_and_parse_stacks(inst: Instance, host: Host = LOCAL) -> tuple[str, list
     Returns (error, workers); error is non-empty (workers `[]`) only when there's
     truly nothing to show (no workers, no logfile, or nothing arrived at
     all)."""
-    path = logfile_of(inst, host)
-    if path is None or not host.is_file(path):
-        return "(no logfile configured)", []
-
     procs = procs_of(inst, host)
     if not procs:
         return "(no workers alive)", []
 
-    before = host.stat_size(path) or 0
-    for proc in procs:
-        signal_process(proc["pid"], signal.SIGQUIT, host)
-
+    at = container_host(inst, host)  # whose pids these are, so whose namespace the signal goes to
     expected = {proc["pid"] for proc in procs}
     text = ""
+
+    if inst["manager"] == "docker":
+        return _dump_via_stream(inst, procs, host)
+
+    path = logfile_of(inst, host)
+    if path is None or not host.is_file(path):
+        return "(no logfile configured)", []
+
+    before = host.stat_size(path) or 0
+    for proc in procs:
+        signal_process(proc["pid"], signal.SIGQUIT, at)
 
     if host.is_local:
         for _ in range(20):  # ~2s budget
@@ -1849,15 +2383,7 @@ def dump_and_parse_stacks(inst: Instance, host: Host = LOCAL) -> tuple[str, list
         # from the start would be bad on a multi-GB log, remote or not.
         proc = host.popen(["tail", "-f", "-c", f"+{before + 1}", str(path)], stderr=subprocess.DEVNULL, text=False)
         try:
-            data = b""
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                data += _read_new_bytes(proc)
-                text = data.decode(errors="replace")
-                seen = {m["pid"] for m in _DUMP_HEADER_RE.finditer(text)}
-                if expected <= seen:
-                    break
-                time.sleep(0.1)
+            text = _read_until_dumped(proc, expected)
         finally:
             proc.kill()
 
@@ -1873,6 +2399,14 @@ def instance_version(inst: Instance, host: Host = LOCAL) -> str | None:
     odoo.sh's own `$ODOO_VERSION` env var, captured at discovery time."""
     if inst["manager"] == "odoosh":
         return inst.get("version")
+
+    if inst["manager"] == "docker":
+        # odoo-addons-path is one of our own tools, installed on the box and
+        # not in the image -- and the layout it would inspect is inside the
+        # container anyway. odoo can just say what it is.
+        out = container_host(inst, host).run(["odoo", "--version"]).stdout
+        m = re.search(r"(\d+\.\d+)", out)
+        return m.group(1) if m else None
 
     try:
         out = host.run(["odoo-addons-path", str(instance_workdir(inst, host)), "--verbose", "--format", "json"]).stdout
@@ -1890,6 +2424,23 @@ def render_config(config: Path, version: str | None, mode: str, host: Host = LOC
     keys differing from odoo's default; expand = every valid option filled
     in). `version` is omitted when unknown; odoo-config then falls back to
     its newest schema."""
+    if host.container is not None:
+        # odoo-config is one of our own tools: installed on the box, never
+        # in the image, and it takes a path rather than stdin -- so the
+        # container's config is copied out to the box for the length of the
+        # call. `docker cp` works on a stopped container too, which matters:
+        # a config is exactly what you want to read when an instance won't
+        # start.
+        box = host.on_box
+        tmp = _copy_out_of_container(host.container, config, box)
+        if tmp is None:
+            return f"(could not read {config} out of {host.container})"
+
+        try:
+            return render_config(Path(tmp), version, mode, box)
+        finally:
+            box.run(["rm", "-f", tmp])
+
     cmd = ["odoo-config", mode, str(config)]
     if version:
         cmd += ["--version", version]
@@ -1903,6 +2454,60 @@ def render_config(config: Path, version: str | None, mode: str, host: Host = LOC
 
 
 _TAIL_CHUNK = 64 * 1024
+
+
+def _untty(text: str) -> str:
+    """Drop the carriage returns a container's log picks up from its tty.
+
+    docker allocates a pty when the service asks for one (doodba's
+    common.yaml sets `tty: true`), and a pty turns every `\n` odoo writes
+    into `\r\n`. Left in, the CR sits at the end of every line and
+    `_DUMP_HEADER_RE`'s end-of-line anchor never matches, so a stack dump
+    parses as zero workers (caught live: the dump was in the log, the
+    Stacks tab was empty).
+    """
+    return text.replace("\r\n", "\n")
+
+
+def log_snapshot(inst: Instance, host: Host = LOCAL, lines: int = 200) -> str | None:
+    """The last `lines` of the instance's log, or None when it hasn't got
+    one to read.
+
+    A container writes to stdout, not to a file: odoo's own `logfile` is
+    unset in every odoo image (doodba's included), and docker keeps the
+    stream itself. So the log is `docker logs`, not a path — which is also
+    why `logfile_of` returning None can't mean "no log" for this manager.
+    """
+    if inst["manager"] == "docker":
+        # 2>&1: odoo logs to stderr, docker keeps the two streams apart, and
+        # a Logs tab showing only stdout would be empty on every instance.
+        out = host.run(["docker", "logs", "--tail", str(lines), inst["container"]])
+        return _untty(out.stdout + out.stderr)
+
+    path = logfile_of(inst, host)
+    return None if path is None else tail(path, lines, host)
+
+
+def log_stream(inst: Instance, host: Host = LOCAL) -> subprocess.Popen | None:
+    """A child streaming the instance's *new* log output, or None when the
+    caller should poll a local file instead (see detail.py's `poll`).
+
+    Callers must `.kill()` it. `--tail 0` (like `tail -f -n 0`) because the
+    lines already on screen came from `log_snapshot` -- without it every
+    follow would replay the whole buffer into the pane.
+    """
+    if inst["manager"] == "docker":
+        return host.popen(
+            ["docker", "logs", "-f", "--tail", "0", inst["container"]],
+            stderr=subprocess.STDOUT,
+            text=False,
+        )
+
+    path = logfile_of(inst, host)
+    if path is None or host.is_local:
+        return None  # a local file is polled by size, no child needed
+
+    return host.popen(["tail", "-f", "-n", "0", str(path)], stderr=subprocess.DEVNULL, text=False)
 
 
 def tail(path: Path, lines: int = 200, host: Host = LOCAL) -> str:
@@ -1943,17 +2548,19 @@ ALL_ROW_FLAGS: dict[str, str] = {"crons": "active", "modules": "installed", "use
 def start_odoo_db(
     command: str,
     db: str,
-    port: str | None = None,
+    port: str | PgTarget | None = None,
     host: Host = LOCAL,
     *,
     include_sensitive_information: bool = False,
     include_inactive: bool = False,
 ) -> subprocess.Popen[str] | None:
-    """Start `odoo-db --output-format json <command> <db>`, on `port` if the
-    instance's cluster isn't the default one (odoo-db has no --port flag of
-    its own, but honors PGPORT like any libpq client — set via an `env`
-    prefix rather than subprocess's `env=` kwarg, so it works the same
-    whether `odoo-db` runs locally or over ssh).
+    """Start `odoo-db --output-format json <command> <db>` against `port` —
+    a plain port, or a full `PgTarget` when the cluster isn't just a port on
+    this box (docker's is a container with its own address and credentials).
+    odoo-db has no connection flags of its own, but honors PGHOST/PGPORT/
+    PGUSER/PGPASSWORD like any libpq client — set via an `env` prefix rather
+    than subprocess's `env=` kwarg, so it works the same whether `odoo-db`
+    runs locally or over ssh.
 
     Returns the live process rather than waiting on it, so a caller can
     `.kill()` it if abandoned (e.g. the tab driving it was switched away
@@ -1978,7 +2585,7 @@ def start_odoo_db(
     by default (uninstalled modules, inactive crons/users) plus the status
     column that tells them apart, so the TUI's `A` can toggle client-side.
     """
-    cmd = ["env", f"PGPORT={port}"] if port else []
+    cmd = PgTarget.of(port).env_prefix
     cmd += ["odoo-db", "--output-format", "json"]
     if include_sensitive_information:
         # odoo-db's global PII master switch -- must precede the subcommand.
