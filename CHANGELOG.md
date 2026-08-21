@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.18.0 (2026-08-21)
+
+### Features
+
+- **mail**: Add Mail tab with Send test mail action
+  ([`bd68d9f`](https://github.com/trobz/odoo-activity/commit/bd68d9ff81dc39d09b9a605b8d2f6d7ad879d646))
+
+
 ## v0.17.0 (2026-08-17)
 
 ### Features
