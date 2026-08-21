@@ -459,3 +459,43 @@ def test_the_clusters_own_maintenance_database_is_not_an_instances(monkeypatch):
     assert probes.databases_by_role("odoo", probes.PgTarget(host="172.20.0.3"), Host()) == ["devel", "e2e"]
     assert "d.datname <> 'postgres'" in sent[0]
     assert "NOT d.datistemplate" in sent[0]
+
+
+_NO_QUEUE_JOB_STDERR = (
+    'psql:<stdin>:1: ERROR:  relation "queue_job" does not exist\n'
+    "LINE 1: ...max(age((now() at time zone 'utc'), date_created)) FROM queue_...\n"
+    "                                                                    ^\n"
+)
+
+
+def test_jobs_says_the_module_is_not_installed_instead_of_quoting_postgres(monkeypatch):
+    """Most databases never install queue_job, so the missing table is the
+    Jobs tab's normal empty case, not a fault -- but postgres phrases it as
+    an ERROR with a LINE/caret excerpt, which reads like something broke."""
+    monkeypatch.setattr(
+        Host,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=1, stdout="", stderr=_NO_QUEUE_JOB_STDERR),
+    )
+
+    assert probes.job_groups("demo", None, Host()) == (None, "(queue_job is not installed on this database)")
+    assert probes.jobs_in_group("demo", "f", "started", None, Host()) == (
+        None,
+        "(queue_job is not installed on this database)",
+    )
+    assert probes.requeue_jobs("demo", None, Host()) == (0, "(queue_job is not installed on this database)")
+
+
+def test_any_other_jobs_error_is_still_quoted_verbatim(monkeypatch):
+    """Only the missing-module case is rephrased: every other failure is
+    rarer, and its exact text is the diagnosis."""
+    monkeypatch.setattr(
+        Host,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(
+            returncode=1, stdout="", stderr="psql: error: connection to server failed: FATAL:  too many clients\n"
+        ),
+    )
+
+    _rows, error = probes.job_groups("demo", None, Host())
+    assert "too many clients" in error

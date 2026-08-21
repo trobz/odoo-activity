@@ -1622,6 +1622,21 @@ _REQUEUE_SQL = (
 )
 
 
+# What postgres says when a database never installed queue_job:
+# `ERROR:  relation "queue_job" does not exist`, with psql's own
+# `psql:<stdin>:1:` prefix and a `LINE 1: ...^` excerpt after it. That is by
+# far the most common reason the Jobs tab has nothing to show -- most
+# databases don't run the module -- and as phrased it reads like something
+# broke. Every other psql error is passed through verbatim: those are rarer,
+# and their exact text is the diagnosis.
+_NO_QUEUE_JOB_RE = re.compile(r'relation "queue_job" does not exist')
+_NO_QUEUE_JOB = "(queue_job is not installed on this database)"
+
+
+def _job_error(error: str) -> str:
+    return _NO_QUEUE_JOB if _NO_QUEUE_JOB_RE.search(error) else error
+
+
 def job_groups(db: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> tuple[list[dict] | None, str]:
     """queue_job rows on `db` grouped by function and state, with the oldest
     creation date and the longest wait/run in each group.
@@ -1630,7 +1645,8 @@ def job_groups(db: str, port: str | PgTarget | None = None, host: Host = LOCAL) 
     but not what's stuck in it: `waiting`/`running` are what a job sitting in
     `started` for hours shows up as.
     """
-    return _psql_json(_JOB_GROUPS_SQL, db, {}, port, host)
+    rows, error = _psql_json(_JOB_GROUPS_SQL, db, {}, port, host)
+    return rows, _job_error(error)
 
 
 def jobs_in_group(
@@ -1639,7 +1655,8 @@ def jobs_in_group(
     """The individual jobs behind one `job_groups` row, oldest first (capped
     at 500 — a backed-up queue runs to tens of thousands, and the ones that
     explain it are the oldest)."""
-    return _psql_json(_JOBS_IN_GROUP_SQL, db, {"function": function, "state": state}, port, host)
+    rows, error = _psql_json(_JOBS_IN_GROUP_SQL, db, {"function": function, "state": state}, port, host)
+    return rows, _job_error(error)
 
 
 def requeue_jobs(db: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> tuple[int, str]:
@@ -1654,7 +1671,7 @@ def requeue_jobs(db: str, port: str | PgTarget | None = None, host: Host = LOCAL
     result = host.run(cmd, input_text=_REQUEUE_SQL)
 
     if result.returncode != 0:
-        return 0, result.stderr.strip() or f"psql exited {result.returncode}"
+        return 0, _job_error(result.stderr.strip()) or f"psql exited {result.returncode}"
 
     # psql echoes the tag ("UPDATE 8") for a statement that changed rows
     tag = result.stdout.strip().rpartition(" ")[2]
