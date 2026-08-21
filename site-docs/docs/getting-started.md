@@ -9,9 +9,9 @@ tags:
 # Getting Started
 
 A terminal UI for Odoo instances, on this machine or on a remote host over
-ssh. One screen: host cpu/mem/uptime, every Odoo instance (`systemd --user`
-or `supervisor`) with its databases nested underneath, and a detail pane for
-process/log/db inspection.
+ssh. One screen: host cpu/mem/uptime, every Odoo instance (`systemd --user`,
+`supervisor` or docker compose) with its databases nested underneath, and a
+detail pane for process/log/db inspection.
 
 ## Installation
 
@@ -39,9 +39,9 @@ oa openerp@somehost
 oa openerp@somehost -p 10113
 ```
 
-Discovers Odoo instances under `systemd --user`, `supervisor`, and odoo.sh
-(all three are merged), and needs the [`odoo-db`][odoo-db] CLI on `PATH`
-for the database category tabs. The Config tab additionally needs
+Discovers Odoo instances under `systemd --user`, `supervisor`, odoo.sh and
+docker compose (all are merged), and needs the [`odoo-db`][odoo-db] CLI on
+`PATH` for the database category tabs. The Config tab additionally needs
 [`odoo-config`][odoo-config] and [`odoo-addons-path`][odoo-addons-path] on
 `PATH`.
 

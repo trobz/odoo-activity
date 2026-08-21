@@ -1185,7 +1185,7 @@ def _params_setup(monkeypatch):
     monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     monkeypatch.setattr(tui, "databases_of", lambda *_: (["demo"], None))
-    monkeypatch.setattr(detail_mod, "db_port_of", lambda *_a, **_k: None)
+    monkeypatch.setattr(detail_mod, "pg_target_of", lambda *_a, **_k: probes.PgTarget())
 
     monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeOdooDbProc(_PARAMS_ROWS))
 
@@ -1330,7 +1330,7 @@ def _db_pilot(monkeypatch):
     monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     monkeypatch.setattr(tui, "databases_of", lambda *_: (["demo"], None))
-    monkeypatch.setattr(detail_mod, "db_port_of", lambda *_: None)
+    monkeypatch.setattr(detail_mod, "pg_target_of", lambda *_: probes.PgTarget())
 
 
 def test_jobs_tab_groups_by_function_then_drills_into_one_group(monkeypatch):
@@ -1502,8 +1502,9 @@ def test_requeue_clears_the_dates_that_say_a_job_is_running(monkeypatch):
     monkeypatch.setattr(
         Host,
         "run",
-        lambda _self, _cmd, input_text=None: sent.append(input_text)
-        or SimpleNamespace(returncode=0, stdout="UPDATE 3", stderr=""),
+        lambda _self, _cmd, input_text=None: (
+            sent.append(input_text) or SimpleNamespace(returncode=0, stdout="UPDATE 3", stderr="")
+        ),
     )
 
     assert probes.requeue_jobs("demo") == (3, "")
@@ -1916,5 +1917,85 @@ def test_down_waits_for_the_databases_still_being_fetched(monkeypatch):
             await pilot.press("down")
             await pilot.pause()
             assert not pane.query_one("#actabs", detail_mod.TabStrip).has_focus
+
+
+def test_a_kill_on_a_container_instance_is_sent_inside_it(monkeypatch):
+    """The pid on screen came out of the container's pid namespace, where
+    the master is 1 -- signalling `1` on the box would be an error at best
+    and init at worst, so the signal has to go back in through the same
+    door the pid came out of."""
+    instances = [
+        {
+            "name": "acme",
+            "status": "running",
+            "uptime": "0:01:00",
+            "manager": "docker",
+            "container": "acme-odoo-1",
+            "workdir": "/srv/acme",
+        }
+    ]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(tui, "databases_of", lambda *_: ([], None))
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(
+        detail_mod,
+        "instance_procs",
+        lambda *_: ([{"pid": "1", "ppid": "0", "user": "odoo", "mem": "1.0", "nice": "0", "cmd": "odoo"}], []),
+    )
+    monkeypatch.setattr(detail_mod, "proc_cpu_ticks_many", lambda *_: {})
+    signalled: list[tuple[str, int, object]] = []
+    monkeypatch.setattr(tui, "signal_process", lambda pid, sig, host: signalled.append((pid, sig, host)))
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Top")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", detail_mod.DataTable)
+            table.move_cursor(row=0)
+            await pilot.press("K")
+            await pilot.pause()
+            await pilot.click("#confirm-yes")
+            await _settle(pilot)
+
+            assert signalled == [("1", signal.SIGKILL, Host().in_container("acme-odoo-1"))]
+
+    asyncio.run(go())
+
+
+def test_the_logs_tab_streams_docker_logs_for_a_container_instance(monkeypatch):
+    """A container has no logfile at all, so the Logs tab can't key off one:
+    it takes a snapshot and follows a stream instead, and "no path" stops
+    meaning "(no logfile configured)"."""
+    instances = [
+        {
+            "name": "acme",
+            "status": "running",
+            "uptime": "0:01:00",
+            "manager": "docker",
+            "container": "acme-odoo-1",
+            "workdir": "/srv/acme",
+        }
+    ]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(tui, "databases_of", lambda *_: ([], None))
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(detail_mod, "logfile_of", lambda *_: None)
+    monkeypatch.setattr(detail_mod, "log_snapshot", lambda *_a, **_k: "INFO devel odoo: ready\n")
+    followed: list[object] = []
+    monkeypatch.setattr(detail_mod, "log_stream", lambda inst, host: followed.append(inst["container"]) or None)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs")
+            await _settle(pilot)
+
+            body = pane.query_one("#acbody", detail_mod.RichLog)
+            assert [line.text for line in body.lines if line.text] == ["INFO devel odoo: ready"]
+            assert followed == ["acme-odoo-1"]
 
     asyncio.run(go())

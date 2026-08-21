@@ -25,6 +25,7 @@ from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
     Instance,
+    container_host,
     databases_of,
     dump_and_parse_stacks,
     format_duration,
@@ -730,13 +731,20 @@ class OdooActivity(App):
         # the re-label below, so the confirmation reads as not having registered
         self.app.notify(f"{action} {name}…", timeout=2)
 
-        error = await to_thread(instance_action, name, action, manager, self.host)
+        error = await to_thread(instance_action, name, action, manager, self.host, inst.get("workdir"))
         if error:
             self.app.notify(error, severity="warning", timeout=3)
         else:
             self.app.notify(f"{action} {name}: done", timeout=2)
 
         self.poll_instances()  # re-label in place; keeps selection, no flicker
+
+    def process_host(self) -> Host:
+        """`self.host`, narrowed to the highlighted instance's container
+        when it has one: a pid only means anything in the namespace it was
+        read from, and for docker that's the container's, not the box's."""
+        inst = self.current_instance()
+        return self.host if inst is None else container_host(inst, self.host)
 
     def action_kill_process(self) -> None:
         pane = self.query_one(ActivityPane)
@@ -756,7 +764,9 @@ class OdooActivity(App):
             if not confirmed:
                 return
 
-            await to_thread(signal_process, proc["pid"], signal.SIGKILL, self.host)
+            # the pid came out of the instance's own namespace, so the
+            # signal has to go back into it (see Host.in_container)
+            await to_thread(signal_process, proc["pid"], signal.SIGKILL, self.process_host())
             # Processes only, and deliberately: it is a snapshot taken when
             # the tab was opened, so the pid just killed would sit there
             # until reopened. Top re-polls every tick on its own, and
@@ -779,7 +789,7 @@ class OdooActivity(App):
         if proc is None or proc.get("kind") == "pg":
             return
 
-        await to_thread(signal_process, proc["pid"], signal.SIGQUIT, self.host)
+        await to_thread(signal_process, proc["pid"], signal.SIGQUIT, self.process_host())
         pane = self.query_one(ActivityPane)
         pane.select_tab_by_name("Stacks")
         pane.focus_active()

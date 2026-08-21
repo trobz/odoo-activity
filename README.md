@@ -1,9 +1,9 @@
 # odoo-activity
 
 A terminal UI for Odoo instances, on this machine or on a remote host over
-ssh. One screen: host cpu/mem/uptime, every Odoo instance (`systemd --user`
-or `supervisor`) with its databases nested underneath, and a detail pane for
-process/log/db inspection.
+ssh. One screen: host cpu/mem/uptime, every Odoo instance (`systemd --user`,
+`supervisor` or docker compose) with its databases nested underneath, and a
+detail pane for process/log/db inspection.
 
 Full docs: <https://trobz.github.io/odoo-activity>
 
@@ -225,7 +225,7 @@ network server instead.
 
 ## Managers
 
-An instance's `manager` — `systemd`, `supervisor`, or `odoosh` — is
+An instance's `manager` — `systemd`, `supervisor`, `odoosh` or `docker` — is
 discovered per instance, not configured, and decides which controller
 process/log/start-stop-restart lookups route through:
 
@@ -239,6 +239,33 @@ process/log/start-stop-restart lookups route through:
   isn't supported (odoo.sh handles sleep/wake on its own); restart goes
   through `odoosh-restart`, needed on `PATH` — which ships pre-installed on
   odoo.sh hosts.
+- **`docker`** — a docker compose project running Odoo, doodba-shaped or
+  not. One project is one instance (the odoo container and its postgres are
+  two halves of the same thing), named after the project; a project running
+  several odoo services shows one row each, as `<project>/<service>`.
+  Stopped projects are listed too, so `s` can start them.
+
+  Everything is probed **inside** the odoo container — `ps`, the config
+  file, signals — because that is where the instance's pids, paths and
+  logs actually are. The database tabs reach postgres over the compose
+  network, using the address of the db container and the credentials from
+  the container's own `odoo.conf`, so nothing has to be published to the
+  host. Logs come from `docker logs` (an odoo image writes to stdout, not
+  to a logfile). Start/stop/restart go through the project's own
+  `invoke start|restart` when it has a `tasks.py` — doodba's, which is what
+  a developer already drives it with — and fall back to `docker compose`
+  otherwise. Stopping always uses `docker compose stop`: doodba's own
+  `invoke stop` is `docker compose down`, which deletes the containers, and
+  the instance would then vanish from the list instead of reading
+  `stopped`, with nothing left to start it from.
+
+  **Limitation: Linux only.** Everything above assumes the docker daemon
+  runs on the same kernel as the box odoo-activity is probing, which is
+  true on Linux and on a remote Linux server over ssh. On Docker Desktop
+  (macOS/Windows) the containers live inside a VM: `docker ps` still
+  answers, but the compose network isn't routable from the host, so the
+  database tabs won't connect. Fixing that means publishing the db port
+  and reading it back from `docker port` — not implemented yet.
 
 ### Config tab modes
 
@@ -303,17 +330,20 @@ in database mode).
 
 ### Data sources
 
-- **Instances** — `systemctl --user list-units` and `supervisorctl status`,
-  merged by name.
+- **Instances** — `systemctl --user list-units`, `supervisorctl status` and
+  `docker ps` (compose labels), merged by name.
 - **Databases** — each instance's `<workdir>/config/{odoo.conf,server.conf}`
   gives a db role (or `ODOO_ACTIVITY_DB_ROLE`); `psql` lists the databases owned
-  by that role.
+  by that role. A container's config names its own role, address and
+  password instead, and `ODOO_ACTIVITY_DB_ROLE` (a convention of *this*
+  box's cluster) deliberately doesn't apply to it.
 - **Top** — the manager gives the instance's master pid (`systemctl ...
   -p MainPID` / `supervisorctl pid`); `ps -eo pid,ppid,user,%mem,args` is then
   walked down the ppid tree from there to find every worker.
 - **Logs** — the same config gives `logfile`, tailed by reading backward in
   fixed-size chunks from the end so a multi-GB file costs a few reads, not a
-  full scan.
+  full scan. A container has no logfile: `docker logs` gives the snapshot and
+  `docker logs -f` the stream.
 - **Config** — read-only: `odoo-config {compact,explain,expand,clean}` is run
   against the instance's config file and its plain-text stdout is shown as-is;
   the version passed to it comes from `odoo-addons-path <workdir> --verbose
