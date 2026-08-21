@@ -1,5 +1,7 @@
+import configparser
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyperclip
 
@@ -8,6 +10,14 @@ from odoo_activity.host import Host
 from odoo_activity.probes import Instance
 
 _INSTANCE: Instance = {"name": "demo", "status": "running", "uptime": "0:01:00", "manager": "systemd"}
+
+
+def _parser(options: dict[str, str]) -> configparser.RawConfigParser:
+    parser = configparser.RawConfigParser()
+    parser.add_section("options")
+    for key, value in options.items():
+        parser.set("options", key, value)
+    return parser
 
 
 def _fake_procs(cmd):
@@ -169,3 +179,182 @@ def test_start_odoo_db_asks_for_every_row_only_when_told(monkeypatch):
     # a command with no such flag must never be handed it
     probes.start_odoo_db("locks", "demo", include_inactive=True)
     assert "--all" not in seen[-1]
+
+
+# --- docker ---------------------------------------------------------------
+
+_DOCKER_INSTANCE: Instance = {
+    "name": "acme",
+    "status": "running",
+    "uptime": "0:01:00",
+    "manager": "docker",
+    "container": "acme-odoo-1",
+    "db_container": "acme-db-1",
+    "workdir": "/srv/acme",
+    "command": "/opt/odoo/common/entrypoint odoo --workers=2",
+}
+
+
+def _recorder(monkeypatch, stdout="", returncode=0):
+    """Record every argv a Host runs, answering all of them the same way."""
+    calls: list[list[str]] = []
+
+    def fake_run(self, argv, input_text=None):
+        calls.append(argv)
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(Host, "run", fake_run)
+    return calls
+
+
+def test_container_host_wraps_argv_and_stops_being_local():
+    """`is_local` is what every probe branches on to decide "act directly":
+    read a file, signal a pid. None of that is true across a container
+    boundary, so a container host is never local -- and over ssh the two
+    wrappers nest, docker inside the remote shell."""
+    local = Host().in_container("acme-odoo-1")
+    assert local.is_local is False
+    assert local._argv(["ps", "-eo", "pid"]) == ["docker", "exec", "acme-odoo-1", "ps", "-eo", "pid"]
+
+    remote = Host(alias="server").in_container("acme-odoo-1")
+    assert remote._argv(["kill", "-3", "1"])[:3] == ["ssh", "-o", "BatchMode=yes"]
+    assert remote._argv(["kill", "-3", "1"])[-1] == "docker exec acme-odoo-1 kill -3 1"
+
+    assert local.on_box.container is None
+    assert Host().in_container(None) == Host()  # nothing to narrow, nothing changes
+
+
+def test_container_shell_invocation_is_interactive():
+    """`_argv`'s exec is for probes (no tty); the command a user pastes is
+    the opposite -- it has to land them in a shell."""
+    cmd = Host().in_container("acme-odoo-1").shell_invocation("odoo shell --no-http")
+    assert cmd == "docker exec -it acme-odoo-1 sh -lc 'odoo shell --no-http'"
+
+
+def test_pg_target_carries_a_containers_connection_settings():
+    """A port is enough for a cluster on this box; a container's postgres
+    needs an address and credentials too, and they ride as libpq env vars so
+    the same argv works over ssh."""
+    assert probes.PgTarget.of("5434").env_prefix == ["env", "PGPORT=5434"]
+    assert probes.PgTarget.of(None).env_prefix == []
+    assert probes.PgTarget.of(probes.PgTarget(port="5432")) == probes.PgTarget(port="5432")
+
+    target = probes.PgTarget(host="172.20.0.3", port="5432", user="odoo", password="s3cret")  # noqa: S106 -- fixture
+    assert target.psql("-d", "devel") == [
+        "env",
+        "PGHOST=172.20.0.3",
+        "PGPORT=5432",
+        "PGUSER=odoo",
+        "PGPASSWORD=s3cret",
+        "psql",
+        "-w",
+        "-d",
+        "devel",
+    ]
+
+
+def test_pg_target_of_a_container_reads_the_config_odoo_itself_connects_with(monkeypatch):
+    """The TUI reaches the database the same way the instance does: the
+    role and password out of the container's own odoo.conf, the address off
+    the compose network (postgres is normally not published to the box)."""
+    monkeypatch.setattr(probes, "_container_ip", lambda *_a, **_k: "172.20.0.3")
+    monkeypatch.setattr(
+        probes,
+        "instance_config",
+        lambda *_: (Path("/opt/odoo"), _parser({"db_port": "5432", "db_user": "odoo", "db_password": "odoopassword"})),
+    )
+
+    assert probes.pg_target_of(_DOCKER_INSTANCE, Host()) == probes.PgTarget(
+        host="172.20.0.3",
+        port="5432",
+        user="odoo",
+        password="odoopassword",  # noqa: S106 -- fixture, not a real credential
+    )
+
+
+def test_container_databases_ignore_the_boxs_db_role_convention(monkeypatch):
+    """ODOO_ACTIVITY_DB_ROLE describes *this box's* cluster (locally every
+    db is owned by `openerp`). A container's cluster is its own, and the
+    role odoo connects as is in its config -- so the override deliberately
+    doesn't reach here, or a container would be listed with the box's
+    databases."""
+    monkeypatch.setattr(probes, "DB_ROLE", "openerp")
+    monkeypatch.setattr(probes, "pg_target_of", lambda *_: probes.PgTarget(host="172.20.0.3", port="5432", user="odoo"))
+    asked: list[str] = []
+    monkeypatch.setattr(probes, "databases_by_role", lambda role, *_a, **_k: asked.append(role) or ["devel", "e2e"])
+
+    assert probes.databases_of(_DOCKER_INSTANCE, Host()) == (["devel", "e2e"], "5432")
+    assert asked == ["odoo"]
+
+
+def test_container_config_is_read_from_the_image_not_a_workdir(monkeypatch):
+    """There is no `<workdir>/config/` convention inside an image: doodba
+    renders one path, the official image ships another, and anything else
+    names it on the command line."""
+    monkeypatch.setattr(Host, "is_file", lambda self, path: str(path) == "/opt/odoo/auto/odoo.conf")
+
+    assert probes.configfile_of(_DOCKER_INSTANCE, Host()) == Path("/opt/odoo/auto/odoo.conf")
+
+    monkeypatch.setattr(Host, "is_file", lambda self, path: False)
+    assert probes.configfile_of(_DOCKER_INSTANCE, Host()) is None
+
+
+def test_container_logs_come_from_docker_not_a_file(monkeypatch):
+    """Odoo in a container writes to stdout and docker keeps the stream, so
+    `logfile_of` returning None can't mean "no log" for this manager."""
+    calls = _recorder(monkeypatch, stdout="hello\r\n")
+
+    assert probes.log_snapshot(_DOCKER_INSTANCE, Host(), lines=5) == "hello\n"
+    assert calls == [["docker", "logs", "--tail", "5", "acme-odoo-1"]]
+
+
+def test_container_log_lines_lose_the_tty_carriage_returns():
+    """docker allocates a pty when the service asks for one (doodba does),
+    which turns every newline into CRLF -- and a trailing CR stops
+    `_DUMP_HEADER_RE` matching, so a stack dump parses as zero workers."""
+    header = "2026-08-21 04:26:08,140 1 INFO devel odoo.tools.misc: \r\n"
+    assert not probes._DUMP_HEADER_RE.search(header)
+    assert probes._DUMP_HEADER_RE.search(probes._untty(header))
+
+
+def test_container_action_prefers_invoke_then_falls_back_to_compose(monkeypatch):
+    """doodba ships a tasks.py with start/stop/restart and that's what a
+    developer drives the project with, so it's what we drive too -- plain
+    compose when the project has no tasks (or the box has no invoke)."""
+    calls = _recorder(monkeypatch)
+    monkeypatch.setattr(Host, "is_file", lambda self, path: str(path) == "/srv/acme/tasks.py")
+
+    assert probes.instance_action("acme", "restart", "docker", Host(), "/srv/acme") == ""
+    assert calls == [["invoke", "-r", "/srv/acme", "restart"]]
+
+    calls.clear()
+    monkeypatch.setattr(Host, "is_file", lambda self, path: False)
+    assert probes.instance_action("acme", "stop", "docker", Host(), "/srv/acme") == ""
+    assert calls == [["docker", "compose", "--project-directory", "/srv/acme", "stop"]]
+
+
+def test_container_action_falls_through_to_compose_when_invoke_fails(monkeypatch):
+    """A tasks.py that doesn't define the task (or an invoke that isn't
+    installed) must not leave the instance unstartable -- compose can do it
+    either way. The error only surfaces if both refuse."""
+    monkeypatch.setattr(Host, "is_file", lambda self, path: True)
+    calls: list[list[str]] = []
+
+    def fake_run(self, argv, input_text=None):
+        calls.append(argv)
+        if argv[0] == "invoke":
+            return SimpleNamespace(returncode=1, stdout="", stderr="No idea what 'start' is!")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(Host, "run", fake_run)
+
+    assert probes.instance_action("acme", "start", "docker", Host(), "/srv/acme") == ""
+    assert [c[0] for c in calls] == ["invoke", "docker"]
+
+
+def test_container_action_without_a_project_directory_says_so(monkeypatch):
+    """compose acts on a directory, not on a name: a row that lost its
+    project label has nothing to act on, and saying so beats a confusing
+    `docker compose` error from the wrong cwd."""
+    _recorder(monkeypatch)
+    assert "nothing to act on" in probes.instance_action("acme", "restart", "docker", Host(), None)

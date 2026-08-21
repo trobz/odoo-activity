@@ -148,7 +148,7 @@ def _odooly_pilot(monkeypatch, envs):
     monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     monkeypatch.setattr(tui, "databases_of", lambda *_: (["demo_db"], None))
-    monkeypatch.setattr(detail_mod, "db_port_of", lambda *_a, **_k: None)
+    monkeypatch.setattr(detail_mod, "pg_target_of", lambda *_a, **_k: probes.PgTarget())
     monkeypatch.setattr(tui, "read_odooly_envs", lambda *_: envs)
 
 
