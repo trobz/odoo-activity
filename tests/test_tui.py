@@ -28,6 +28,626 @@ def test_parse_odoo_db_output_wraps_a_single_json_object():
     assert rows == [{"db": "demo"}]
 
 
+def test_mail_server_creds_cell_masked_shows_set():
+    from odoo_activity.panes.mail import _mail_server_creds_cell
+
+    assert _mail_server_creds_cell("********", "********") == "set"
+    assert _mail_server_creds_cell("********", None) == "set"
+
+
+def test_mail_server_creds_cell_revealed_shows_real_values():
+    from odoo_activity.panes.mail import _mail_server_creds_cell
+
+    assert _mail_server_creds_cell("svc@acme.com", "s3cr3t") == "svc@acme.com/s3cr3t"
+    assert _mail_server_creds_cell("svc@acme.com", None) == "svc@acme.com"
+    assert _mail_server_creds_cell(None, None) == ""
+
+
+def test_render_mail_writes_one_table_per_nonempty_section():
+    """odoo-db's `mail` command answers one nested object -- each section
+    its own list, with its own columns -- rather than the flat row list
+    every other db-tab command returns. render_mail (not the generic table
+    renderer) turns that into one Rich Table per non-empty section, so the
+    TUI reads the same way the CLI's own text output does; a `section`
+    column mashing everything into one table (the earlier design) read as
+    mostly blank cells on a real host."""
+    from rich.console import Group
+    from rich.table import Table
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "config_parameters": [{"key": "mail.catchall.domain", "value": "example.com", "explanation": ""}],
+        "alias_domains": None,
+        "addresses": [{"partner_id": 1, "label": "Company", "email": "a@example.com", "is_default": False}],
+        "mail_servers": [],
+        "modules": [{"name": "mass_mailing", "state": "installed"}],
+    }
+
+    class _FakeBody:
+        def __init__(self):
+            self.written = None
+
+        def clear(self):
+            self.written = None
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    assert isinstance(body.written, Group)
+    renderables = list(body.written.renderables)
+    # config_parameters, addresses, mail_servers ("(none defined...)" text), modules --
+    # alias_domains is None (pre-Odoo 17) so it contributes nothing at all.
+    titles = [r.title for r in renderables if isinstance(r, Table)]
+    assert titles == ["Config parameters", "Relevant addresses", "Relevant modules"]
+
+
+def test_render_mail_alias_domain_missing_reads_as_normal_on_a_clean_install():
+    """alias_domain_id IS NULL alone is the documented state of a clean
+    17+ install (mail installed, nothing to migrate) -- not a
+    misconfiguration, so this must not read as an alarm: it flags nearly
+    every real database otherwise."""
+    from rich.table import Table
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "is_legacy_mail_config_configured": False,
+        "alias_domains": [
+            {
+                "company_id": 1,
+                "company_name": "Acme",
+                "alias_domain_id": None,
+                "alias_domain": None,
+                "bounce_email": None,
+                "catchall_email": None,
+                "default_from_email": None,
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    tables = [r for r in list(body.written.renderables) if isinstance(r, Table)]
+    alias_table = next(t for t in tables if t.title == "Alias domains (Odoo 17+, authoritative)")
+    cell = str(next(iter(alias_table.columns[1].cells)))
+    assert cell == "(not set -- normal for a clean 17+ install)"
+    assert "stuck" not in cell.lower()
+
+
+def test_render_mail_alias_domain_missing_warns_when_legacy_config_survives():
+    """The genuinely broken case: a leftover pre-17 ICP value means the
+    v16-to-17 alias-domain migration never ran (or failed)."""
+    from rich.table import Table
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "is_legacy_mail_config_configured": True,
+        "alias_domains": [
+            {
+                "company_id": 1,
+                "company_name": "Acme",
+                "alias_domain_id": None,
+                "alias_domain": None,
+                "bounce_email": None,
+                "catchall_email": None,
+                "default_from_email": None,
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    tables = [r for r in list(body.written.renderables) if isinstance(r, Table)]
+    alias_table = next(t for t in tables if t.title == "Alias domains (Odoo 17+, authoritative)")
+    cell = str(next(iter(alias_table.columns[1].cells)))
+    assert "stuck v16-to-17 migration" in cell
+
+
+def test_render_mail_tolerates_a_host_whose_odoo_db_predates_is_legacy_mail_config_configured():
+    """Same graceful-degradation convention as is_test_catcher: an older
+    odoo-db's bundle simply lacks this key, and must not crash."""
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "alias_domains": [
+            {
+                "company_id": 1,
+                "company_name": "Acme",
+                "alias_domain_id": None,
+                "alias_domain": None,
+                "bounce_email": None,
+                "catchall_email": None,
+                "default_from_email": None,
+            }
+        ],
+        # no "is_legacy_mail_config_configured" key -- an older odoo-db's shape
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type] -- must not raise KeyError
+
+
+def test_render_mail_of_an_empty_bundle_shows_the_no_server_placeholder():
+    """An empty/missing bundle still shows one thing: the mail_servers
+    section always contributes something (a table or this placeholder),
+    so the group is never actually empty."""
+    from rich.console import Group
+    from rich.text import Text
+
+    from odoo_activity.panes.mail import render_mail
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, {})  # ty: ignore[invalid-argument-type]
+
+    assert isinstance(body.written, Group)
+    renderables = list(body.written.renderables)
+    assert len(renderables) == 1
+    assert isinstance(renderables[0], Text)
+    assert str(renderables[0]) == "Outgoing mail servers: (none defined -- odoo will use localhost:25)"
+
+
+def test_render_mail_flags_a_test_catcher_server_with_an_explicit_warning():
+    """A test-mail catcher (mailhog, ...) accepts mail and Odoo marks it
+    sent -- indistinguishable from a working relay anywhere else, so this
+    tab is the one place that spells out why a real send never arrives
+    (odoo-db's own `is_test_catcher` flag, see get_mail_servers)."""
+    from rich.table import Table
+    from rich.text import Text
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "mail_servers": [
+            {
+                "sequence": 10,
+                "name": "mailhog",
+                "smtp_host": "mailhog-acme18-staging",
+                "smtp_port": 2025,
+                "smtp_user": None,
+                "smtp_pass": None,
+                "smtp_encryption": "none",
+                "smtp_authentication": "login",
+                "from_filter": None,
+                "active": True,
+                "is_test_catcher": True,
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    renderables = list(body.written.renderables)
+    assert isinstance(renderables[0], Table)
+    assert next(iter(renderables[0].columns[1].cells)) == "mailhog"
+    assert [c.header for c in renderables[0].columns] == [
+        "seq",
+        "name",
+        "host:port",
+        "creds",
+        "encryption/auth",
+        "from_filter",
+        "active",
+    ]
+    assert isinstance(renderables[1], Text)
+    assert "mailhog" in str(renderables[1])  # names the offending server, not just "server(s) above"
+    assert "test-mail catcher" in str(renderables[1])
+    assert "never relay it anywhere real" in str(renderables[1])
+    assert renderables[1].style == "bold red"
+
+
+def test_mail_servers_table_folds_token_shaped_columns_instead_of_truncating_them():
+    """host:port and creds hold single unbreakable tokens -- rich's default
+    ellipsis overflow drops characters off a hostname as soon as the pane is
+    narrow (smtp.sendg... vs smtp.sendgrid.net.evil.example is exactly the
+    distinction this tab exists to preserve), reproduced live at a 120-column
+    terminal. name stays on ellipsis: it has spaces to wrap on, so folding
+    it mid-word would only make it uglier for no benefit."""
+    from rich.table import Table
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "mail_servers": [
+            {
+                "sequence": 1,
+                "name": "Production relay",
+                "smtp_host": "smtp.sendgrid.net",
+                "smtp_port": 587,
+                "smtp_user": None,
+                "smtp_pass": None,
+                "smtp_encryption": "starttls",
+                "smtp_authentication": "login",
+                "from_filter": None,
+                "active": True,
+                "is_test_catcher": False,
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    table = next(r for r in list(body.written.renderables) if isinstance(r, Table))
+    overflow_by_header = {c.header: c.overflow for c in table.columns}
+    assert overflow_by_header["host:port"] == "fold"
+    assert overflow_by_header["creds"] == "fold"
+    assert overflow_by_header["name"] == "ellipsis"
+    assert overflow_by_header["from_filter"] == "ellipsis"
+
+
+def test_render_mail_flags_a_known_production_relay_positively():
+    """The positive counterpart to is_test_catcher: not being flagged as a
+    test catcher is an absence, not a confirmation -- known_production_relay
+    (odoo-db's own flag, matched on host+port against Google/M365) is a real
+    "yes, this is a real managed relay" signal, shown in green rather than
+    the test-catcher's red warning."""
+    from rich.table import Table
+    from rich.text import Text
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "mail_servers": [
+            {
+                "sequence": 1,
+                "name": "Primary",
+                "smtp_host": "smtp-relay.gmail.com",
+                "smtp_port": 587,
+                "smtp_user": None,
+                "smtp_pass": None,
+                "smtp_encryption": "starttls",
+                "smtp_authentication": "login",
+                "from_filter": None,
+                "active": True,
+                "is_test_catcher": False,
+                "known_production_relay": "Google Workspace SMTP relay",
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    renderables = list(body.written.renderables)
+    assert isinstance(renderables[0], Table)
+    assert next(iter(renderables[0].columns[1].cells)) == "Primary"
+    assert isinstance(renderables[1], Text)
+    assert "KNOWN RELAY" in str(renderables[1])
+    assert "Google Workspace SMTP relay" in str(renderables[1])
+    assert renderables[1].style == "bold green"
+
+
+def test_render_mail_has_no_warning_when_no_server_is_a_test_catcher():
+    from rich.text import Text
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "mail_servers": [
+            {
+                "sequence": 1,
+                "name": "Real Relay",
+                "smtp_host": "smtp.sendgrid.net",
+                "smtp_port": 587,
+                "smtp_user": None,
+                "smtp_pass": None,
+                "smtp_encryption": "starttls",
+                "smtp_authentication": "login",
+                "from_filter": None,
+                "active": True,
+                "is_test_catcher": False,
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    renderables = list(body.written.renderables)
+    assert not any(isinstance(r, Text) and "TEST CATCHER" in str(r) for r in renderables)
+
+
+def test_render_mail_leads_with_a_neutralization_banner_when_is_neutralized():
+    """database.is_neutralized (set on every odoo.sh staging build) is the
+    single most common reason mail never leaves an Odoo database -- surfaced
+    as the very first renderable so a reader doesn't have to piece it
+    together from an inactive relay and an unfamiliar stub row."""
+    from rich.table import Table
+    from rich.text import Text
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {"is_neutralized": True, "mail_servers": []}
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    renderables = list(body.written.renderables)
+    assert isinstance(renderables[0], Text)
+    assert "NEUTRALIZED" in str(renderables[0])
+    assert renderables[0].style == "bold red"
+    # mail_servers=[] still contributes its own placeholder right after.
+    assert isinstance(renderables[1], Text)
+    assert "none defined" in str(renderables[1])
+    assert not any(isinstance(r, Table) for r in renderables)
+
+
+def test_render_mail_has_no_neutralization_banner_when_not_neutralized():
+    from rich.text import Text
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {"is_neutralized": False, "mail_servers": []}
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    renderables = list(body.written.renderables)
+    assert not any(isinstance(r, Text) and "NEUTRALIZED" in str(r) for r in renderables)
+
+
+def test_render_mail_flags_the_neutralization_stub_server_with_a_summary_line():
+    """base/data/neutralize.sql inserts exactly this (name, host) row after
+    disabling every pre-existing relay -- flagged so it isn't mistaken for a
+    real, working server, and so the *other*, now-inactive row isn't
+    mistaken for a broken one."""
+    from rich.table import Table
+    from rich.text import Text
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "is_neutralized": True,
+        "mail_servers": [
+            {
+                "sequence": None,
+                "name": "neutralization - disable emails",
+                "smtp_host": "invalid",
+                "smtp_port": 1025,
+                "smtp_user": None,
+                "smtp_pass": None,
+                "smtp_encryption": "none",
+                "smtp_authentication": "login",
+                "from_filter": None,
+                "active": True,
+                "is_test_catcher": False,
+                "known_production_relay": None,
+                "is_neutralization_stub": True,
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    renderables = list(body.written.renderables)
+    assert isinstance(renderables[0], Text)
+    assert "NEUTRALIZED" in str(renderables[0])
+    assert isinstance(renderables[1], Table)
+    stub_lines = [r for r in renderables if isinstance(r, Text) and "NEUTRALIZATION STUB" in str(r)]
+    assert len(stub_lines) == 1
+    assert stub_lines[0].style == "bold yellow"
+
+
+def test_render_mail_tolerates_a_host_whose_odoo_db_predates_is_neutralization_stub():
+    """Same graceful-degradation convention as is_test_catcher: an older
+    odoo-db's mail_servers rows simply lack this key, and must not crash."""
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "mail_servers": [
+            {
+                "sequence": 1,
+                "name": "Primary",
+                "smtp_host": "smtp.example.com",
+                "smtp_port": 587,
+                "smtp_user": None,
+                "smtp_pass": None,
+                "smtp_encryption": "starttls",
+                "smtp_authentication": "login",
+                "from_filter": None,
+                "active": True,
+                # no "is_neutralization_stub" key -- an older odoo-db's shape
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type] -- must not raise KeyError
+
+
+def test_render_mail_shows_record_missing_instead_of_dropping_the_row():
+    """odoo-db's get_mail_addresses now emits a row with missing: True
+    (xmlid unresolved or dangling) rather than silently dropping it --
+    "not listed" must not read as "no admin problem"."""
+    from rich.table import Table
+
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "addresses": [
+            {"partner_id": None, "label": "Admin Email", "email": None, "is_default": False, "missing": True},
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type]
+
+    tables = [r for r in list(body.written.renderables) if isinstance(r, Table)]
+    addr_table = next(t for t in tables if t.title == "Relevant addresses")
+    assert str(next(iter(addr_table.columns[0].cells))) == ""
+    assert str(next(iter(addr_table.columns[2].cells))) == "(record missing)"
+
+
+def test_render_mail_tolerates_a_host_whose_odoo_db_predates_missing_addresses():
+    """Same graceful-degradation convention as is_test_catcher: an older
+    odoo-db's addresses rows simply lack this key, and must not crash."""
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "addresses": [
+            {"partner_id": 1, "label": "Company Email", "email": "a@example.com", "is_default": False},
+            # no "missing" key -- an older odoo-db's shape
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type] -- must not raise KeyError
+
+
+def test_render_mail_tolerates_a_host_whose_odoo_db_predates_is_test_catcher():
+    """Caught live against a real host still running an older odoo-db: its
+    mail_servers rows have no `is_test_catcher` key at all, and a hard
+    `m["is_test_catcher"]` index crashed the whole tab (KeyError) instead of
+    just not flagging anything -- same graceful-degradation convention the
+    --all flag uses for an old host elsewhere in this app."""
+    from odoo_activity.panes.mail import render_mail
+
+    audit = {
+        "mail_servers": [
+            {
+                "sequence": 1,
+                "name": "mailhog",
+                "smtp_host": "mailhog-acme18-staging",
+                "smtp_port": 2025,
+                "smtp_user": None,
+                "smtp_pass": None,
+                "smtp_encryption": "none",
+                "smtp_authentication": "login",
+                "from_filter": None,
+                "active": True,
+                # no "is_test_catcher" key -- an older odoo-db's shape
+            }
+        ],
+    }
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_mail(body, audit)  # ty: ignore[invalid-argument-type] -- must not raise KeyError
+
+
+def test_stringify_none_is_blank_not_the_literal_word():
+    """Caught live against a real host: Mail's config_parameters rows for an
+    unset key carry value: None, and str(None) rendered as the literal text
+    "None" in the cell before this -- every field a row genuinely has but
+    left unset should read blank instead."""
+    assert probes.stringify(None) == ""
+    assert probes.stringify(0) == "0"  # falsy but not None -- must stay visible
+    assert probes.stringify(False) == "False"
+
+
 def test_proc_cpu_ticks_many_batches_a_remote_host_into_one_call(monkeypatch):
     # regression: this used to be one ssh round trip per pid (proc_cpu_ticks
     # in a loop) -- slow enough with more than a couple of top that
@@ -394,6 +1014,119 @@ def test_selected_process_follows_the_filtered_table(monkeypatch):
     asyncio.run(go())
 
 
+_MAIL_AUDIT = {
+    "config_parameters": [{"key": "mail.catchall.domain", "value": "example.com", "explanation": ""}],
+    "alias_domains": None,
+    "addresses": [{"partner_id": 1, "label": "Company", "email": "info@example.com", "is_default": False}],
+    "mail_servers": [],
+    "modules": [],
+}
+
+
+def test_mail_tab_renders_via_the_log_body_and_shows_only_check_port_25_without_odooly(monkeypatch):
+    """The Mail tab's fetch has to unwrap odoo-db's nested audit object and
+    hand it to render_mail (see panes/mail.py), which writes it into the
+    RichLog body rather than the generic table renderer -- the DataTable
+    stays hidden, and `_dbtab.rows` stays empty so a leftover `/` search
+    from a prior tab can't clobber it (see _show_datatable's early return).
+    Check port 25 is a plain network probe, not an authenticated Odoo
+    action, so it shows regardless of odooly; Send test mail only shows up
+    once odooly can reach this database -- unmatched here (see
+    test_odooly.py for the matched case)."""
+    _params_setup(monkeypatch)  # instance/db plumbing only; overridden below
+    monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeOdooDbProc(_MAIL_AUDIT))
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("down")
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Mail")
+            await pilot.pause()
+            await _settle(pilot)
+
+            assert pane._dbtab.rows == []
+            assert pilot.app.query_one("#acbody", detail_mod.RichLog).display is True
+            assert pilot.app.query_one("#actable", DataTable).display is False
+            assert pane.query_one("#acactions", detail_mod.Horizontal).display is True
+            assert pilot.app.query_one("#check-port-25", detail_mod.Button)
+            assert list(pane.query(f"#{detail_mod._SEND_TEST_MAIL_ACTION[0]}")) == []
+
+    asyncio.run(go())
+
+
+def test_check_port_25_button_runs_nc_with_a_scan_and_a_short_timeout(monkeypatch):
+    """-z (scan, no data exchange) plus a short timeout: without them, a
+    successful connection to an *open* port would leave `nc` sitting there
+    waiting for input, and this action hung with no result ever shown --
+    worse than the failure case it exists to diagnose."""
+    _params_setup(monkeypatch)
+    monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeOdooDbProc(_MAIL_AUDIT))
+
+    calls = []
+
+    def fake_run(_self, argv, input_text=None):
+        # The running app also polls instance status (systemctl, ...) through
+        # Host.run in the background -- only nc is this test's concern.
+        if argv[0] == "nc":
+            calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(Host, "run", fake_run)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("down")
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Mail")
+            await pilot.pause()
+            await _settle(pilot)
+
+            pane.query_one("#check-port-25", detail_mod.Button).press()
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+    asyncio.run(go())
+
+    assert calls == [["nc", "-z", "-w", "3", "localhost", "25"]]
+
+
+def test_check_port_25_button_tolerates_nc_missing_from_path(monkeypatch):
+    """Same graceful-degradation convention the rest of this app uses for a
+    missing binary -- must not crash the worker."""
+    _params_setup(monkeypatch)
+    monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeOdooDbProc(_MAIL_AUDIT))
+
+    def fake_run(_self, argv, input_text=None):
+        if argv[0] == "nc":
+            raise FileNotFoundError
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(Host, "run", fake_run)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("down")
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Mail")
+            await pilot.pause()
+            await _settle(pilot)
+
+            pane.query_one("#check-port-25", detail_mod.Button).press()
+            await pilot.app.workers.wait_for_complete()  # must not raise
+            await pilot.pause()
+
+    asyncio.run(go())
+
+
 def test_leaving_a_late_db_tab_for_an_instance_row(monkeypatch):
     # regression guard: database mode has more tabs than instance mode, so
     # navigating off one of the extra ones (Crons) back up to an instance row
@@ -431,10 +1164,12 @@ _PARAMS_ROWS = [
 
 class _FakeOdooDbProc:
     """Stands in for the odoo-db subprocess.Popen `start_odoo_db` returns --
-    `_fetch_db_tab` only ever calls .communicate()/.kill() on it."""
+    `_fetch_db_tab` only ever calls .communicate()/.kill() on it. `payload`
+    is a list of rows for every command but Mail, whose odoo-db output is
+    one nested object instead (see panes.mail.render_mail)."""
 
-    def __init__(self, rows: list[dict]) -> None:
-        self._rows = rows
+    def __init__(self, payload: list[dict] | dict) -> None:
+        self._rows = payload
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
         return json.dumps(self._rows), ""

@@ -8,8 +8,6 @@ tool call to that one target (local if omitted) -- the counterpart to `oa
 --host-filter.
 """
 
-from __future__ import annotations
-
 import functools
 import inspect
 import re
@@ -469,6 +467,47 @@ def db_query(
 
     rows, raw = probes.parse_odoo_db_output(*result)
     return rows if rows is not None else raw
+
+
+@mcp.tool()
+@_pinned_host
+def mail_audit(db: str, port: str | None = None, *, target: Host) -> dict | str:
+    """Outbound mail config audit for `db`: whether the database is
+    neutralized (the most common reason mail never leaves one), config
+    parameters, per-company alias domains, company/OdooBot/admin addresses,
+    outgoing mail servers (flagged if a known test-mail catcher or a known
+    managed relay), and mass_mailing's install state — see odoo-db's own
+    `mail` command.
+
+    Kept out of `db_query`'s scoped command set rather than added there:
+    odoo-db's `mail` answers one nested object, not the flat row list every
+    `db_query` command shares — the same reason the TUI renders it through
+    its own `panes/mail.py` instead of the generic table pane. Secret-looking
+    values (`smtp_user`/`smtp_pass`) are masked by odoo-db unless the server
+    was started with `--include-sensitive-information` — launch-time only,
+    same rule `db_query`'s `params` follows.
+
+    Args:
+        db: database name.
+        port: postgres port, if the instance's cluster isn't the default one.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    proc = probes.start_odoo_db("mail", db, port, target, include_sensitive_information=_include_sensitive_information)
+    if proc is None:
+        return "(odoo-db not found on PATH)"
+
+    try:
+        result = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "(odoo-db timed out after 90s)"
+
+    rows, raw = probes.parse_odoo_db_output(*result)
+    if rows is None:
+        return raw
+    return rows[0] if rows else {}
 
 
 @app.command()

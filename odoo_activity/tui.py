@@ -156,6 +156,7 @@ class OdooActivity(App):
         ("l", "select_tab('Locks')", "Locks"),
         ("c", "select_tab('Config')", "Config"),
         ("c", "select_tab('Crons')", "Crons"),
+        ("m", "select_tab('Mail')", "Mail"),
         ("t", "select_tab('Toolbox')", "Toolbox"),
         ("u", "select_tab('Users')", "Users"),
         ("j", "select_tab('Jobs')", "Jobs"),

@@ -36,7 +36,7 @@ by default — you already have a shell on this host. Pass
 | `[` / `]` | switch tab in the detail pane |
 | `f` | maximize/minimize the focused pane |
 | `p` / `l` / `c` / `t` | Top / Logs / Config / Toolbox |
-| `u` / `l` / `j` / `c` / `p` | Users / Locks / Jobs / Crons / Params |
+| `u` / `l` / `j` / `c` / `m` / `p` | Users / Locks / Jobs / Crons / Mail / Params |
 | `K` | kill -9 the selected process (Top and Processes tabs, confirm popup) |
 | `L` | kill -3 the selected process, then jump to Stacks (Top tab) |
 | `D` | dump stacks of all workers, then jump to Stacks |
@@ -110,14 +110,25 @@ Database > Toolbox then offers:
   the module's own file; the ones that are fine are left alone, so running
   it twice is a no-op.
 
-and Jobs grows a **Create test job** button next to Requeue, which queues one
-of queue_job's own test jobs to see whether a runner picks it up.
+Jobs grows a **Create test job** button next to Requeue, which queues one
+of queue_job's own test jobs to see whether a runner picks it up, and Mail
+grows a **Send test mail** button, which prompts for a recipient and sends
+one real email (calling `.send()` directly, so it goes out synchronously
+rather than waiting on the mail queue cron) from the connecting user's own
+company address — for checking outbound mail actually reaches an inbox,
+not just that it queues. Mail always shows a **Check port 25** button too (no
+odooly needed — a plain network probe, not an authenticated Odoo action):
+`nc -z -w 3 localhost 25` on the target host, the question that matters
+once `mail_servers` is empty and Odoo falls back to `localhost:25` for
+outgoing mail. `-z` (scan, no data exchange) and the timeout keep it from
+hanging forever if the port turns out to be open.
 
-Both scripts live in `odoo_activity/scripts/` and run on their own too:
+All three scripts live in `odoo_activity/scripts/` and run on their own too:
 
 ```bash
 python -m odoo_activity.scripts.restore_app_icons --env acme18-int
 python -m odoo_activity.scripts.create_test_job --env acme18-int
+python -m odoo_activity.scripts.send_test_mail --env acme18-int --to me@example.com
 ```
 
 They always run on **this** machine, even when `oa` is watching a remote
@@ -155,7 +166,14 @@ or is rejected.
 call has no human at the screen, and the plaintext would land in the agent's
 context. Unmasking is launch-time only, via `--include-sensitive-information`
 on the `oa-mcp`/`oa-mcp-multi` command line — never a per-call tool
-argument, so no tool call can turn it on itself.
+argument, so no tool call can turn it on itself. `mail_audit` (outbound mail
+config — neutralization status, config parameters, alias domains,
+addresses, outgoing mail servers, mass_mailing state) follows the same
+rule for `smtp_user`/`smtp_pass`. It's a separate tool rather than another
+`db_query` command: odoo-db's `mail` answers one nested object, not the
+flat row list every `db_query` command shares — the same reason the TUI
+renders it through its own `panes/mail.py` instead of the generic table
+pane.
 
 `oa-mcp-multi` instead leaves the target per-call, capped by
 `--host-filter` (an odoo dbfilter-style regex; unset means unrestricted)
@@ -202,6 +220,7 @@ odoo_activity/
 ├── panes/detail.py    # ActivityPane: the one stateful rendering widget
 ├── panes/processes.py   # Processes tab: workers grouped by role
 ├── panes/stacks.py    # Stacks tab: parsed dumpstacks, busy-first
+├── panes/mail.py       # Mail tab: one Rich table per section, into the log body
 ├── scripts/           # odooly actions the Toolbox shells out to (network, not host)
 └── tui.py             # app shell: layout, list, timers, actions
 ```
@@ -220,7 +239,8 @@ odoo_activity/
 - **`panes/detail.py`** — `ActivityPane`, the one stateful render widget: a
   tab strip over a Log/DataTable/Tree, mode-switched by whatever's
   highlighted (see Modes below) — not a separate popup screen. Delegates
-  the Processes and Stacks tab bodies to `panes/processes.py`/`panes/stacks.py`.
+  the Processes, Stacks, and Mail tab bodies to `panes/processes.py`/
+  `panes/stacks.py`/`panes/mail.py`.
 - **`tui.py`** — the shell only: `compose()` layout, the nested instances+dbs
   `ListView`, focus/highlight wiring, refresh timers, start/stop/restart.
   Delegates rendering to `ActivityPane`, data to `probes.py`,
@@ -234,7 +254,7 @@ odoo_activity/
 - **Instance mode** — an instance row is highlighted. Tabs: Top,
   Processes, Stacks, Logs, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
-  Queries, Users, Locks, Jobs, Crons, Modules, Params, Toolbox.
+  Queries, Users, Locks, Jobs, Crons, Mail, Modules, Params, Toolbox.
 
 Both modes share the same tab strip and Log/DataTable widgets (just a
 `_mode` flag), and several letter-key shortcuts are reused across them for
@@ -263,5 +283,21 @@ in database mode).
   secret-looking ones (`password`, `token`, an `enterprise_code`, ...) as
   `********` by default, so the TUI always runs it with
   `--include-sensitive-information`.
+- **Mail** — `odoo-db mail <db>` audits outbound mail config (config
+  parameters, per-company alias domains, addresses, outgoing mail servers,
+  relevant modules) as one nested object rather than a flat row list.
+  Unlike every other db tab, it doesn't go through the generic table
+  renderer: the sections don't share columns, so `panes/mail.py` renders
+  each non-empty one as its own table in the log body instead (`/` search
+  and the generic DataTable are unused here). Outgoing mail servers is
+  shown first — whether mail leaves the box at all is the most important
+  question — with test-catcher/known-relay/neutralization-stub detection
+  surfaced as summary lines below the table rather than per-row columns.
+  Mail always shows a **Check port 25** button alongside **Send test
+  mail** (see the Jobs/Mail actions paragraph above). A neutralized
+  database (`database.is_neutralized` — every odoo.sh staging build)
+  leads with its own red banner, since it's the single most
+  common reason mail never leaves an Odoo database at all.
+  `--enable-odooly` grows a **Send test mail** button (see Odooly below).
 
 [odoo-config-cli]: https://github.com/trobz/odoo-config/blob/main/CLI.md
