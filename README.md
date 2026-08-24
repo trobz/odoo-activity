@@ -5,25 +5,31 @@ ssh. One screen: host cpu/mem/uptime, every Odoo instance (`systemd --user`
 or `supervisor`) with its databases nested underneath, and a detail pane for
 process/log/db inspection.
 
+Full docs: <https://trobz.github.io/odoo-activity>
+
 ## Installation
 
 ```bash
 uv tool install odoo-activity
 ```
 
+Or with pip:
+
+```bash
+pip install odoo-activity
+```
+
 ## Usage
 
 ```bash
-odoo-activity                    # or: oa — this machine
-oa openerp@somehost              # a remote host over ssh
-oa openerp@somehost -p 10113     # ...on a non-default ssh port
+oa                        # this machine
+oa openerp@somehost       # a remote host over ssh
 ```
 
-Discovers Odoo instances under `systemd --user`, `supervisor`, and odoo.sh
-(all three are merged), and needs the `odoo-db` CLI on `PATH` for the
-database category tabs. The Config tab additionally needs `odoo-config`
-and `odoo-addons-path` on `PATH`. See [Managers](#managers) for what each
-one supports.
+See [Getting Started][docs-getting-started] for the full quick example,
+[Keybindings & Tabs][docs-keybindings] for every key and what each tab
+shows, and [MCP Server][docs-mcp] for `oa-mcp`/`oa-mcp-multi` — the same
+data exposed to an agent.
 
 The Params tab shows `ir_config_parameter` secret-looking values unmasked
 by default — you already have a shell on this host. Pass
@@ -308,3 +314,6 @@ in database mode).
   `--enable-odooly` grows a **Send test mail** button (see Odooly below).
 
 [odoo-config-cli]: https://github.com/trobz/odoo-config/blob/main/CLI.md
+[docs-getting-started]: ./site-docs/docs/getting-started.md
+[docs-keybindings]: ./site-docs/docs/keybindings.md
+[docs-mcp]: ./site-docs/docs/mcp.md
