@@ -1190,7 +1190,7 @@ def _container_env(container: str | None, host: Host = LOCAL) -> dict[str, str]:
     return env
 
 
-def pg_target_of(inst: Instance, host: Host = LOCAL) -> PgTarget:
+def pg_target_of(inst: Instance, host: Host = LOCAL, parser: configparser.RawConfigParser | None = None) -> PgTarget:
     """The instance's postgres, as the db-tab probes need it.
 
     Every manager but docker resolves to a port on the local cluster (see
@@ -1203,7 +1203,9 @@ def pg_target_of(inst: Instance, host: Host = LOCAL) -> PgTarget:
     if inst["manager"] != "docker":
         return PgTarget(port=db_port_of(inst, host))
 
-    _workdir, parser = instance_config(inst, host)
+    if parser is None:  # `databases_of` already has one; reading it again is a copy out of the container
+        _workdir, parser = instance_config(inst, host)
+
     db_container = inst.get("db_container")
     # A stopped project has no address to connect to -- and leaving PGHOST
     # unset is not "no database", it is *this box's* cluster, so a stale db
@@ -1264,15 +1266,17 @@ def instance_workdir(inst: Instance, host: Host = LOCAL) -> Path:
         return Path(inst.get("directory") or ".")
 
     if inst["manager"] == "docker":
-        # the container's cwd, not the compose project directory on the
-        # host: this is the base every *path* here is resolved against
-        # (config, logfile, data_dir) and those all live inside. The
-        # project directory is `workdir` on the row, used only to run
-        # invoke/docker compose (see instance_action).
-        at = container_host(inst, host)
-        if (pid := instance_pid(inst, at)) is not None and (cwd := _proc_link(pid, "cwd", at)) is not None:
-            return Path(cwd)
-        return Path("/")
+        # The container's own working directory, not the compose project
+        # directory on the host: this is the base every *path* here is
+        # resolved against (config, logfile, data_dir) and those all live
+        # inside. The project directory is `workdir` on the row, used only
+        # to run invoke/docker compose (see instance_action).
+        #
+        # Read off the image rather than /proc/<pid>/cwd: one call instead
+        # of a ps plus a readlink, and it answers for a stopped container
+        # too, which has no process to ask.
+        out = host.on_box.run(["docker", "inspect", "-f", "{{.Config.WorkingDir}}", inst["container"]]).stdout
+        return Path(out.strip() or "/")
 
     if inst["manager"] == "odoosh":
         if host.is_local:
@@ -1351,6 +1355,37 @@ def _config_names(instance_name: str) -> list[str]:
     return ["odoo.conf", "server.conf"]
 
 
+def _container_config(host: Host) -> tuple[Path | None, str | None]:
+    """(path, contents) of the odoo config inside `host`'s container, or
+    (None, None).
+
+    An image puts the config where it likes, so there is no
+    `<workdir>/config/` convention to walk: doodba renders one at
+    /opt/odoo/auto/odoo.conf, the official image ships /etc/odoo/odoo.conf,
+    and anything else names it on the command line (which `_config_file`
+    handles before it gets here).
+
+    Read with `docker cp`, not `docker exec cat`: exec needs the container
+    running, and a config is exactly what you want to read when an instance
+    won't start (verified: with the container stopped, an exec probe
+    reported no config at all).
+
+    Path *and* contents in one go, deliberately: locating the file and
+    reading it are the same copy, and doing them separately meant four
+    copies out of the container per `databases_of` -- 12 round trips, each
+    one an ssh hop on a remote box.
+    """
+    if host.container is None:
+        return None, None
+
+    for candidate in _DOCKER_CONFIG_PATHS:
+        text = _read_out_of_container(host.container, candidate, host.on_box)
+        if text is not None:
+            return Path(candidate), text
+
+    return None, None
+
+
 def _config_file(inst: Instance, host: Host = LOCAL) -> Path | None:
     """The config file named on a directly-run instance's own command line,
     the fixed `~/.config/odoo/odoo.conf` odoo.sh always writes, or the first
@@ -1361,25 +1396,7 @@ def _config_file(inst: Instance, host: Host = LOCAL) -> Path | None:
         return Path(path) if host.is_file(path) else None
 
     if inst["manager"] == "docker":
-        # An image puts the config where it likes, so there is no workdir
-        # convention to walk: doodba renders one at /opt/odoo/auto/odoo.conf,
-        # the official image ships /etc/odoo/odoo.conf, and anything else
-        # names it on the command line (handled by the `config` key above,
-        # filled from argv like a directly-run instance's).
-        #
-        # Probed with `docker cp`, not `host.is_file`'s exec: exec needs a
-        # running container, and a config is exactly what you want to read
-        # when an instance won't start (verified: with the container
-        # stopped, the exec probe reported no config at all).
-        box, container = host.on_box, host.container
-        for candidate in _DOCKER_CONFIG_PATHS:
-            if container is None:
-                break
-            tmp = _copy_out_of_container(container, candidate, box)
-            if tmp is not None:
-                box.run(["rm", "-f", tmp])
-                return Path(candidate)
-        return None
+        return _container_config(host)[0]
 
     if inst["manager"] == "odoosh":
         path = instance_workdir(inst, host) / ".config" / "odoo" / "odoo.conf"
@@ -1412,19 +1429,20 @@ def instance_config(inst: Instance, host: Host = LOCAL) -> tuple[Path, configpar
     line, or — with no config file at all — only the latter.
     """
     workdir = instance_workdir(inst, host)
-    path = _config_file(inst, host)
     host = container_host(inst, host)  # the file lives in the container, if there is one
+
+    if host.container is not None:
+        path, text = _container_config(host)  # one copy out, path and contents together
+    else:
+        path = _config_file(inst, host)
+        text = host.read_text(path) if path is not None else None
+
     if path is None and inst["manager"] not in ("local", "docker"):
         return workdir, None
 
     parser = configparser.RawConfigParser()  # odoo configs may contain `%`
-    if path is not None:
-        text = (
-            _read_out_of_container(host.container, path, host.on_box)
-            if host.container is not None
-            else host.read_text(path)
-        )
-        parser.read_string(text or "")
+    if text is not None:
+        parser.read_string(text)
 
     if inst["manager"] in ("local", "docker"):
         # compose's `command:` is argv the same way a shell-run instance's
@@ -1550,7 +1568,7 @@ def databases_of(inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | N
         # (locally every db is owned by `openerp`); a container's cluster is
         # its own, and the role odoo connects as is right there in its
         # config -- so the env override deliberately doesn't apply here.
-        target = pg_target_of(inst, host)
+        target = pg_target_of(inst, host, parser)
         if target.host is None or target.host.endswith(".invalid"):
             return [], None  # postgres isn't up; nothing to list, and nothing to mistake for it
 
@@ -2537,10 +2555,13 @@ def log_snapshot(inst: Instance, host: Host = LOCAL, lines: int = 200) -> str | 
     why `logfile_of` returning None can't mean "no log" for this manager.
     """
     if inst["manager"] == "docker":
-        # 2>&1: odoo logs to stderr, docker keeps the two streams apart, and
+        # Both streams: odoo logs to stderr, docker keeps the two apart, and
         # a Logs tab showing only stdout would be empty on every instance.
+        # Concatenated rather than interleaved -- there is no shell here to
+        # `2>&1` with -- which is right for odoo (everything is on stderr)
+        # and the reason the follow stream below merges them properly.
         out = host.run(["docker", "logs", "--tail", str(lines), inst["container"]])
-        return _untty(out.stdout + out.stderr)
+        return _untty(out.stderr + out.stdout)
 
     path = logfile_of(inst, host)
     return None if path is None else tail(path, lines, host)

@@ -316,21 +316,23 @@ def test_container_config_is_found_with_docker_cp_so_a_stopped_one_still_has_it(
     Probed with `docker cp`, not `docker exec`: exec needs the container
     running, and a config is exactly what you want to read when an instance
     won't start."""
-    copied: list[str] = []
+    read: list[str] = []
 
-    def fake_copy(_container, path, *_a, **_k):
-        copied.append(str(path))
-        return "copied-to-here" if str(path) == "/opt/odoo/auto/odoo.conf" else None
+    def fake_read(_container, path, *_a, **_k):
+        read.append(str(path))
+        return "[options]\ndb_user = odoo\n" if str(path) == "/opt/odoo/auto/odoo.conf" else None
 
-    monkeypatch.setattr(probes, "_copy_out_of_container", fake_copy)
-    monkeypatch.setattr(Host, "run", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(probes, "_read_out_of_container", fake_read)
     monkeypatch.setattr(Host, "is_file", lambda self, path: True)  # exec would answer, and is not what's used
 
     at = Host().in_container("acme-odoo-1")
     assert probes.configfile_of(_DOCKER_INSTANCE, at) == Path("/opt/odoo/auto/odoo.conf")
-    assert copied == ["/opt/odoo/auto/odoo.conf"]
 
-    monkeypatch.setattr(probes, "_copy_out_of_container", lambda *_a, **_k: None)
+    # one copy out of the container, not a probe followed by a read: doing
+    # both separately cost four copies per databases_of
+    assert read == ["/opt/odoo/auto/odoo.conf"]
+
+    monkeypatch.setattr(probes, "_read_out_of_container", lambda *_a, **_k: None)
     assert probes.configfile_of(_DOCKER_INSTANCE, at) is None
 
 
@@ -550,3 +552,19 @@ def test_any_other_jobs_error_is_still_quoted_verbatim(monkeypatch):
 
     _rows, error = probes.job_groups("demo", None, Host())
     assert "too many clients" in error
+
+
+def test_a_containers_workdir_comes_off_the_image_not_a_running_process(monkeypatch):
+    """/proc/<pid>/cwd would cost a ps plus a readlink and answers nothing
+    at all for a stopped container -- which still has paths worth
+    resolving (its config, see the test above)."""
+    calls: list[list[str]] = []
+
+    def fake_run(self, argv, input_text=None):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="/opt/odoo\n", stderr="")
+
+    monkeypatch.setattr(Host, "run", fake_run)
+
+    assert probes.instance_workdir(_DOCKER_INSTANCE, Host()) == Path("/opt/odoo")
+    assert calls == [["docker", "inspect", "-f", "{{.Config.WorkingDir}}", "acme-odoo-1"]]
