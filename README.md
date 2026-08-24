@@ -175,6 +175,13 @@ flat row list every `db_query` command shares — the same reason the TUI
 renders it through its own `panes/mail.py` instead of the generic table
 pane.
 
+`--enable-odooly` is the same launch-time-only pattern, for the one
+non-read-only exception: `list_odooly_envs`, `instance_odooly_env`, and
+`odooly_run_script` match a database against `~/odooly.ini` and run the
+packaged scripts (`create_test_job`, `restore_app_icons`, `send_test_mail`
+— the last needs `to`), the same actions the TUI's `oa --enable-odooly`
+offers a human through the Toolbox — now callable by the agent directly.
+
 `oa-mcp-multi` instead leaves the target per-call, capped by
 `--host-filter` (an odoo dbfilter-style regex; unset means unrestricted)
 and `--host-file` (which `~/.ssh/config`-style file reads aliases from).
