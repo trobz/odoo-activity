@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.19.0 (2026-08-24)
+
+### Features
+
+- **mcp**: Add --enable-odooly to oa-mcp/oa-mcp-multi
+  ([`bed5295`](https://github.com/trobz/odoo-activity/commit/bed5295fb711b753cb525de9edb6d541e5778de3))
+
+
 ## v0.18.0 (2026-08-21)
 
 ### Features
