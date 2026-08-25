@@ -1,3 +1,8 @@
 [environment]
 python = "./.venv"
 python-version = "3.12"
+
+[src]
+# demo_fixture.py deliberately monkeypatches probes with mismatched-type
+# fixtures for `make demo` -- not shipped, not real code to type-check.
+exclude = ["site-docs/**"]

@@ -3,7 +3,7 @@ _commit: v1.4.1
 _src_path: https://github.com/trobz/trobz-python-template.git
 author_email: contact@trobz.com
 author_username: trobz
-enable_docs_site: false
+enable_docs_site: true
 enable_github_action: true
 package_name: odoo_activity
 project_description: TUI tool named odoo-activity (inspired by pg_activity)

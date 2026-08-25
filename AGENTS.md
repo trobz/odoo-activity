@@ -37,9 +37,11 @@ make test      # Run pytest
 
 ## Docs
 
-`README.md`'s keybindings table documents `odoo_activity/tui.py`'s
-`BINDINGS` and `odoo_activity/panes/detail.py`'s `TABS`/`TOOLBOX_TOOLS`;
-its MCP section documents `odoo_activity/mcp_server.py`'s `@mcp.tool`
-defs. Before merging a PR that changes any of those, run
-`make docs-check` (advisory — diffs the surface files since `README.md`
-was last touched) and fold real changes into `README.md`.
+[`site-docs/docs/keybindings.md`](site-docs/docs/keybindings.md)'s
+keybindings table documents `odoo_activity/tui.py`'s `BINDINGS` and
+`odoo_activity/panes/detail.py`'s `TABS`/`TOOLBOX_TOOLS`;
+[`site-docs/docs/mcp.md`](site-docs/docs/mcp.md) documents
+`odoo_activity/mcp_server.py`'s `@mcp.tool` defs. Before merging a PR that
+changes any of those, run `make docs-check` (advisory — diffs the surface
+files since each doc page was last touched) and fold real changes into the
+relevant page.
