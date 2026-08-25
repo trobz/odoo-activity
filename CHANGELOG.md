@@ -2,6 +2,38 @@
 
 <!-- version list -->
 
+## v0.21.0 (2026-08-25)
+
+### Bug Fixes
+
+- **docker**: Retry a db list that raced the container's startup
+  ([`0004462`](https://github.com/trobz/odoo-activity/commit/00044627eb33f033d92d6a0f86a45f5c058a0c5c))
+
+- **jobs**: Say the module isn't installed instead of quoting postgres
+  ([`4548275`](https://github.com/trobz/odoo-activity/commit/454827532b21f3a1f1f162a283490e2e793b6cde))
+
+### Documentation
+
+- Retitle project tagline to cover both TUI and MCP
+  ([`7c22cd1`](https://github.com/trobz/odoo-activity/commit/7c22cd186a4753bbdcd8b9fe66ae8a20aac6d97b))
+
+- **demo**: Show TUI homepage only, drop MCP --help scene
+  ([`9618cad`](https://github.com/trobz/odoo-activity/commit/9618cad1243db7ead75f96dda23d21b3b42547a7))
+
+- **demo**: Use odoo-* naming instead of legacy openerp-*
+  ([`1cda785`](https://github.com/trobz/odoo-activity/commit/1cda785df2f4f08d7c2ff914e51d3e5631877549))
+
+### Features
+
+- **docker**: Add a docker compose manager
+  ([`a85ce5f`](https://github.com/trobz/odoo-activity/commit/a85ce5f214dc1e38c6dbcb23fd5f08c3e17b5796))
+
+### Performance Improvements
+
+- **docker**: Read a container's config once, not four times
+  ([`41f191a`](https://github.com/trobz/odoo-activity/commit/41f191abdabafd6214a6c67708f813d04b21af4c))
+
+
 ## v0.20.0 (2026-08-25)
 
 ### Features
