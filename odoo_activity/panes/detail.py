@@ -34,11 +34,14 @@ from odoo_activity.probes import (
     CLK_TCK,
     ODOOLY_CONFIG,
     Instance,
+    PgTarget,
     ProcRow,
     Worker,
     _read_new_bytes,
+    _untty,
     configfile_of,
-    db_port_of,
+    container_host,
+    db_container_host,
     instance_pid,
     instance_procs,
     instance_version,
@@ -46,11 +49,14 @@ from odoo_activity.probes import (
     job_groups,
     jobrunner_pids,
     jobs_in_group,
+    log_snapshot,
+    log_stream,
     logfile_of,
     long_queries,
     odoo_pid_for_port,
     parse_odoo_db_output,
     pg_client_port,
+    pg_target_of,
     proc_cpu_ticks_many,
     render_config,
     requeue_jobs,
@@ -63,7 +69,6 @@ from odoo_activity.probes import (
     start_odoo_db,
     stringify,
     table_columns,
-    tail,
     try_local_clipboard,
 )
 
@@ -329,7 +334,9 @@ class ActivityPane(Vertical):
         self._log_text = ""  # full text currently loaded/followed, for re-filtering
         self._filters: dict[str, str] = {}  # tab name -> its search query
         self._show_all = False  # db-tab: include rows the active/installed flag hides
-        self._top_prev: dict[str, tuple[int, float]] = {}  # pid -> (ticks, monotonic)
+        # (kind, pid) -> (ticks, monotonic): under docker odoo and postgres
+        # are two pid namespaces, where the same number is two processes
+        self._top_prev: dict[tuple[str, str], tuple[int, float]] = {}
         self._proc_rows: list[ProcDisplayRow] = []  # rows behind #actable in the Top tab
         self._config_mode = self.CONFIG_MODES[0]  # which odoo-config view the Config tab shows
         self._inflight: dict[str, object] = {}  # key -> ident of the run in progress
@@ -617,7 +624,7 @@ class ActivityPane(Vertical):
             return
 
         host = self.app.host
-        port = await to_thread(db_port_of, inst, host)
+        port = await to_thread(pg_target_of, inst, host)
         rows, error = await to_thread(requeue_jobs, db, port, host)
 
         if error:
@@ -651,12 +658,13 @@ class ActivityPane(Vertical):
         if not confirmed:
             return
 
-        pid = await to_thread(instance_pid, inst, host)
+        at = container_host(inst, host)  # the pid is the container's, so the signal must be too
+        pid = await to_thread(instance_pid, inst, at)
         if pid is None:
             self.app.notify(f"{inst['name']}: no master pid found", severity="warning", timeout=3)
             return
 
-        await to_thread(signal_process, pid, sig, host)
+        await to_thread(signal_process, pid, sig, at)
         self.app.notify(f"{label} sent to {inst['name']} (pid {pid})", timeout=2)
 
     async def copy_shell_command(self, inst: Instance, host: Host) -> None:
@@ -665,6 +673,10 @@ class ActivityPane(Vertical):
         config) only exist on `host`, not necessarily on the machine
         odoo-activity itself is running on. Called from the Toolbox row and
         the app's own `S` shortcut alike."""
+        # the argv, the paths in it and the shell that runs it are all the
+        # container's when there is one -- Host.shell_invocation then wraps
+        # the whole thing in `docker exec -it` (and ssh outside that)
+        host = container_host(inst, host)
         cmd = await to_thread(shell_command, inst, host)
         if cmd is None:
             self.app.notify(f"{inst['name']} isn't running — no shell command to copy", severity="warning", timeout=3)
@@ -684,6 +696,7 @@ class ActivityPane(Vertical):
         if not confirmed:
             return
 
+        host = container_host(inst, host)  # data_dir is a path inside the container
         session_dir = await to_thread(session_dir_of, inst, host)
         if session_dir is None:
             self.app.notify(f"{inst['name']}: no data_dir configured", severity="warning", timeout=3)
@@ -911,7 +924,7 @@ class ActivityPane(Vertical):
         on a timer; a no-op whenever another tab is active (``_log_path`` is
         None then)."""
         if self._log_proc is not None:
-            data = _read_new_bytes(self._log_proc).decode(errors="replace")
+            data = _untty(_read_new_bytes(self._log_proc).decode(errors="replace"))
             if data:
                 self._append_log(data)
             return
@@ -1043,26 +1056,28 @@ class ActivityPane(Vertical):
 
     async def _do_load_log(self, inst: Instance | None) -> None:
         host = self.app.host
+        # the path is for the title and the local-file poll only -- a
+        # container has no logfile at all and streams instead (log_stream),
+        # so "no path" no longer means "no log" (see log_snapshot)
         path = await to_thread(logfile_of, inst, host) if inst else None
-        text = await to_thread(tail, path, 200, host) if path is not None else None
+        text = await to_thread(log_snapshot, inst, host) if inst else None
 
         # both awaits above are ssh round trips -- long enough remotely for
         # the tab/instance to have changed since; recheck before spawning a
-        # tail -f child or writing into the shared #acbody
+        # follow child or writing into the shared #acbody
         if self._instance is not inst or not self.is_logs_active():
             return
 
         proc = None
-        if path is not None and not host.is_local:
+        if inst is not None and text is not None:
             # host.popen() forks+execs a new ssh child -- to_thread it, same
             # as every other host call here, so that fork never shares the
             # event-loop thread that's also reading keypresses (this is the
             # one spot that used to run it inline
-            proc = await to_thread(
-                host.popen, ["tail", "-f", "-n", "0", str(path)], stderr=subprocess.DEVNULL, text=False
-            )
+            proc = await to_thread(log_stream, inst, host)
             if self._instance is not inst or not self.is_logs_active():
-                proc.kill()  # superseded while the child was still spawning
+                if proc is not None:
+                    proc.kill()  # superseded while the child was still spawning
                 return
 
         self._follow_log(path, text, host, proc)
@@ -1073,23 +1088,26 @@ class ActivityPane(Vertical):
         self._filters.pop("Logs", None)
         self.border_title = self._title()
 
-        if path is None:
+        if text is None:
             self._log_pos = 0
             self._log_text = "(no logfile configured)"
             self._render_log()
             return
 
-        self._log_text = text or ""
+        self._log_text = text
         self._render_log()
 
-        if host.is_local:
-            try:
-                self._log_pos = path.stat().st_size
-            except OSError:
-                self._log_pos = 0
+        # a streaming child is the source whenever there is one (remote
+        # file, or a container's `docker logs`); only a file on this box is
+        # polled by size, and only that branch needs the path
+        if proc is not None:
+            self._log_proc = proc
             return
 
-        self._log_proc = proc
+        try:
+            self._log_pos = path.stat().st_size if path is not None else 0
+        except OSError:
+            self._log_pos = 0
 
     def _render_log(self) -> None:
         body = self.query_one("#acbody", RichLog)
@@ -1140,7 +1158,10 @@ class ActivityPane(Vertical):
             self._show_config_text("(no instance)")
             return
 
-        host = self.app.host
+        # the config file lives inside the container when there is one;
+        # render_config copies it back out for odoo-config (which is on the
+        # box, not in the image)
+        host = container_host(inst, self.app.host)
         config = await to_thread(configfile_of, inst, host)
 
         # each await above is an ssh round trip -- long enough remotely for
@@ -1184,8 +1205,10 @@ class ActivityPane(Vertical):
         master, rows = await to_thread(instance_workers, inst, host)
         # one postgres lookup for the whole tree, and only to label a role:
         # an unreachable db just leaves the runner under "HTTP Worker"
-        port = await to_thread(db_port_of, inst, host)
-        jobrunners = await to_thread(jobrunner_pids, port, host)
+        port = await to_thread(pg_target_of, inst, host)
+        # `ss`/`lsof` have to run where the odoo processes' sockets are: the
+        # container's own network namespace, not the box's
+        jobrunners = await to_thread(jobrunner_pids, port, container_host(inst, host))
 
         if self._instance is not inst or not self.is_processes_active():
             return  # instance or tab changed while this was fetching; the result is stale
@@ -1213,7 +1236,20 @@ class ActivityPane(Vertical):
         now = time.monotonic()
         prev, self._top_prev = self._top_prev, {}
 
-        ticks_by_pid = await to_thread(proc_cpu_ticks_many, [p["pid"] for p, _ in procs], host)
+        # under docker the two groups live in two different pid namespaces
+        # (odoo's container and postgres's), where the same number means two
+        # different processes -- so ticks are read per group, and keyed by
+        # group. Same host for every other manager, and then it stays one
+        # round trip.
+        odoo_at, pg_at = container_host(inst, host), db_container_host(inst, host)
+        if odoo_at == pg_at:
+            flat = await to_thread(proc_cpu_ticks_many, [p["pid"] for p, _ in procs], odoo_at)
+            ticks_by_pid = {(kind, p["pid"]): flat.get(p["pid"]) for p, kind in procs}
+        else:
+            odoo_ticks = await to_thread(proc_cpu_ticks_many, [p["pid"] for p in odoo_procs], odoo_at)
+            pg_ticks = await to_thread(proc_cpu_ticks_many, [p["pid"] for p in pg_procs], pg_at)
+            ticks_by_pid = {("odoo", pid): value for pid, value in odoo_ticks.items()}
+            ticks_by_pid.update({("pg", pid): value for pid, value in pg_ticks.items()})
 
         # one more round trip (batched -- see proc_cpu_ticks_many) since the
         # guard above; recheck before forcing #actable visible, or a late
@@ -1224,17 +1260,17 @@ class ActivityPane(Vertical):
         rows: list[ProcDisplayRow] = []
         for p, kind in procs:
             pid = p["pid"]
-            ticks = ticks_by_pid.get(pid)
+            ticks = ticks_by_pid.get((kind, pid))
             cpu = 0.0
             time_str = "-"
 
             if ticks is not None:
-                self._top_prev[pid] = (ticks, now)
+                self._top_prev[kind, pid] = (ticks, now)
                 secs = int(ticks / CLK_TCK)  # cumulative CPU time (top's TIME+)
                 time_str = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
 
-                if pid in prev and (dt := now - prev[pid][1]) > 0:
-                    cpu = max(0.0, ticks - prev[pid][0]) / CLK_TCK / dt * 100
+                if (kind, pid) in prev and (dt := now - prev[kind, pid][1]) > 0:
+                    cpu = max(0.0, ticks - prev[kind, pid][0]) / CLK_TCK / dt * 100
 
             rows.append({**p, "kind": kind, "time": time_str, "cpu": f"{cpu:.1f}"})
 
@@ -1354,7 +1390,7 @@ class ActivityPane(Vertical):
 
     async def _fetch_db_tab(self, category: str, db: str, ident: tuple[str, str, tuple[str, str] | None]) -> None:
         host = self.app.host
-        port = await to_thread(db_port_of, self._db[0], host) if self._db else None
+        port = await to_thread(pg_target_of, self._db[0], host) if self._db else None
 
         if category == "Queries":
             # see `long_queries`
@@ -1397,7 +1433,7 @@ class ActivityPane(Vertical):
         self,
         category: str,
         db: str,
-        port: str | None,
+        port: PgTarget | None,
         host: Host,
         ident: tuple[str, str, tuple[str, str] | None],
         include_inactive: bool,
@@ -1442,7 +1478,7 @@ class ActivityPane(Vertical):
         return parse_odoo_db_output(*result)
 
     async def _fetch_jobs(
-        self, db: str, port: str | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
+        self, db: str, port: PgTarget | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
     ) -> None:
         """The Jobs tab, in its two depths: every function/state group, or
         the individual jobs inside the one that's open.
@@ -1469,7 +1505,7 @@ class ActivityPane(Vertical):
         self._render_actions()
 
     async def _fetch_mail(
-        self, db: str, port: str | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
+        self, db: str, port: PgTarget | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
     ) -> None:
         """The Mail tab: odoo-db's `mail` audit, rendered as separate tables
         per section (see panes/mail.py) rather than through the generic
