@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.20.0 (2026-08-25)
+
+### Features
+
+- **tui**: Walk the three zones with the arrow keys
+  ([`27a2437`](https://github.com/trobz/odoo-activity/commit/27a2437d7a2bde0b6e07067aac1497f667c58200))
+
+
 ## v0.19.1 (2026-08-25)
 
 ### Bug Fixes
