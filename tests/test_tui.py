@@ -1999,3 +1999,58 @@ def test_the_logs_tab_streams_docker_logs_for_a_container_instance(monkeypatch):
             assert followed == ["acme-odoo-1"]
 
     asyncio.run(go())
+
+
+def test_an_empty_docker_db_list_is_retried_by_the_poll(monkeypatch):
+    """First fetch can land while the `db` container is still `health:
+    starting`: postgres is unreachable, the list degrades to `[]`, and that
+    empty result used to stay cached for the rest of the session."""
+    instances = [
+        {
+            "name": "acme",
+            "status": "running",
+            "uptime": "0:01:00",
+            "manager": "docker",
+            "container": "acme-odoo-1",
+            "workdir": "/srv/acme",
+        },
+        {
+            "name": "idle",
+            "status": "stopped",
+            "uptime": "-",
+            "manager": "docker",
+            "container": "idle-odoo-1",
+            "workdir": "/srv/idle",
+        },
+    ]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "instance_status", lambda *_: "running")
+    fetches: list[str] = []
+
+    def fake_databases_of(inst, *_):
+        fetches.append(inst["name"])
+        return (["devel"], "5432") if len(fetches) > 1 else ([], None)
+
+    monkeypatch.setattr(tui, "databases_of", fake_databases_of)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            app = cast("tui.OdooActivity", pilot.app)
+            assert app._db_cache["docker:acme"] == ([], None)
+            # a stopped project's empty list is the right answer, not a race
+            app._db_cache["docker:idle"] = ([], None)
+
+            app.poll_instances()
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app._db_cache["docker:acme"] == (["devel"], "5432")
+            assert fetches == ["acme", "acme"]
+            keys = [item.name for item in app.query_one("#instances", tui.ListView).children]
+            assert keys == ["docker:acme", "docker:acme::db::devel", "docker:idle"]
+
+    asyncio.run(go())

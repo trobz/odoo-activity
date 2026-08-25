@@ -572,6 +572,32 @@ class OdooActivity(App):
             if inst is not None:
                 self._instance_status[item.name or ""] = await to_thread(instance_status, inst, self.host)
 
+        await self._retry_empty_docker_databases()
+
+    async def _retry_empty_docker_databases(self) -> None:
+        """Refetch docker instances whose cached db list came back empty.
+
+        A first fetch right after `docker compose up` races the db container's
+        own startup: postgres isn't reachable yet, so `databases_by_role`
+        degrades to `[]` and that empty list is what gets cached -- forever,
+        since locally nothing invalidates it. A non-empty cache is left alone,
+        so this never disturbs (or resets the selection on) rows the user is
+        browsing.
+
+        Only running instances: a stopped project's empty list is the right
+        answer, and retrying it would copy a config out of a dead container
+        every tick for as long as it stays down.
+        """
+        for key, (names, _port) in list(self._db_cache.items()):
+            inst = self._instances.get(key)
+            if names or inst is None or inst["manager"] != "docker" or inst["status"] != "running":
+                continue
+
+            fetched = await to_thread(databases_of, inst, self.host)
+            if fetched[0]:
+                self._db_cache[key] = fetched
+                await self._mount_databases(key)
+
     def current_instance(self) -> Instance | None:
         item = self.query_one("#instances", InstanceList).highlighted_child
         if item is None or item.name is None:
