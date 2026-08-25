@@ -2,6 +2,7 @@ import asyncio
 import json
 import signal
 from types import SimpleNamespace
+from typing import cast
 
 from textual.widgets import DataTable
 
@@ -1726,5 +1727,194 @@ def test_refresh_stays_in_the_group_it_was_refreshing(monkeypatch):
 
             assert fetched == ["members"]  # not "groups"
             assert pane._jobs_group is not None
+
+    asyncio.run(go())
+
+
+def _nav_pilot(monkeypatch):
+    """One running instance with one db nested under it — the shape that
+    makes the walk interesting, since the instance row is not the last."""
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda *_: (["demo"], None))
+
+
+def test_enter_opens_the_tabs_of_the_row_it_is_pressed_on(monkeypatch):
+    """A row's own tabs have to be reachable from that row. `down` can't be
+    the way in: an instance with databases nested under it is never the last
+    row, so `down` there belongs to the row below — which is a database, and
+    carries the other mode's tabs."""
+    _nav_pilot(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            strip = pane.query_one("#actabs", detail_mod.TabStrip)
+
+            # on the instance row (not the last one) -> its own tabs
+            await pilot.press("enter")
+            await pilot.pause()
+            assert strip.has_focus and pane._mode == "instance"
+
+            # and back down the list for the database row's tabs
+            await pilot.press("up")
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert strip.has_focus and pane._mode == "database"
+
+    asyncio.run(go())
+
+
+def test_arrows_walk_the_three_zones_and_the_tabs(monkeypatch):
+    """list -> strip -> body downwards, body -> strip -> list back up, and
+    left/right between tabs while the strip holds focus."""
+    _nav_pilot(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            strip = pane.query_one("#actabs", detail_mod.TabStrip)
+            instances = pilot.app.query_one("#instances", tui.InstanceList)
+
+            await pilot.press("enter")  # into the strip
+            await pilot.pause()
+            first = pane._active_tab()
+
+            await pilot.press("right")
+            await pilot.pause()
+            assert pane._active_tab() != first
+            await pilot.press("left")
+            await pilot.pause()
+            assert pane._active_tab() == first
+
+            await pilot.press("down")  # into the tab body
+            await pilot.pause()
+            assert not strip.has_focus
+            body = pilot.app.focused
+            assert body is not None and pane in body.ancestors
+
+            await pilot.press("up")  # at the body's top edge -> back to the strip
+            await pilot.pause()
+            assert strip.has_focus
+
+            await pilot.press("up")  # and up out of the pane again
+            await pilot.pause()
+            assert instances.has_focus
+
+    asyncio.run(go())
+
+
+def test_down_off_the_last_row_reaches_the_strip(monkeypatch):
+    """The one row with nothing below it: `down` has nowhere else to go."""
+    _nav_pilot(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            await pilot.press("down")  # onto the db row, the last one
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+
+            assert pane.query_one("#actabs", detail_mod.TabStrip).has_focus
+
+    asyncio.run(go())
+
+
+def test_focus_follows_the_body_a_late_fetch_swaps_in(monkeypatch):
+    """Every async tab shows the "Loading …" log first and reveals its real
+    body a moment later. A user who arrowed into the body in between was
+    holding the log, and the reveal threw focus back out of the pane — so the
+    documented way in silently failed on the slow (remote) path.
+
+    Driven through `_use` rather than keys: Top re-renders on a timer, which
+    would swap the body from under the assertions on a slow enough machine.
+    """
+    _nav_pilot(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Stacks")  # no refresh timer of its own
+            await pilot.pause()
+
+            pane._log_body("Loading stacks…")  # what a tab shows while fetching
+            log = pane.query_one("#acbody", detail_mod.BodyLog)
+            pilot.app.set_focus(log)
+            await pilot.pause()
+            assert log.has_focus
+
+            pane._use("stacks")  # what the fetch does when its result lands
+            await pilot.pause()
+
+            assert pane.query_one("#acstacks", detail_mod.BodyTree).has_focus
+
+
+def test_the_strip_does_not_hand_focus_to_a_maximized_away_list(monkeypatch):
+    """`f` maximizes the pane, which leaves the instances list with no region
+    on screen. Focusing it anyway gave the user a widget they cannot see:
+    arrows moved a hidden highlight, and `s`/`r` acted on that hidden row."""
+    _nav_pilot(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            strip = pane.query_one("#actabs", detail_mod.TabStrip)
+
+            await pilot.press("enter")
+            await pilot.press("f")  # maximize the pane
+            await pilot.pause()
+            assert pilot.app.screen.maximized is not None
+
+            await pilot.press("up")
+            await pilot.pause()
+            assert strip.has_focus  # stayed put; `f` is what leaves
+
+            await pilot.press("f")  # and once minimized it works again
+            await pilot.pause()
+            await pilot.press("up")
+            await pilot.pause()
+            assert pilot.app.query_one("#instances", tui.InstanceList).has_focus
+
+    asyncio.run(go())
+
+
+def test_down_waits_for_the_databases_still_being_fetched(monkeypatch):
+    """The last row is only last until an instance's dbs land — 3-4 ssh round
+    trips away. Hopping to the strip anyway skipped the rows about to appear,
+    making one keypress mean two things depending on fetch latency."""
+    _nav_pilot(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            app = cast("tui.OdooActivity", pilot.app)
+            pane = app.query_one(tui.ActivityPane)
+            app._db_cache.clear()  # as if the fetch were still in flight
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert not pane.query_one("#actabs", detail_mod.TabStrip).has_focus
 
     asyncio.run(go())

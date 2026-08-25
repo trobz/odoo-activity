@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -116,6 +116,34 @@ def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50)
     return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
 
 
+class InstanceList(ListView):
+    """The instances list, as the top of the three-zone arrow-key walk.
+
+    `enter` opens the highlighted row's tabs. That, not `down`, is the way
+    in: the list is a tree, so a row's own tabs have to be reachable from
+    that row — an instance with databases nested under it is never the last
+    row, and `down` there belongs to the row below it.
+
+    `down` past the last row lands on the strip too, for the one row where
+    there is nothing below to move to. See TabStrip for the rest of the walk.
+    """
+
+    if TYPE_CHECKING:
+
+        @property
+        def app(self) -> OdooActivity: ...
+
+    def action_select_cursor(self) -> None:
+        self.app.query_one(ActivityPane).focus_tabs()
+
+    def action_cursor_down(self) -> None:
+        if self.index is not None and self.index >= len(self.children) - 1 and self.app.databases_settled():
+            self.app.query_one(ActivityPane).focus_tabs()
+            return
+
+        super().action_cursor_down()
+
+
 class OdooActivity(App):
     CSS = """
     #body { height: 1fr; }
@@ -210,7 +238,7 @@ class OdooActivity(App):
                 with Vertical(id="uptime-panel", classes="stat-panel"):
                     yield Static("", id="uptime-text")
 
-            yield ListView(id="instances")
+            yield InstanceList(id="instances")
             yield ActivityPane(id="activity")
 
         yield Footer()
@@ -219,7 +247,7 @@ class OdooActivity(App):
         self.register_theme(TROBZ_THEME)
         self.theme = "trobz"
 
-        self.query_one("#instances", ListView).border_title = "Instances"
+        self.query_one("#instances", InstanceList).border_title = "Instances"
 
         # cheap synchronous seed -- instant locally; for a remote host the
         # real numbers land on the first refresh_host tick (see below),
@@ -238,7 +266,7 @@ class OdooActivity(App):
         # (a loading widget can't take focus -- see Widget._check_disabled);
         # membership-change rebuilds later never set loading, so they don't
         # blank already-shown rows or steal focus back
-        self.query_one("#instances", ListView).loading = True
+        self.query_one("#instances", InstanceList).loading = True
         self.refresh_instances()
 
         # also paces the Top tab, which rides this tick (ActivityPane.tick)
@@ -323,7 +351,7 @@ class OdooActivity(App):
 
     @work(exclusive=True, group="instances")
     async def _rebuild_instances(self) -> None:
-        lv = self.query_one("#instances", ListView)
+        lv = self.query_one("#instances", InstanceList)
         first_load = not self._instances_ready
         keep = lv.highlighted_child.name if lv.highlighted_child else None
         await lv.clear()
@@ -411,8 +439,20 @@ class OdooActivity(App):
         return self.odooly_env_for(hit[0]["name"], hit[1]) if hit is not None else None
 
     def _highlighted_owner(self) -> str | None:
-        item = self.query_one("#instances", ListView).highlighted_child
+        item = self.query_one("#instances", InstanceList).highlighted_child
         return self._row_owner.get(item.name) if item is not None and item.name else None
+
+    def databases_settled(self) -> bool:
+        """True when the highlighted row's databases are already known.
+
+        `_load_databases` runs on highlight and costs 3-4 ssh round trips, so
+        remotely the last row is "last" only until they land. Without this,
+        `down` there jumps to the tab strip and skips the rows about to
+        appear -- the same keypress doing two different things depending on
+        how fast the fetch was.
+        """
+        owner = self._highlighted_owner()
+        return owner is None or owner in self._db_cache
 
     @work(exclusive=True, group="databases")
     async def _load_databases(self, key: str | None) -> None:
@@ -435,7 +475,7 @@ class OdooActivity(App):
 
     async def _mount_databases(self, key: str) -> None:
         """Replace `key`'s db rows in place with what `_db_cache` now holds."""
-        lv = self.query_one("#instances", ListView)
+        lv = self.query_one("#instances", InstanceList)
         rows = [(i, item.name or "") for i, item in enumerate(lv.children)]
 
         row = next((i for i, name in rows if name == key), None)
@@ -486,7 +526,7 @@ class OdooActivity(App):
         """Redraw the running dots in place — a cheap re-render off the
         cached state, no process polling (that's poll_instances' job)."""
         try:
-            listview = self.query_one("#instances", ListView)
+            listview = self.query_one("#instances", InstanceList)
         except NoMatches:  # the 0.2s tick can land mid-shutdown, after the tree unmounts
             return
         for item in listview.children:
@@ -526,13 +566,13 @@ class OdooActivity(App):
             return
 
         self._instances = fresh
-        for item in self.query_one("#instances", ListView).children:
+        for item in self.query_one("#instances", InstanceList).children:
             inst = fresh.get(item.name or "")
             if inst is not None:
                 self._instance_status[item.name or ""] = await to_thread(instance_status, inst, self.host)
 
     def current_instance(self) -> Instance | None:
-        item = self.query_one("#instances", ListView).highlighted_child
+        item = self.query_one("#instances", InstanceList).highlighted_child
         if item is None or item.name is None:
             return None
 
@@ -541,7 +581,7 @@ class OdooActivity(App):
 
     def highlighted_db(self) -> tuple[Instance, str] | None:
         """(instance, db name) if a db row is highlighted, else None."""
-        item = self.query_one("#instances", ListView).highlighted_child
+        item = self.query_one("#instances", InstanceList).highlighted_child
         if item is None or item.name is None:
             return None
 
@@ -553,7 +593,7 @@ class OdooActivity(App):
         return (inst, db) if inst else None
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        item = self.query_one("#instances", ListView).highlighted_child
+        item = self.query_one("#instances", InstanceList).highlighted_child
         key = item.name if item is not None else None
 
         if key != self._shown_key:

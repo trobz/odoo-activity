@@ -143,12 +143,97 @@ class ActivityTab(Static):
         pane.focus_active()
 
 
+class TabStrip(Horizontal):
+    """The tab header, as a focus stop of its own.
+
+    The three zones — the instances list, this strip, the tab body — are
+    walked with the arrow keys: `down`/`up` move between them at each zone's
+    edge, `left`/`right` move between tabs while the strip holds focus. The
+    letter shortcuts and `[`/`]` still jump straight to a tab from anywhere,
+    for anyone who already knows which one they want.
+    """
+
+    can_focus = True
+
+    BINDINGS: ClassVar = [
+        ("left", "prev_tab", "Prev tab"),
+        ("right", "next_tab", "Next tab"),
+        ("down,enter", "into_body", "Into tab"),
+        ("up", "to_instances", "Back to list"),
+    ]
+
+    @property
+    def _pane(self) -> ActivityPane:
+        return self.app.query_one(ActivityPane)
+
+    def action_prev_tab(self) -> None:
+        self._pane.select_tab(self._pane.tab_index - 1)
+        self.app.refresh_bindings()  # which keys apply is per tab (see check_action)
+
+    def action_next_tab(self) -> None:
+        self._pane.select_tab(self._pane.tab_index + 1)
+        self.app.refresh_bindings()
+
+    def action_into_body(self) -> None:
+        self._pane.focus_active()
+
+    def action_to_instances(self) -> None:
+        # a maximized pane hides the list: focusing it anyway leaves the user
+        # driving a widget with no region on screen -- arrow keys move a
+        # highlight they can't see, and `s`/`r` act on that hidden row. `f`
+        # is what leaves the maximized view.
+        if self.screen.maximized is not None:
+            return
+
+        self.app.query_one("#instances").focus()
+
+
+# The body widgets below all hand focus back to the tab strip when `up` is
+# pressed at their top edge, and only there: anywhere else `up` scrolls as it
+# always did, so the zone hop costs nothing to someone not looking for it.
+class BodyTable(DataTable):
+    def action_cursor_up(self) -> None:
+        if self.cursor_row <= 0:
+            self.app.query_one(TabStrip).focus()
+            return
+
+        super().action_cursor_up()
+
+
+class BodyTree(Tree):
+    def action_cursor_up(self) -> None:
+        if self.cursor_line <= 0:
+            self.app.query_one(TabStrip).focus()
+            return
+
+        super().action_cursor_up()
+
+
+class BodyLog(RichLog):
+    """RichLog scrolls rather than moving a cursor, so its top edge is a
+    scroll offset of zero."""
+
+    def action_scroll_up(self) -> None:
+        if self.scroll_offset.y <= 0:
+            self.app.query_one(TabStrip).focus()
+            return
+
+        super().action_scroll_up()
+
+
 class _RawScroll(VerticalScroll):
     """VerticalScroll (like every Container) hardcodes ALLOW_MAXIMIZE = False,
     which would block `f` from walking up to the pane while this is
     focused — opt back in."""
 
     ALLOW_MAXIMIZE = True
+
+    def action_scroll_up(self) -> None:
+        if self.scroll_offset.y <= 0:
+            self.app.query_one(TabStrip).focus()
+            return
+
+        super().action_scroll_up()
 
 
 class ActivityPane(Vertical):
@@ -162,6 +247,10 @@ class ActivityPane(Vertical):
     ActivityTab { width: auto; padding: 0 1; color: $text-muted; }
     ActivityTab:hover { color: $text; }
     ActivityTab.-active { background: $primary; color: $text; text-style: bold; }
+    /* the strip is a focus stop of its own (see TabStrip): show it, and make
+       the active tab the thing the eye lands on while arrowing left/right */
+    #actabs:focus ActivityTab { color: $text; }
+    #actabs:focus ActivityTab.-active { background: $accent; color: $text; text-style: bold reverse; }
     #acbody { background: transparent; }
     #actable { background: transparent; display: none; }
     #acsearch { margin-bottom: 1; }
@@ -213,18 +302,18 @@ class ActivityPane(Vertical):
         def app(self) -> OdooActivity: ...
 
     def compose(self) -> ComposeResult:
-        yield Horizontal(id="actabs")
+        yield TabStrip(id="actabs")
         yield Input(
             id="acsearch",
             placeholder="search, enter to apply, empty clears",
             compact=True,
         )
-        yield RichLog(id="acbody", highlight=True, wrap=True)
-        yield DataTable(id="actable", zebra_stripes=True, cursor_type="row")
+        yield BodyLog(id="acbody", highlight=True, wrap=True)
+        yield BodyTable(id="actable", zebra_stripes=True, cursor_type="row")
         with _RawScroll(id="acraw"):
             yield Static(id="acraw-body")
-        yield Tree("stacks", id="acstacks")
-        yield Tree("processes", id="acprocesses")
+        yield BodyTree("stacks", id="acstacks")
+        yield BodyTree("processes", id="acprocesses")
         yield Horizontal(id="acactions")
 
     def on_mount(self) -> None:
@@ -736,6 +825,14 @@ class ActivityPane(Vertical):
                 tree.root.add_leaf(f"(no match: {query})")
         _log.debug("_populate_stacks took %.0fms", (time.monotonic() - started) * 1000)
 
+    @property
+    def tab_index(self) -> int:
+        """Which tab is active, as an index into the current mode's tabs."""
+        return self._tab
+
+    def focus_tabs(self) -> None:
+        self.query_one("#actabs", TabStrip).focus()
+
     def select_tab(self, index: int) -> None:
         self._tab = index
         self._render_active()
@@ -870,7 +967,7 @@ class ActivityPane(Vertical):
         return title
 
     def _build_tabs(self, names: list[str]) -> None:
-        strip = self.query_one("#actabs", Horizontal)
+        strip = self.query_one("#actabs", TabStrip)
         strip.remove_children()
         strip.mount_all(ActivityTab(name, i, active=(i == self._tab)) for i, name in enumerate(names))
 
@@ -1411,18 +1508,31 @@ class ActivityPane(Vertical):
             self._show_datatable()
 
     _BODY_WIDGETS: ClassVar = {
-        "log": ("#acbody", RichLog),
-        "table": ("#actable", DataTable),
+        "log": ("#acbody", BodyLog),
+        "table": ("#actable", BodyTable),
         "raw": ("#acraw", VerticalScroll),
-        "stacks": ("#acstacks", Tree),
-        "processes": ("#acprocesses", Tree),
+        "stacks": ("#acstacks", BodyTree),
+        "processes": ("#acprocesses", BodyTree),
     }
 
     def _use(self, which: str) -> None:
         """Show the Log, the DataTable, the raw-json view, the Stacks tree,
-        or the Processes tree in the pane body."""
+        or the Processes tree in the pane body.
+
+        Focus moves with the swap when the widget being hidden had it: every
+        async tab shows the "Loading …" log first and reveals its real body a
+        moment later, so a user who arrowed into the body in the meantime
+        would otherwise have focus thrown back out of the pane by the reveal.
+        """
+        had_focus = False
+
         for name, (selector, widget_type) in self._BODY_WIDGETS.items():
-            self.query_one(selector, widget_type).display = name == which
+            widget = self.query_one(selector, widget_type)
+            had_focus = had_focus or (widget.has_focus and name != which)
+            widget.display = name == which
+
+        if had_focus:
+            self.focus_active()
 
     def _render_db_toolbox(self) -> None:
         """The database-mode Toolbox: what odooly can do to this database.
