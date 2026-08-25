@@ -33,10 +33,10 @@ pip install odoo-activity
 oa
 
 # Watch a remote host over ssh
-oa openerp@somehost
+oa odoo@somehost
 
 # ...on a non-default ssh port
-oa openerp@somehost -p 10113
+oa odoo@somehost -p 10113
 ```
 
 Discovers Odoo instances under `systemd --user`, `supervisor`, and odoo.sh
