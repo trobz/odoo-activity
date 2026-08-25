@@ -23,7 +23,7 @@ pip install odoo-activity
 
 ```bash
 oa                        # this machine
-oa openerp@somehost       # a remote host over ssh
+oa odoo@somehost          # a remote host over ssh
 ```
 
 See [Getting Started][docs-getting-started] for the full quick example,
@@ -128,7 +128,7 @@ the actions that need a login appear with it; red where none does, so a
 database missing from the ini is visible rather than silent.
 
 Matching is by name: the instance's, stripped of what only a process manager
-adds (`openerp-acme18-integration.service` → `acme18-integration`), against
+adds (`odoo-acme18-integration.service` → `acme18-integration`), against
 the section names — spelled either way (`-integration` / `-int`, `-staging` /
 `-stag`, `-production` / `-prod`), and with a suffix allowed, since a
 multi-db instance is usually configured one section per database

@@ -11,7 +11,7 @@ from odoo_activity import probes, tui
 from odoo_activity.panes import detail as detail_mod
 
 INSTANCE = {
-    "name": "openerp-acme18-production.service",
+    "name": "odoo-acme18-production.service",
     "status": "running",
     "uptime": "4:12:07",
     "manager": "systemd",
@@ -23,23 +23,23 @@ WORKER_ROWS = [
     {
         "pid": MASTER_PID,
         "ppid": "1",
-        "user": "openerp",
+        "user": "odoo",
         "mem": "0.5",
         "nice": "0",
         "cmd": "/usr/bin/python3 /opt/odoo/odoo-bin -c odoo.conf",
     },
-    {"pid": "12341", "ppid": MASTER_PID, "user": "openerp", "mem": "3.1", "nice": "0", "cmd": "odoo: worker 0"},
-    {"pid": "12342", "ppid": MASTER_PID, "user": "openerp", "mem": "2.9", "nice": "0", "cmd": "odoo: worker 1"},
-    {"pid": "12343", "ppid": MASTER_PID, "user": "openerp", "mem": "1.8", "nice": "10", "cmd": "odoo: worker 2"},
+    {"pid": "12341", "ppid": MASTER_PID, "user": "odoo", "mem": "3.1", "nice": "0", "cmd": "odoo: worker 0"},
+    {"pid": "12342", "ppid": MASTER_PID, "user": "odoo", "mem": "2.9", "nice": "0", "cmd": "odoo: worker 1"},
+    {"pid": "12343", "ppid": MASTER_PID, "user": "odoo", "mem": "1.8", "nice": "10", "cmd": "odoo: worker 2"},
     {
         "pid": "12344",
         "ppid": MASTER_PID,
-        "user": "openerp",
+        "user": "odoo",
         "mem": "2.2",
         "nice": "0",
         "cmd": "odoo: gevent worker 0",
     },
-    {"pid": "12345", "ppid": MASTER_PID, "user": "openerp", "mem": "1.5", "nice": "0", "cmd": "odoo: WorkerJobRunner"},
+    {"pid": "12345", "ppid": MASTER_PID, "user": "odoo", "mem": "1.5", "nice": "0", "cmd": "odoo: WorkerJobRunner"},
 ]
 PG_ROWS = [
     {
@@ -48,7 +48,7 @@ PG_ROWS = [
         "user": "postgres",
         "mem": "1.1",
         "nice": "0",
-        "cmd": "postgres: acme18_prod openerp [local] idle",
+        "cmd": "postgres: acme18_prod odoo [local] idle",
     },
     {
         "pid": "9002",
@@ -56,7 +56,7 @@ PG_ROWS = [
         "user": "postgres",
         "mem": "0.9",
         "nice": "0",
-        "cmd": "postgres: acme18_prod openerp [local] SELECT",
+        "cmd": "postgres: acme18_prod odoo [local] SELECT",
     },
 ]
 JOB_GROUPS = [
