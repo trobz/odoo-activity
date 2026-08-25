@@ -1,7 +1,7 @@
 # odoo-activity terminal demo
 # Showcases: the TUI homepage with a populated instance/database (via
 # demo_fixture.py -- see its docstring for why -- rendered fully offscreen
-# before the reveal), and the --help surface for the MCP server (oa-mcp)
+# before the reveal)
 
 # ── Output ────────────────────────────────────────────────────────────────────
 Output ./docs/demo.gif
@@ -42,16 +42,3 @@ Show
 
 # ── Scene 1: TUI homepage, instance + database loaded ───────────────────────────
 Sleep 6s
-Type "q"
-Hide
-Sleep 1.5s
-Type "clear"
-Enter
-
-# ── Scene 2: MCP server help ─────────────────────────────────────────────────────
-Show
-Sleep 800ms
-Type "oa-mcp --help"
-Sleep 500ms
-Enter
-Sleep 3s

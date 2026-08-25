@@ -6,7 +6,7 @@ author_username: trobz
 enable_docs_site: true
 enable_github_action: true
 package_name: odoo_activity
-project_description: TUI tool named odoo-activity (inspired by pg_activity)
+project_description: The odoo ops toolbox, for you (TUI) and your agent (MCP)
 project_name: odoo-activity
 project_type: cli
 publish_to_pypi: true
