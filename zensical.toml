@@ -1,7 +1,7 @@
 [project]
 site_name = "odoo-activity"
 site_url = "https://trobz.github.io/odoo-activity"
-site_description = "TUI tool named odoo-activity (inspired by pg_activity)"
+site_description = "The odoo ops toolbox, for you (TUI) and your agent (MCP)"
 site_author = "Trobz"
 docs_dir = "site-docs/docs"
 site_dir = "site"

@@ -1,7 +1,7 @@
 [project]
 name = "odoo-activity"
 version = "0.20.0"
-description = "TUI tool named odoo-activity (inspired by pg_activity)"
+description = "The odoo ops toolbox, for you (TUI) and your agent (MCP)"
 authors = [{name = "trobz", email = "contact@trobz.com"}]
 requires-python = ">=3.10"
 readme = "README.md"

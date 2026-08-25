@@ -1,6 +1,6 @@
 ---
 icon: lucide/rocket
-description: TUI tool named odoo-activity (inspired by pg_activity)
+description: The odoo ops toolbox, for you (TUI) and your agent (MCP)
 tags:
   - installation
   - quickstart
