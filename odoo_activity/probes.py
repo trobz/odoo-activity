@@ -143,11 +143,23 @@ _SUPERVISOR_STATUS = {
 
 _SYSTEMD_STATUS = {"active": "running", "failed": "failed"}
 
+# systemd --user sidecar units that ride alongside an instance's own unit,
+# named after it (e.g. backup-odoo-acme-production.service next to
+# odoo-acme-production.service) so `_is_odoo` matches their name too —
+# without this they'd show up as extra, never-runnable "instances".
+_SIDECAR_UNIT_PREFIXES = ("backup-", "logrotate-")
+
 
 def _is_odoo(*text: str) -> bool:
     """True if any hint names an Odoo instance (odoo or the legacy openerp)."""
     blob = " ".join(text).lower()
     return "odoo" in blob or "openerp" in blob
+
+
+def _is_sidecar_unit(unit_id: str) -> bool:
+    """True for a systemd --user unit that manages a task *for* an Odoo
+    instance (backups, log rotation) rather than being the instance itself."""
+    return unit_id.lower().startswith(_SIDECAR_UNIT_PREFIXES)
 
 
 def list_instances(host: Host = LOCAL) -> list[Instance]:
@@ -183,7 +195,9 @@ def systemd_instances(host: Host = LOCAL) -> list[Instance]:
 
     Uses list-unit-files (catches stopped units, which list-units hides) then
     one batched `show` to read Description + state for each. Matches the unit
-    name or Description so name-convention units (openerp-*.service) are caught.
+    name or Description so name-convention units (openerp-*.service) are
+    caught. Sidecar units for a given instance (backup-*, logrotate-*) match
+    the same way but aren't instances themselves, so they're dropped.
     """
     # --user only; add system-wide (`systemctl` without --user) when a
     # host needs it.
@@ -231,7 +245,7 @@ def systemd_instances(host: Host = LOCAL) -> list[Instance]:
     for block in out.split("\n\n"):
         props = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
         name = props.get("Id", "")
-        if not _is_odoo(name, props.get("Description", "")):
+        if not _is_odoo(name, props.get("Description", "")) or _is_sidecar_unit(name):
             continue
 
         status = _SYSTEMD_STATUS.get(props.get("ActiveState", ""), "stopped")

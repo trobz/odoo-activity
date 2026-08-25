@@ -32,13 +32,17 @@ def test_systemd_instances_filters_templates_and_maps_status(monkeypatch):
         "openerp-demo.service    disabled enabled\n"  # matched by name only
         "odoo-demo.service        disabled enabled\n"
         "odoo-crashed.service     disabled enabled\n"
+        "backup-odoo-acme-production.service     disabled enabled\n"  # sidecar, filtered
+        "logrotate-odoo-acme-production.service  disabled enabled\n"  # sidecar, filtered
     )
     show = (
         "Id=wiki.service\nDescription=A wiki\nActiveState=inactive\n\n"
         "Id=openerp-demo.service\nDescription=Staging\nActiveState=inactive\n\n"
         "Id=odoo-demo.service\nDescription=Odoo odoo 18.0 instance\n"
         "ActiveState=active\nActiveEnterTimestampMonotonic=1000000\n\n"
-        "Id=odoo-crashed.service\nDescription=Odoo crashed instance\nActiveState=failed\n"
+        "Id=odoo-crashed.service\nDescription=Odoo crashed instance\nActiveState=failed\n\n"
+        "Id=backup-odoo-acme-production.service\nDescription=Backup odoo acme\nActiveState=active\n\n"
+        "Id=logrotate-odoo-acme-production.service\nDescription=Logrotate odoo acme\nActiveState=active\n"
     )
 
     def fake_run(cmd, **_):
