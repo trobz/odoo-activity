@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.19.1 (2026-08-25)
+
+### Bug Fixes
+
+- **probes**: Exclude backup/logrotate sidecar units from instance detection
+  ([`2bf72dc`](https://github.com/trobz/odoo-activity/commit/2bf72dc213ada24ba3d06905318c496e85531284))
+
+### Documentation
+
+- Enable documentation site using Zensical
+  ([`0077907`](https://github.com/trobz/odoo-activity/commit/007790797bc6fbb839d26732983a78e11f258adb))
+
+
 ## v0.19.0 (2026-08-24)
 
 ### Features
