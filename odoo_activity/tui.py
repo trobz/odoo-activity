@@ -21,18 +21,20 @@ from textual.theme import Theme
 from textual.widgets import Footer, Label, ListItem, ListView, Static
 
 from odoo_activity.host import Host, to_thread
-from odoo_activity.panes.confirm import ConfirmScreen
-from odoo_activity.panes.detail import ActivityPane
-from odoo_activity.probes import (
-    Instance,
-    container_host,
-    databases_of,
-    dump_and_parse_stacks,
-    format_duration,
+from odoo_activity.managers import (
+    host_for,
     instance_action,
     instance_status,
     instance_workdir,
     list_instances,
+)
+from odoo_activity.panes.confirm import ConfirmScreen
+from odoo_activity.panes.detail import ActivityPane
+from odoo_activity.probes import (
+    Instance,
+    databases_of,
+    dump_and_parse_stacks,
+    format_duration,
     read_cpu_times,
     read_host_stats,
     signal_process,
@@ -736,13 +738,13 @@ class OdooActivity(App):
         if inst is None:
             return
 
-        name, manager = inst["name"], inst["manager"]
+        name = inst["name"]
 
         # a remote systemctl takes seconds and nothing changes on screen until
         # the re-label below, so the confirmation reads as not having registered
         self.app.notify(f"{action} {name}…", timeout=2)
 
-        error = await to_thread(instance_action, name, action, manager, self.host, inst.get("workdir"))
+        error = await to_thread(instance_action, inst, action, self.host)
         if error:
             self.app.notify(error, severity="warning", timeout=3)
         else:
@@ -755,7 +757,7 @@ class OdooActivity(App):
         when it has one: a pid only means anything in the namespace it was
         read from, and for docker that's the container's, not the box's."""
         inst = self.current_instance()
-        return self.host if inst is None else container_host(inst, self.host)
+        return self.host if inst is None else host_for(inst, self.host)
 
     def action_kill_process(self) -> None:
         pane = self.query_one(ActivityPane)

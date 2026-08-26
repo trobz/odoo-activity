@@ -8,7 +8,7 @@ The argv strings below are trimmed from real processes on a dev machine.
 
 from types import SimpleNamespace
 
-from odoo_activity import probes
+from odoo_activity import managers, probes
 from odoo_activity.host import Host
 from odoo_activity.probes import Instance, ProcRow
 
@@ -257,15 +257,15 @@ def _inst(status: str) -> Instance:
 def test_instance_status_promotes_ambiguous_stopped_but_not_explicit_failure(monkeypatch):
     # a live process promotes an ambiguous "stopped" report to running
     monkeypatch.setattr(probes, "procs_of", lambda *_: [{"pid": "1"}])
-    assert probes.instance_status(_inst("stopped")) == "running"
+    assert managers.instance_status(_inst("stopped")) == "running"
 
     # regression: an explicit failure is authoritative even with a live
     # process matching the same db — procs_of() matches by db name, not
     # manager, so that process may belong to the *other* manager's instance
-    assert probes.instance_status(_inst("failed")) == "failed"
+    assert managers.instance_status(_inst("failed")) == "failed"
 
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
-    assert probes.instance_status(_inst("stopped")) == "stopped"
+    assert managers.instance_status(_inst("stopped")) == "stopped"
 
 
 # --- docker ---------------------------------------------------------------

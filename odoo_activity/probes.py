@@ -163,40 +163,6 @@ def _is_sidecar_unit(unit_id: str) -> bool:
     return unit_id.lower().startswith(_SIDECAR_UNIT_PREFIXES)
 
 
-def list_instances(host: Host = LOCAL) -> list[Instance]:
-    """All Odoo instances on `host`, from systemd --user, supervisor, odoo.sh,
-    docker compose and directly-run processes.
-
-    Each row carries its `manager` so actions route to the right controller;
-    managers can even expose the same name (e.g. odoo-demo).
-    """
-    return (
-        systemd_instances(host)
-        + supervisor_instances(host)
-        + odoosh_instances(host)
-        + docker_instances(host)
-        + local_instances(host)
-    )
-
-
-def instance_status(inst: Instance, host: Host = LOCAL) -> str:
-    """The instance's corrected status: `running`, `stopped`, or a manager
-    failure state (`failed`/`exited`/`fatal`).
-
-    A manager may report "stopped" while a bare shell runs it, so a live
-    process promotes an ambiguous *stopped* report to running. An explicit
-    failure (systemd "failed", supervisor "exited"/"fatal") is authoritative
-    even if a process serving the same db is alive — `procs_of` matches by
-    db name, not manager, so that process may belong to the *other*
-    manager's instance of the same name/db (see `list_instances`).
-    """
-    if inst["status"] == "running":
-        return "running"
-    if inst["status"] == "stopped" and procs_of(inst, host):
-        return "running"
-    return inst["status"]
-
-
 def systemd_instances(host: Host = LOCAL) -> list[Instance]:
     """Odoo instances from systemd --user units.
 
@@ -951,17 +917,51 @@ def _read_out_of_container(container: str, path: str | Path, box: Host = LOCAL) 
         box.run(["rm", "-f", tmp])
 
 
+def _manager_of(inst: Instance):
+    """`inst`'s manager, imported here rather than at module scope.
+
+    This module is the low-level layer the managers are built on, so it must
+    not import them while it is still being defined. Only these few
+    instance-scoped probes need one at all -- everything else in here takes
+    a `Host` and never asks who runs it.
+    """
+    from odoo_activity.managers import manager_of
+
+    return manager_of(inst)
+
+
 def container_host(inst: Instance, host: Host = LOCAL) -> Host:
-    """`host` narrowed to the instance's own container, or unchanged for
-    every other manager — so a caller can probe without branching."""
-    return host.in_container(inst.get("container"))
+    """`host` narrowed to where this instance's own processes and files live
+    -- inside its container for docker, `host` unchanged for every other
+    manager, so a caller can probe without branching."""
+    return _manager_of(inst).host_for(inst, host)
 
 
 def db_container_host(inst: Instance, host: Host = LOCAL) -> Host:
-    """`host` narrowed to the instance's *postgres* container. Only the
-    Top tab's backend list needs this: everything else reaches postgres
-    over TCP (see `pg_target_of`), not by running commands next to it."""
-    return host.in_container(inst.get("db_container"))
+    """`host` narrowed to the instance's *postgres* container, where it has
+    one. Only the Top tab's backend list needs this: everything else reaches
+    postgres over TCP (see `pg_target_of`), not by running commands next to
+    it."""
+    manager = _manager_of(inst)
+    db_host_for = getattr(manager, "db_host_for", None)
+
+    return db_host_for(inst, host) if db_host_for else host
+
+
+def instance_pid(inst: Instance, host: Host = LOCAL) -> str | None:
+    """The instance's master pid, straight from its process manager.
+
+    Not matched by database name: in multi-db/config-only setups the odoo
+    process's argv never carries a db name at all (only postgres's own
+    backends do, since they connect to a specific db), so a db-name-in-argv
+    heuristic both misses the real process and can misfire on postgres.
+    """
+    return _manager_of(inst).pid(inst, host)
+
+
+def instance_workdir(inst: Instance, host: Host = LOCAL) -> Path:
+    """The directory every path this instance reports is resolved against."""
+    return _manager_of(inst).workdir(inst, host)
 
 
 # doodba ships a tasks.py with start/stop/restart, and a developer running
@@ -1012,60 +1012,6 @@ def _docker_action(action: str, host: Host = LOCAL, workdir: str | None = None) 
         error = out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
 
     return error
-
-
-def instance_action(
-    unit: str, action: str, manager: str = "systemd", host: Host = LOCAL, workdir: str | None = None
-) -> str:
-    """start/stop/restart an instance via its process manager.
-
-    Odoo instances run under systemd --user, supervisor, odoo.sh or docker
-    compose; the caller passes the `manager` recorded at discovery time so
-    the right controller is used. Returns "" on success, else the
-    controller's error output (so the UI can show why nothing happened
-    instead of failing silently).
-
-    `workdir` is docker's alone: compose acts on a project directory, not on
-    a name the way a unit does.
-    """
-    if manager == "docker":
-        return _docker_action(action, host, workdir)
-
-    if manager == "local":
-        return "no process manager — a directly-run instance can't be started or stopped from here"
-
-    if manager == "odoosh":
-        # odoo.sh has no separate start/stop — sleep/wake is the platform's
-        # call, not ours; only a restart of the http workers is exposed.
-        if action != "restart":
-            return "start/stop not supported — odoo.sh handles sleep/wake on its own"
-
-        # odoosh-restart takes one service at a time, unlike `supervisorctl
-        # restart` which restarts everything for the instance in one call —
-        # so restart both services it's equivalent to.
-        for service in ("http", "cron"):
-            try:
-                out = host.run(["odoosh-restart", service])
-            except FileNotFoundError:
-                return "odoosh-restart not found on PATH"
-
-            if out.returncode != 0:
-                return out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
-        return ""
-
-    # synchronous; --user odoo units activate fast. Move to a worker
-    # if a unit's start/restart ever blocks the UI.
-    cmd = ["supervisorctl", action, unit] if manager == "supervisor" else ["systemctl", "--user", action, unit]
-
-    try:
-        out = host.run(cmd)
-    except FileNotFoundError:
-        return f"{cmd[0]} not found on PATH"
-
-    if out.returncode == 0:
-        return ""
-
-    return out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
 
 
 # db ownership: a database belongs to an instance when its owner role matches
@@ -1255,34 +1201,6 @@ def _systemd_workdir(unit: str, host: Host = LOCAL) -> Path:
     if m := re.search(r"WorkingDirectory=(\S+)", show):
         return Path(m.group(1))
     return Path.cwd() if host.is_local else Path("/")
-
-
-def instance_workdir(inst: Instance, host: Host = LOCAL) -> Path:
-    """The instance's working directory (supervisor `directory=`, a
-    directly-run instance's own cwd, the systemd unit's WorkingDirectory, or
-    $HOME on odoo.sh)."""
-    if inst["manager"] in ("supervisor", "local"):
-        return Path(inst.get("directory") or ".")
-
-    if inst["manager"] == "docker":
-        # The container's own working directory, not the compose project
-        # directory on the host: this is the base every *path* here is
-        # resolved against (config, logfile, data_dir) and those all live
-        # inside. The project directory is `workdir` on the row, used only
-        # to run invoke/docker compose (see instance_action).
-        #
-        # Read off the image rather than /proc/<pid>/cwd: one call instead
-        # of a ps plus a readlink, and it answers for a stopped container
-        # too, which has no process to ask.
-        out = host.on_box.run(["docker", "inspect", "-f", "{{.Config.WorkingDir}}", inst["container"]]).stdout
-        return Path(out.strip() or "/")
-
-    if inst["manager"] == "odoosh":
-        if host.is_local:
-            return Path.home()
-        return Path(host.run(["sh", "-c", "echo $HOME"]).stdout.strip() or "/root")
-
-    return _systemd_workdir(inst["name"], host)
 
 
 # Odoo's CLI mirrors its config keys once `--` is stripped and dashes become
@@ -1912,38 +1830,6 @@ def proc_cpu_ticks_many(pids: list[str], host: Host = LOCAL) -> dict[str, int | 
         pid, _, data = block.partition("\n")
         result[pid.strip()] = _parse_cpu_ticks(data)
     return result
-
-
-def instance_pid(inst: Instance, host: Host = LOCAL) -> str | None:
-    """The instance's master pid, straight from its process manager.
-
-    Not matched by database name: in multi-db/config-only setups the odoo
-    process's argv never carries a db name at all (only postgres's own
-    backends do, since they connect to a specific db), so a db-name-in-argv
-    heuristic both misses the real process and can misfire on postgres.
-    """
-    if inst["manager"] == "odoosh":
-        return _odoosh_master_pid(host)
-
-    if inst["manager"] == "docker":
-        # compose has no MainPID to ask for, and the pid is the container's
-        # own (see docker_instances) -- so it comes from a ps inside it.
-        # Not cached on the row: a container that restarted keeps its name
-        # and gets a fresh pid, which a cached one would miss.
-        return _odoo_master_in(container_host(inst, host))
-
-    if inst["manager"] == "local":
-        # nothing to re-ask for a MainPID; `list_instances` re-runs on a timer,
-        # so a restart arrives as a fresh row rather than being tracked here
-        return inst.get("pid")
-
-    if inst["manager"] == "supervisor":
-        out = host.run(["supervisorctl", "pid", inst["name"]]).stdout.strip()
-        return out if out.isdigit() else None
-
-    out = host.run(["systemctl", "--user", "show", inst["name"], "-p", "MainPID"]).stdout
-    m = re.search(r"MainPID=(\d+)", out)
-    return m.group(1) if m and m.group(1) != "0" else None
 
 
 def _ps_snapshot(host: Host) -> tuple[dict[str, ProcRow], dict[str, list[str]]]:

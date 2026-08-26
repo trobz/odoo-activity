@@ -25,6 +25,7 @@ from textual.widgets import Button, DataTable, Input, RichLog, Static, Tree
 from textual.widgets.data_table import RowDoesNotExist
 
 from odoo_activity.host import Host, to_thread
+from odoo_activity.managers import db_host_for, host_for, instance_pid
 from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.mail import render_mail
 from odoo_activity.panes.processes import render_processes
@@ -39,9 +40,6 @@ from odoo_activity.probes import (
     _read_new_bytes,
     _untty,
     configfile_of,
-    container_host,
-    db_container_host,
-    instance_pid,
     instance_procs,
     instance_version,
     instance_workers,
@@ -648,7 +646,7 @@ class ActivityPane(Vertical):
         if not confirmed:
             return
 
-        at = container_host(inst, host)  # the pid is the container's, so the signal must be too
+        at = host_for(inst, host)  # the pid is the container's, so the signal must be too
         pid = await to_thread(instance_pid, inst, at)
         if pid is None:
             self.app.notify(f"{inst['name']}: no master pid found", severity="warning", timeout=3)
@@ -666,7 +664,7 @@ class ActivityPane(Vertical):
         # the argv, the paths in it and the shell that runs it are all the
         # container's when there is one -- Host.shell_invocation then wraps
         # the whole thing in `docker exec -it` (and ssh outside that)
-        host = container_host(inst, host)
+        host = host_for(inst, host)
         cmd = await to_thread(shell_command, inst, host)
         if cmd is None:
             self.app.notify(f"{inst['name']} isn't running — no shell command to copy", severity="warning", timeout=3)
@@ -686,7 +684,7 @@ class ActivityPane(Vertical):
         if not confirmed:
             return
 
-        host = container_host(inst, host)  # data_dir is a path inside the container
+        host = host_for(inst, host)  # data_dir is a path inside the container
         session_dir = await to_thread(session_dir_of, inst, host)
         if session_dir is None:
             self.app.notify(f"{inst['name']}: no data_dir configured", severity="warning", timeout=3)
@@ -1151,7 +1149,7 @@ class ActivityPane(Vertical):
         # the config file lives inside the container when there is one;
         # render_config copies it back out for odoo-config (which is on the
         # box, not in the image)
-        host = container_host(inst, self.app.host)
+        host = host_for(inst, self.app.host)
         config = await to_thread(configfile_of, inst, host)
 
         # each await above is an ssh round trip -- long enough remotely for
@@ -1198,7 +1196,7 @@ class ActivityPane(Vertical):
         port = await to_thread(pg_target_of, inst, host)
         # `ss`/`lsof` have to run where the odoo processes' sockets are: the
         # container's own network namespace, not the box's
-        jobrunners = await to_thread(jobrunner_pids, port, container_host(inst, host))
+        jobrunners = await to_thread(jobrunner_pids, port, host_for(inst, host))
 
         if self._instance is not inst or not self.is_processes_active():
             return  # instance or tab changed while this was fetching; the result is stale
@@ -1231,7 +1229,7 @@ class ActivityPane(Vertical):
         # different processes -- so ticks are read per group, and keyed by
         # group. Same host for every other manager, and then it stays one
         # round trip.
-        odoo_at, pg_at = container_host(inst, host), db_container_host(inst, host)
+        odoo_at, pg_at = host_for(inst, host), db_host_for(inst, host)
         if odoo_at == pg_at:
             flat = await to_thread(proc_cpu_ticks_many, [p["pid"] for p, _ in procs], odoo_at)
             ticks_by_pid = {(kind, p["pid"]): flat.get(p["pid"]) for p, kind in procs}

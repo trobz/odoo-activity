@@ -29,7 +29,7 @@ import typer
 from mcp.server.fastmcp import FastMCP
 from typing_extensions import TypedDict
 
-from odoo_activity import probes
+from odoo_activity import managers, probes
 from odoo_activity.host import Host
 from odoo_activity.probes import Instance, ProcRow, Worker
 
@@ -179,13 +179,13 @@ def _instances(host: Host) -> list[Instance]:
     now = time.monotonic()
 
     if cached is None or now - cached[0] >= _DISCOVERY_TTL:
-        _discovered[key] = (now, probes.list_instances(host))
+        _discovered[key] = (now, managers.list_instances(host))
 
     return _discovered[key][1]
 
 
 def _with_status(inst: Instance, host: Host) -> Instance:
-    return {**inst, "status": probes.instance_status(inst, host)}
+    return {**inst, "status": managers.instance_status(inst, host)}
 
 
 def _find(name: str, host: Host) -> Instance | None:
