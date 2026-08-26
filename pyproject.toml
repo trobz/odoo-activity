@@ -22,6 +22,14 @@ Repository = "https://github.com/trobz/odoo-activity"
 [project.entry-points."odoo_activity.plugins"]
 odooly = "odoo_activity.plugins.odooly:OdoolyPlugin"
 
+# the bundled managers come through the same door a third-party one would
+[project.entry-points."odoo_activity.managers"]
+systemd = "odoo_activity.managers.systemd:SystemdManager"
+supervisor = "odoo_activity.managers.supervisor:SupervisorManager"
+odoosh = "odoo_activity.managers.odoosh:OdooshManager"
+docker = "odoo_activity.managers.docker:DockerManager"
+local = "odoo_activity.managers.local:LocalManager"
+
 [project.scripts]
 odoo-activity = "odoo_activity.main:app"
 oa = "odoo_activity.main:app"

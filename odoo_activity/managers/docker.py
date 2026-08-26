@@ -30,6 +30,7 @@ _CONFIG_PATHS = ("/opt/odoo/auto/odoo.conf", "/etc/odoo/odoo.conf")
 
 class DockerManager(Manager):
     name = "docker"
+    order = 40
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
         return probes.docker_instances(host)

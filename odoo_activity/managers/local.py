@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 
 class LocalManager(Manager):
     name = "local"
+    # last: a process no real manager claimed reads as a footnote to the
+    # list rather than its head
+    order = 90
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
         return probes.local_instances(host)

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 class SystemdManager(Manager):
     name = "systemd"
+    order = 10
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
         return probes.systemd_instances(host)

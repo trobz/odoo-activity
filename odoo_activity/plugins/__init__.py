@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from odoo_activity.tui import OdooActivity
 
 GROUP = "odoo_activity.plugins"
+MANAGER_GROUP = "odoo_activity.managers"
 
 # what a contribution acts on: an instance row, or one database on one
 DbTarget = tuple["Instance", str]
@@ -93,23 +94,26 @@ def split_names(values: list[str] | None) -> list[str]:
     return [name.strip() for value in values or () for name in value.split(",") if name.strip()]
 
 
-def load() -> tuple[list[Plugin], list[str]]:
-    """Every installed plugin, plus a message for each one that failed.
+def load(group: str = GROUP) -> tuple[list, list[str]]:
+    """Everything registered under `group`, plus a message per failure.
 
-    A plugin that raises on import is skipped rather than fatal, and that
-    is load-bearing rather than merely defensive: the odooly plugin imports
+    One that raises on import is skipped rather than fatal, and that is
+    load-bearing rather than merely defensive: the odooly plugin imports
     `odooly`, so `oa` installed without that extra simply has no odooly
     plugin -- the same end state as never installing it.
+
+    Shared by both entry point groups: a manager is discovered exactly the
+    way a contributor is, and neither can take the TUI down by failing.
     """
-    plugins, failures = [], []
+    found, failures = [], []
 
-    for ep in entry_points(group=GROUP):
+    for ep in entry_points(group=group):
         try:
-            plugins.append(ep.load()())
+            found.append(ep.load()())
         except Exception as exc:
-            failures.append(f"plugin {ep.name} failed to load: {exc}")
+            failures.append(f"{ep.name} failed to load: {exc}")
 
-    return plugins, failures
+    return found, failures
 
 
 def select(plugins: list[Plugin], enable: list[str], disable: list[str]) -> list[Plugin]:

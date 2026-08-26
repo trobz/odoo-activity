@@ -40,6 +40,11 @@ class Manager:
     """
 
     name = ""
+    # where this manager's instances sit in the list -- display order only:
+    # lookup is by name, and `local` is an explicit fallback rather than
+    # the last one standing. The bundled five are spaced 10 apart so a
+    # third-party manager can land between any two of them.
+    order = 50
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
         """Every Odoo instance this manager runs on `host`."""

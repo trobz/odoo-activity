@@ -23,15 +23,12 @@ A manager overrides only what argv cannot express.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from odoo_activity import probes
+from odoo_activity import plugins, probes
 from odoo_activity.managers.base import Manager
-from odoo_activity.managers.docker import DockerManager
 from odoo_activity.managers.local import LocalManager
-from odoo_activity.managers.odoosh import OdooshManager
-from odoo_activity.managers.supervisor import SupervisorManager
-from odoo_activity.managers.systemd import SystemdManager
 from odoo_activity.probes import (
     LOCAL,
     container_host,
@@ -44,18 +41,49 @@ if TYPE_CHECKING:
     from odoo_activity.host import Host
     from odoo_activity.probes import Instance
 
-# Discovery order is display order: the managers a Trobz box actually uses
-# first, and `local` last -- it is the fallback for a process no manager
-# claims, so it reads as a footnote to the list rather than its head.
-MANAGERS: list[Manager] = [
-    SystemdManager(),
-    SupervisorManager(),
-    OdooshManager(),
-    DockerManager(),
-    LocalManager(),
-]
 
-_BY_NAME = {manager.name: manager for manager in MANAGERS}
+@lru_cache(maxsize=1)
+def _installed() -> tuple[tuple[Manager, ...], tuple[str, ...]]:
+    """Every installed manager, ordered, plus a message per failure.
+
+    The five bundled ones register in this project's own pyproject, through
+    the same entry point group a third-party manager would use: one loader
+    path, and the shipped managers exercise the door everyone else comes
+    through.
+
+    Resolved on first use rather than at import, so a manager that imports
+    this package back cannot deadlock the import graph. Cached because
+    discovery walks the installed distributions, and the answer cannot
+    change while the process runs.
+    """
+    found, failures = plugins.load(plugins.MANAGER_GROUP)
+
+    if not found:
+        # Entry points come from the *installed* metadata, not the source
+        # tree, so an editable install whose dist-info predates them
+        # discovers nothing while happily running this very code -- and
+        # with no manager there is no instance list at all. Say so, and
+        # keep the fallback so the app opens instead of tracebacking.
+        failures.append(
+            "no process managers found -- the installed odoo-activity metadata is stale; "
+            "reinstall it (`uv sync`, or `uv tool install --force --editable .`)"
+        )
+        found = [LocalManager()]
+
+    found.sort(key=lambda manager: (manager.order, manager.name))
+
+    return tuple(found), tuple(failures)
+
+
+def installed() -> list[Manager]:
+    """Every installed manager, in display order."""
+    return list(_installed()[0])
+
+
+def failures() -> list[str]:
+    """One message per manager that failed to load -- the app reports these
+    rather than silently listing fewer instances than the box has."""
+    return list(_installed()[1])
 
 
 def manager_of(inst: Instance) -> Manager:
@@ -66,7 +94,9 @@ def manager_of(inst: Instance) -> Manager:
     manager degrades to showing what is already known rather than raising
     in the middle of a render.
     """
-    return _BY_NAME.get(inst["manager"], _BY_NAME["local"])
+    by_name = {manager.name: manager for manager in installed()}
+
+    return by_name.get(inst["manager"]) or by_name.get("local") or LocalManager()
 
 
 def list_instances(host: Host = LOCAL) -> list[Instance]:
@@ -75,7 +105,7 @@ def list_instances(host: Host = LOCAL) -> list[Instance]:
     Each row carries its `manager` so later calls route back to the one that
     found it; two managers can even expose the same name (e.g. odoo-demo).
     """
-    return [inst for manager in MANAGERS for inst in manager.instances(host)]
+    return [inst for manager in installed() for inst in manager.instances(host)]
 
 
 def instance_status(inst: Instance, host: Host = LOCAL) -> str:
@@ -115,10 +145,11 @@ host_for = container_host
 db_host_for = db_container_host
 
 __all__ = [
-    "MANAGERS",
     "Manager",
     "db_host_for",
+    "failures",
     "host_for",
+    "installed",
     "instance_action",
     "instance_pid",
     "instance_status",

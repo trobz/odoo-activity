@@ -399,3 +399,30 @@ def test_docker_instances_are_empty_without_docker(monkeypatch):
 
     monkeypatch.setattr(Host, "run", no_docker)
     assert probes.docker_instances(Host()) == []
+
+
+def test_managers_are_discovered_through_entry_points(monkeypatch):
+    """The five bundled managers register the same way a third-party one
+    would, and keep their intended display order rather than whatever order
+    the metadata happens to list them in."""
+    managers._installed.cache_clear()
+    found = managers.installed()
+
+    assert [m.name for m in found] == ["systemd", "supervisor", "odoosh", "docker", "local"]
+    assert managers.failures() == []
+
+
+def test_stale_metadata_says_so_instead_of_showing_an_empty_list(monkeypatch):
+    """Entry points come from the installed dist-info, not the source tree:
+    an editable install whose metadata predates them finds no manager at all
+    while running this very code. An empty instance list would read as `this
+    box has no Odoo`, so it is reported and the fallback keeps the app up."""
+    monkeypatch.setattr(managers.plugins, "load", lambda *_a, **_k: ([], []))
+    managers._installed.cache_clear()
+
+    assert [m.name for m in managers.installed()] == ["local"]
+    assert "metadata is stale" in managers.failures()[0]
+    # and nothing tracebacks on a row whose manager is now missing
+    assert managers.manager_of(_inst("running")).name == "local"
+
+    managers._installed.cache_clear()

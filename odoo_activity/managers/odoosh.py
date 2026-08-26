@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 class OdooshManager(Manager):
     name = "odoosh"
+    order = 30
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
         return probes.odoosh_instances(host)

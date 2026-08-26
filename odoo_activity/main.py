@@ -8,7 +8,7 @@ from typing import Annotated
 
 import typer
 
-from odoo_activity import plugins
+from odoo_activity import managers, plugins
 from odoo_activity.host import Host, close_control_master
 from odoo_activity.tui import OdooActivity
 
@@ -67,7 +67,9 @@ def main(
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
 
-    for failure in failures:
+    # a manager that failed to load means instances silently missing from
+    # the list, which is worth a line on stderr rather than a shorter list
+    for failure in (*failures, *managers.failures()):
         typer.echo(failure, err=True)
 
     target = Host(alias=host, port=port)

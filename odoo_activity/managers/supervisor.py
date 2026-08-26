@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 class SupervisorManager(Manager):
     name = "supervisor"
+    order = 20
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
         return probes.supervisor_instances(host)
