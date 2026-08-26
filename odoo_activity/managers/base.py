@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -12,7 +13,7 @@ from odoo_activity.probes import LOCAL
 
 if TYPE_CHECKING:
     from odoo_activity.host import Host
-    from odoo_activity.probes import Instance
+    from odoo_activity.probes import Instance, ProcRow, Worker
 
 
 def _config_names(instance_name: str) -> list[str]:
@@ -128,3 +129,33 @@ class Manager:
             return None
 
         return host.popen(["tail", "-f", "-n", "0", str(path)], stderr=subprocess.DEVNULL, text=False)
+
+    def data_dir(self, inst: Instance, host: Host = LOCAL) -> str | None:
+        """The instance's `data_dir`, from its odoo config."""
+        _, parser = probes.instance_config(inst, host)
+
+        return probes._opt(parser, "data_dir")
+
+    def version(self, inst: Instance, host: Host = LOCAL) -> str | None:
+        """The instance's Odoo version, via the `odoo-addons-path` CLI --
+        layout and addons-path detection live there, not here."""
+        try:
+            out = host.run(
+                ["odoo-addons-path", str(self.workdir(inst, host)), "--verbose", "--format", "json"]
+            ).stdout
+        except FileNotFoundError:
+            return None
+
+        try:
+            return json.loads(out).get("version")
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def dump_stacks(self, inst: Instance, procs: list[ProcRow], host: Host = LOCAL) -> tuple[str, list[Worker]]:
+        """SIGQUIT every worker and collect what it wrote.
+
+        The file strategy: note the log's size first, then read only what
+        arrives past that offset. A manager whose log is a stream has to
+        attach a reader *before* signalling instead.
+        """
+        return probes._dump_via_logfile(inst, procs, host)

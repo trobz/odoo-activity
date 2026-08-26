@@ -65,3 +65,13 @@ class OdooshManager(Manager):
         path = self.workdir(inst, host) / "logs" / "odoo.log"
 
         return path if host.is_file(path) else None
+
+    def data_dir(self, inst: Instance, host: Host = LOCAL) -> str | None:
+        """odoo.sh's fixed `~/data` -- its config has no `data_dir` key,
+        same as it has no `logfile` one."""
+        return str(self.workdir(inst, host) / "data")
+
+    def version(self, inst: Instance, host: Host = LOCAL) -> str | None:
+        """Straight off the row: odoo.sh's own `$ODOO_VERSION`, captured at
+        discovery time."""
+        return inst.get("version")

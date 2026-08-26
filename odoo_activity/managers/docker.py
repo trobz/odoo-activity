@@ -7,6 +7,7 @@ every shared probe work against them without a branch of its own.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -17,7 +18,7 @@ from odoo_activity.probes import LOCAL
 
 if TYPE_CHECKING:
     from odoo_activity.host import Host
-    from odoo_activity.probes import Instance
+    from odoo_activity.probes import Instance, ProcRow, Worker
 
 # doodba first, then the official image. An image puts the config where it
 # likes, so there is no `<workdir>/config/` convention to walk -- a custom
@@ -116,3 +117,17 @@ class DockerManager(Manager):
             stderr=subprocess.STDOUT,
             text=False,
         )
+
+    def version(self, inst: Instance, host: Host = LOCAL) -> str | None:
+        """`odoo --version` inside the container: odoo-addons-path is one of
+        our own tools, installed on the box and not in the image -- and the
+        layout it would inspect is inside the container anyway."""
+        out = self.host_for(inst, host).run(["odoo", "--version"]).stdout
+        found = re.search(r"(\d+\.\d+)", out)
+
+        return found.group(1) if found else None
+
+    def dump_stacks(self, inst: Instance, procs: list[ProcRow], host: Host = LOCAL) -> tuple[str, list[Worker]]:
+        """The log is a stream, so the reader attaches before the signal --
+        there is no offset to seek back to afterwards."""
+        return probes._dump_via_stream(inst, procs, host)

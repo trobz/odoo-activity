@@ -1361,11 +1361,7 @@ def data_dir_of(inst: Instance, host: Host = LOCAL) -> str | None:
     """The instance's `data_dir`, from its odoo config, or odoo.sh's fixed
     `~/data` (its config has no `data_dir` key -- same reasoning as
     `logfile_of`'s odoosh case)."""
-    if inst["manager"] == "odoosh":
-        return str(instance_workdir(inst, host) / "data")
-
-    _, parser = instance_config(inst, host)
-    return _opt(parser, "data_dir")
+    return _manager_of(inst).data_dir(inst, host)
 
 
 def session_dir_of(inst: Instance, host: Host = LOCAL) -> str | None:
@@ -2245,12 +2241,16 @@ def dump_and_parse_stacks(inst: Instance, host: Host = LOCAL) -> tuple[str, list
     if not procs:
         return "(no workers alive)", []
 
+    return _manager_of(inst).dump_stacks(inst, procs, host)
+
+
+def _dump_via_logfile(inst: Instance, procs: list[ProcRow], host: Host = LOCAL) -> tuple[str, list[Worker]]:
+    """`dump_and_parse_stacks` for an instance whose log is a file: note its
+    size, signal every worker, then read only what arrived after that offset.
+    """
     at = container_host(inst, host)  # whose pids these are, so whose namespace the signal goes to
     expected = {proc["pid"] for proc in procs}
     text = ""
-
-    if inst["manager"] == "docker":
-        return _dump_via_stream(inst, procs, host)
 
     path = logfile_of(inst, host)
     if path is None or not host.is_file(path):
@@ -2293,26 +2293,7 @@ def instance_version(inst: Instance, host: Host = LOCAL) -> str | None:
     """The instance's Odoo version, via the `odoo-addons-path` CLI (layout/
     addons-path detection lives there, not here) — or straight from
     odoo.sh's own `$ODOO_VERSION` env var, captured at discovery time."""
-    if inst["manager"] == "odoosh":
-        return inst.get("version")
-
-    if inst["manager"] == "docker":
-        # odoo-addons-path is one of our own tools, installed on the box and
-        # not in the image -- and the layout it would inspect is inside the
-        # container anyway. odoo can just say what it is.
-        out = container_host(inst, host).run(["odoo", "--version"]).stdout
-        m = re.search(r"(\d+\.\d+)", out)
-        return m.group(1) if m else None
-
-    try:
-        out = host.run(["odoo-addons-path", str(instance_workdir(inst, host)), "--verbose", "--format", "json"]).stdout
-    except FileNotFoundError:
-        return None
-
-    try:
-        return json.loads(out).get("version")
-    except (json.JSONDecodeError, ValueError):
-        return None
+    return _manager_of(inst).version(inst, host)
 
 
 def render_config(config: Path, version: str | None, mode: str, host: Host = LOCAL) -> str:
