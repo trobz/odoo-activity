@@ -127,27 +127,56 @@ def match_odooly_env(instance_name: str, db: str, envs: list[OdoolyEnv]) -> str 
     return min(matches)[3] if matches else None
 
 
+def _is_bare_name(script: str) -> bool:
+    """Whether `script` names one of this package's own scripts rather than
+    a path to a project's. `.py` is what separates them -- a bundled script
+    is named without it, a discovered one always carries it."""
+    return not script.endswith(".py")
+
+
+def _script_label(path: Path) -> str:
+    """`zones.py` -> `zones (project)`, so a project's own scripts read as
+    rows rather than filenames, and are never mistaken for packaged ones."""
+    return f"{path.stem.replace('_', ' ')} (project)"
+
+
+def project_scripts(root: Path | None = None) -> list[Path]:
+    """The `scripts/*.py` of the directory `oa` was launched from, sorted.
+
+    A project's own scripts live in that project's repository, so running
+    `oa` from a checkout is what offers them -- nothing to install, nothing
+    to register. Private files (`_helpers.py`) are skipped, so a project can
+    keep shared code next to the scripts that use it.
+    """
+    folder = (root or Path.cwd()) / "scripts"
+    if not folder.is_dir():
+        return []
+
+    return sorted(path for path in folder.glob("*.py") if not path.name.startswith("_"))
+
+
 def run_odooly_script(script: str, env: str, *extra_args: str, timeout: int = 300) -> str:
     """Run an odooly script against env `env`, and return what it printed
     (stdout, then stderr).
 
-    A bare name is one of this plugin's own scripts; a dotted one is any
-    importable module, which is how a project ships scripts that only make
-    sense for it (`oa_demeter.scripts.zones`).
+    A bare name is one of this plugin's own scripts, run as a module; a path
+    is a project's own script (see `project_scripts`), run as a file so it
+    keeps working whatever the working directory ends up being.
 
     Deliberately local and never over `Host`: odooly reaches the instance
     over the network using this machine's `~/odooly.ini`, which the watched
     host neither has nor should be asked for.
 
-    `sys.executable -m` rather than a console script, so it is the
-    interpreter running odoo-activity -- the one odooly is installed in --
-    whatever `PATH` says.
+    `sys.executable` rather than a console script, so it is the interpreter
+    running odoo-activity -- the one odooly is installed in -- whatever
+    `PATH` says. That is also what lets a project script import this
+    package's own `redact`/`use_user_config` helpers.
 
     `extra_args` is appended verbatim after `--env <env>`, for a script
     that needs more than the env to run (e.g. send_test_mail's `--to`).
     """
-    module = script if "." in script else f"{_SCRIPTS}.{script}"
-    argv = [sys.executable, "-m", module, "--env", env, *extra_args]
+    target = ["-m", f"{_SCRIPTS}.{script}"] if _is_bare_name(script) else [script]
+    argv = [sys.executable, *target, "--env", env, *extra_args]
 
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
@@ -194,10 +223,16 @@ class OdoolyPlugin(Plugin):
         if db is None or self.env_for(db) is None:
             return []
 
-        return [
+        rows: list[Tool] = [
             ("Open odooly (copy command)", self._copy_command),
             ("Restore app icons", self._script("restore_app_icons", "Restore app icons")),
         ]
+
+        # a project's own scripts get the same login this database resolved
+        # to, so they are offered on exactly the databases odooly can reach
+        rows += [(_script_label(path), self._script(str(path), path.stem)) for path in project_scripts()]
+
+        return rows
 
     def column(self, mode: str, target: Target) -> str:
         db = self._db(mode, target)

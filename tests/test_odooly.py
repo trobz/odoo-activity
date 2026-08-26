@@ -99,6 +99,40 @@ def test_scripts_run_in_this_interpreter_and_report_what_they_printed(monkeypatc
     assert seen["argv"][0] == odooly_plugin.sys.executable
 
 
+def test_a_projects_own_scripts_are_offered_and_run_by_path(tmp_path, monkeypatch):
+    """A project ships scripts that only make sense for it, in its own repo:
+    launching `oa` from that checkout is what offers them. They run by path,
+    not as `-m scripts.x`, so the call survives a working directory that
+    isn't the checkout by the time the row is pressed."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in ("zones.py", "sync_prices.py", "_shared.py", "notes.txt"):
+        (scripts / name).write_text("")
+
+    monkeypatch.chdir(tmp_path)
+
+    # `_shared.py` is a helper the others import, `notes.txt` is not a script
+    assert [p.name for p in odooly_plugin.project_scripts()] == ["sync_prices.py", "zones.py"]
+
+    seen = {}
+    monkeypatch.setattr(
+        odooly_plugin.subprocess,
+        "run",
+        lambda argv, **_k: seen.update(argv=argv) or SimpleNamespace(stdout="done\n", stderr="", returncode=0),
+    )
+
+    assert odooly_plugin.run_odooly_script(str(scripts / "zones.py"), "demo-int") == "done"
+    assert seen["argv"] == [odooly_plugin.sys.executable, str(scripts / "zones.py"), "--env", "demo-int"]
+
+
+def test_project_scripts_are_absent_without_a_scripts_directory(tmp_path, monkeypatch):
+    """Nothing to offer, and nothing to complain about — most projects have
+    no scripts of their own."""
+    monkeypatch.chdir(tmp_path)
+
+    assert odooly_plugin.project_scripts() == []
+
+
 def test_run_odooly_script_appends_extra_args_after_env(monkeypatch):
     """send_test_mail needs a --to the caller supplies -- appended after
     --env, in the order the standalone CLI itself expects."""
