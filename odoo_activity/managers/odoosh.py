@@ -75,3 +75,8 @@ class OdooshManager(Manager):
         """Straight off the row: odoo.sh's own `$ODOO_VERSION`, captured at
         discovery time."""
         return inst.get("version")
+
+    def databases(self, inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | None]:
+        """A single env-provided database (`PGDATABASE`), captured at
+        discovery: there is exactly one, so no role query to run."""
+        return [inst["db"]], None

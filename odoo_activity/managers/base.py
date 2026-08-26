@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import json
 import re
 import subprocess
@@ -140,9 +141,7 @@ class Manager:
         """The instance's Odoo version, via the `odoo-addons-path` CLI --
         layout and addons-path detection live there, not here."""
         try:
-            out = host.run(
-                ["odoo-addons-path", str(self.workdir(inst, host)), "--verbose", "--format", "json"]
-            ).stdout
+            out = host.run(["odoo-addons-path", str(self.workdir(inst, host)), "--verbose", "--format", "json"]).stdout
         except FileNotFoundError:
             return None
 
@@ -159,3 +158,30 @@ class Manager:
         attach a reader *before* signalling instead.
         """
         return probes._dump_via_logfile(inst, procs, host)
+
+    def databases(self, inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | None]:
+        """(databases, postgres port) for this instance.
+
+        Read off one parser rather than calling `db_port_of`, which would
+        re-fetch and re-parse the config: cheap to duplicate locally, but
+        each fetch is its own ssh round trip remotely.
+        """
+        _, parser = probes.instance_config(inst, host)
+        port = probes._opt(parser, "db_port")
+        # ODOO_ACTIVITY_DB_ROLE describes *this box's* cluster convention
+        # (locally every db is owned by `openerp`), so it wins where set;
+        # else the config names the role odoo connects as, and the
+        # instance's own name is the last resort.
+        role = probes.DB_ROLE or probes._opt(parser, "db_user") or inst["name"].removesuffix(".service")
+
+        return probes.databases_by_role(role, port, host), port
+
+    def pg_target(
+        self, inst: Instance, host: Host = LOCAL, parser: configparser.RawConfigParser | None = None
+    ) -> probes.PgTarget:
+        """Where this instance's postgres is, as the db-tab probes need it.
+
+        A port on the box's own cluster, for every manager whose instance
+        shares that cluster.
+        """
+        return probes.PgTarget(port=probes.db_port_of(inst, host))

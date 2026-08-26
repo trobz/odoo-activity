@@ -43,3 +43,14 @@ class LocalManager(Manager):
         """The config's `logfile`, else stdout when it was redirected to a
         file -- the closest thing to one for a runner that never set it."""
         return super().logfile(inst, host) or probes._redirected_stdout(inst, host)
+
+    def databases(self, inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | None]:
+        """`-d`/`db_name` on the command line pins the instance to those
+        databases; unpinned is genuinely multi-db, so fall back to asking
+        the cluster which ones its role owns."""
+        _, parser = probes.instance_config(inst, host)
+
+        if pinned := probes._opt(parser, "db_name"):
+            return [name.strip() for name in pinned.split(",") if name.strip()], probes._opt(parser, "db_port")
+
+        return super().databases(inst, host)

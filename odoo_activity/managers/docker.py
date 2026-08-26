@@ -7,6 +7,7 @@ every shared probe work against them without a branch of its own.
 
 from __future__ import annotations
 
+import configparser
 import re
 import subprocess
 from pathlib import Path
@@ -131,3 +132,24 @@ class DockerManager(Manager):
         """The log is a stream, so the reader attaches before the signal --
         there is no offset to seek back to afterwards."""
         return probes._dump_via_stream(inst, procs, host)
+
+    def pg_target(
+        self, inst: Instance, host: Host = LOCAL, parser: configparser.RawConfigParser | None = None
+    ) -> probes.PgTarget:
+        return probes._container_pg_target(inst, host, parser)
+
+    def databases(self, inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | None]:
+        """Asked of the container's own cluster, as the role its own config
+        connects with.
+
+        `ODOO_ACTIVITY_DB_ROLE` deliberately does not apply: it describes
+        this box's cluster convention, and applying it to a container is
+        what made a stopped project report the host's databases as its own.
+        """
+        _, parser = probes.instance_config(inst, host)
+        target = self.pg_target(inst, host, parser)
+
+        if target.host is None or target.host.endswith(".invalid"):
+            return [], None  # postgres isn't up; nothing to list, and nothing to mistake for it
+
+        return probes.databases_by_role(target.user or "odoo", target, host), target.port

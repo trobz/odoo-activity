@@ -1145,9 +1145,18 @@ def pg_target_of(inst: Instance, host: Host = LOCAL, parser: configparser.RawCon
     environment, which is where the official image keeps them) — so the TUI
     reaches the database exactly the way the instance does.
     """
-    if inst["manager"] != "docker":
-        return PgTarget(port=db_port_of(inst, host))
+    return _manager_of(inst).pg_target(inst, host, parser)
 
+
+def _container_pg_target(inst: Instance, host: Host, parser: configparser.RawConfigParser | None) -> PgTarget:
+    """`pg_target_of` for a compose project, whose postgres is a container.
+
+    The address comes from the compose network, the role and password from
+    the odoo config that the odoo container is itself connecting with
+    (falling back to its environment, which is where the official image
+    keeps them) -- so the TUI reaches the database exactly the way the
+    instance does.
+    """
     if parser is None:  # `databases_of` already has one; reading it again is a copy out of the container
         _workdir, parser = instance_config(inst, host)
 
@@ -1401,29 +1410,7 @@ def databases_of(inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | N
     scratch) — cheap to duplicate locally, but each fetch is its own ssh
     round trip remotely.
     """
-    if inst["manager"] == "odoosh":
-        return [inst["db"]], None
-
-    _, parser = instance_config(inst, host)
-    port = _opt(parser, "db_port")
-
-    # `-d`/`db_name` pins it to one db; unpinned is genuinely multi-db
-    if inst["manager"] == "local" and (pinned := _opt(parser, "db_name")):
-        return [name.strip() for name in pinned.split(",") if name.strip()], port
-
-    if inst["manager"] == "docker":
-        # ODOO_ACTIVITY_DB_ROLE is about *this box's* cluster convention
-        # (locally every db is owned by `openerp`); a container's cluster is
-        # its own, and the role odoo connects as is right there in its
-        # config -- so the env override deliberately doesn't apply here.
-        target = pg_target_of(inst, host, parser)
-        if target.host is None or target.host.endswith(".invalid"):
-            return [], None  # postgres isn't up; nothing to list, and nothing to mistake for it
-
-        return databases_by_role(target.user or "odoo", target, host), target.port
-
-    role = DB_ROLE or _opt(parser, "db_user") or inst["name"].removesuffix(".service")
-    return databases_by_role(role, port, host), port
+    return _manager_of(inst).databases(inst, host)
 
 
 def databases_by_role(role: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> list[str]:

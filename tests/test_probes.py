@@ -300,7 +300,9 @@ def test_container_databases_ignore_the_boxs_db_role_convention(monkeypatch):
     doesn't reach here, or a container would be listed with the box's
     databases."""
     monkeypatch.setattr(probes, "DB_ROLE", "openerp")
-    monkeypatch.setattr(probes, "pg_target_of", lambda *_: probes.PgTarget(host="172.20.0.3", port="5432", user="odoo"))
+    monkeypatch.setattr(
+        probes, "_container_pg_target", lambda *_: probes.PgTarget(host="172.20.0.3", port="5432", user="odoo")
+    )
     asked: list[str] = []
     monkeypatch.setattr(probes, "databases_by_role", lambda role, *_a, **_k: asked.append(role) or ["devel", "e2e"])
 
