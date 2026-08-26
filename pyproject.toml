@@ -34,12 +34,20 @@ dev = [
     "ty>=0.0.1a16",
     "ruff>=0.11.5",
     "pytest>=7.2.0",
+    "pytest-xdist>=3.6",
+    # a runtime extra, but not an optional one for the suite: the bundled
+    # odooly plugin's tests import it, and skipping them when it is absent
+    # would quietly stop testing the plugin at all
+    "odooly>=2.6",
     "python-semantic-release>=10.5.3",
     "zensical>=0.0.40",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# the TUI tests each spin up their own Textual app and are independent, so
+# the suite is worth spreading across cores rather than serialising
+addopts = "-n auto"
 
 
 [build-system]
