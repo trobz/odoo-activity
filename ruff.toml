@@ -47,6 +47,9 @@ extend-safe-fixes = ["UP008"]
 "odoo_activity/probes.py" = ["S603", "S607"]
 # dispatches argv built by probes.py's own fixed-argv calls (see above), plus `ssh`
 "odoo_activity/host.py" = ["S603", "S607"]
+# runs its own scripts as `sys.executable -m <module>` -- an absolute
+# interpreter path and a module name, neither of them untrusted input
+"odoo_activity/plugins/odooly/__init__.py" = ["S603"]
 
 [format]
 preview = true

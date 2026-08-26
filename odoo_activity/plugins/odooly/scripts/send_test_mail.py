@@ -8,7 +8,7 @@ the record `outgoing` for the mail queue cron to pick up, is what makes this
 synchronous -- the result is known by the time this exits rather than
 "maybe, eventually".
 
-    python -m odoo_activity.scripts.send_test_mail --env acme18-int --to me@example.com
+    python -m odoo_activity.plugins.odooly.scripts.send_test_mail --env acme18-int --to me@example.com
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import sys
 import odooly
 import typer
 
-from odoo_activity.scripts import redact, use_user_config
+from odoo_activity.plugins.odooly.scripts import redact, use_user_config
 
 app = typer.Typer(add_completion=False)
 

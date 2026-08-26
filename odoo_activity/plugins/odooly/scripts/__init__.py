@@ -6,7 +6,7 @@ user's `~/odooly.ini` and connect from wherever they are run. The Toolbox
 tabs shell out to them (see panes/detail.py), and they stay usable on their
 own:
 
-    python -m odoo_activity.scripts.restore_app_icons --env acme18-int
+    python -m odoo_activity.plugins.odooly.scripts.restore_app_icons --env acme18-int
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import re
 
 import odooly
 
-from odoo_activity.probes import ODOOLY_CONFIG
+from odoo_activity.plugins.odooly import ODOOLY_CONFIG
 
 
 def use_user_config() -> None:

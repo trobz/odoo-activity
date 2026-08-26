@@ -14,12 +14,14 @@ dependencies = [
     "typing-extensions>=4.16",
     "mcp[cli]>=1.28.1,<2.0.0",
     "pyperclip>=1.11.0",
-    "odooly>=2.6",
     "requests>=2.32",
 ]
 
 [project.urls]
 Repository = "https://github.com/trobz/odoo-activity"
+[project.entry-points."odoo_activity.plugins"]
+odooly = "odoo_activity.plugins.odooly:OdoolyPlugin"
+
 [project.scripts]
 odoo-activity = "odoo_activity.main:app"
 oa = "odoo_activity.main:app"
@@ -52,6 +54,10 @@ module-root = ""
 [project.optional-dependencies]
 build = ["uv ~= 0.7.12"]
 mcp = []
+odooly = ["odooly>=2.6"]
+# hand-maintained: a new bundled plugin needs its own extra above and a
+# mention here, and this can only reach plugins shipped with odoo-activity
+all = ["odoo-activity[odooly]"]
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

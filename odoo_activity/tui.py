@@ -33,12 +33,13 @@ from odoo_activity.probes import (
     instance_status,
     instance_workdir,
     list_instances,
-    match_odooly_env,
     read_cpu_times,
     read_host_stats,
-    read_odooly_envs,
     signal_process,
 )
+
+if TYPE_CHECKING:
+    from odoo_activity.plugins import DbTarget, Plugin
 
 # sort priority for the instances list: running first, then a failure state
 # (systemd "failed", supervisor "exited"/"fatal"), then a clean "stopped"
@@ -99,12 +100,10 @@ def _db_label(db: str, port: str | None, name_width: int, uptime_width: int, ind
     return f"{db}{' ' * pad}[dim]{port}[/]"
 
 
-def _odooly_marker(env: str | None) -> str:
-    """The `ODOOLY` tag every db row carries once `--enable-odooly` is on:
-    green when a section can reach it, red when none can. Both are shown —
-    an absent marker reads as the flag not being passed, which is the one
-    thing the tag exists to tell apart."""
-    return "[green]ODOOLY[/]" if env else "[red]ODOOLY[/]"
+def _markers(plugins: list[Plugin], target: DbTarget) -> str:
+    """Every installed plugin's tag for this database row, space-separated
+    and empty when none has anything to say."""
+    return " ".join(tag for plugin in plugins if (tag := plugin.marker(target)))
 
 
 def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50) -> str:
@@ -205,15 +204,12 @@ class OdooActivity(App):
         host: Host | None = None,
         *,
         include_sensitive_information: bool = True,
-        enable_odooly: bool = False,
+        plugins: list[Plugin] | None = None,
     ) -> None:
         super().__init__()
         self.host = host or Host()
         self.include_sensitive_information = include_sensitive_information
-        self.enable_odooly = enable_odooly
-        # read once, at startup: the file is the user's own and small, and a
-        # row's marker must not depend on when it happened to be rendered
-        self.odooly_envs = read_odooly_envs() if enable_odooly else []
+        self.plugins = plugins or []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="body"):
@@ -412,7 +408,7 @@ class OdooActivity(App):
         names, port = cached
         items = []
 
-        instance_name = self._instances[key]["name"] if key in self._instances else ""
+        inst = self._instances.get(key)
 
         for db in names:
             db_key = f"{key}::db::{db}"
@@ -421,23 +417,12 @@ class OdooActivity(App):
             # two spaces off the filled field, the gap the instance rows put
             # between their uptime and their status: the tag reads as that
             # same column rather than as a ragged suffix of the db name
-            marker = f"  {_odooly_marker(self.odooly_env_for(instance_name, db))}" if self.enable_odooly else ""
+            tags = _markers(self.plugins, (inst, db)) if inst is not None else ""
+            marker = f"  {tags}" if tags else ""
             label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}{marker}"
             items.append(ListItem(Label(label), name=db_key))
 
         return items
-
-    def odooly_env_for(self, instance_name: str, db: str) -> str | None:
-        """The odooly env serving `db` on `instance_name`, or None when there
-        is no match (or `--enable-odooly` was not passed, which leaves
-        `odooly_envs` empty and every lookup unmatched)."""
-        return match_odooly_env(instance_name, db, self.odooly_envs) if self.odooly_envs else None
-
-    def highlighted_odooly_env(self) -> str | None:
-        """The odooly env of the highlighted database row, if it has one."""
-        hit = self.highlighted_db()
-
-        return self.odooly_env_for(hit[0]["name"], hit[1]) if hit is not None else None
 
     def _highlighted_owner(self) -> str | None:
         item = self.query_one("#instances", InstanceList).highlighted_child

@@ -8,7 +8,7 @@ is private, which Odoo refuses to expose. So odooly is used for what it is
 good for here (resolving `--env` to a server, database and credentials) and
 the two calls the controller needs go over plain HTTP.
 
-    python -m odoo_activity.scripts.create_test_job --env acme18-int
+    python -m odoo_activity.plugins.odooly.scripts.create_test_job --env acme18-int
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from http.cookiejar import CookieJar
 import odooly
 import typer
 
-from odoo_activity.scripts import redact, use_user_config
+from odoo_activity.plugins.odooly.scripts import redact, use_user_config
 
 app = typer.Typer(add_completion=False)
 

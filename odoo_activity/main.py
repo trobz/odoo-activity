@@ -4,9 +4,11 @@ import os
 import queue
 import traceback
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
+from odoo_activity import plugins
 from odoo_activity.host import Host, close_control_master
 from odoo_activity.tui import OdooActivity
 
@@ -34,12 +36,18 @@ def main(
     debug: bool = typer.Option(
         False, "--debug", help=f"log keypress/loop-lag diagnostics to {DEBUG_LOG_PATH} (tail -f it from elsewhere)."
     ),
-    enable_odooly: bool = typer.Option(
-        False,
-        "--enable-odooly",
-        help="Experimental: match each database against ~/odooly.ini and enable the actions that need "
-        "a login (Database > Toolbox, Jobs > Create test job).",
-    ),
+    enable_plugins: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--enable-plugins",
+            help="Run only these plugins, by name (comma-separated, or repeat the flag). "
+            "Every installed plugin runs when this is omitted.",
+        ),
+    ] = None,
+    disable_plugins: Annotated[
+        list[str] | None,
+        typer.Option("--disable-plugins", help="Run everything except these. Wins over --enable-plugins."),
+    ] = None,
     include_sensitive_information: bool = typer.Option(
         True,
         "--include-sensitive-information/--no-include-sensitive-information",
@@ -51,13 +59,24 @@ def main(
     if debug:
         _setup_debug_logging()
 
+    installed, failures = plugins.load()
+    try:
+        active = plugins.select(installed, plugins.split_names(enable_plugins), plugins.split_names(disable_plugins))
+    except plugins.UnknownPlugin as exc:
+        # a typo must not look like a plugin that has nothing to say
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
+
+    for failure in failures:
+        typer.echo(failure, err=True)
+
     target = Host(alias=host, port=port)
     code = 0
     try:
         OdooActivity(
             host=target,
             include_sensitive_information=include_sensitive_information,
-            enable_odooly=enable_odooly,
+            plugins=active,
         ).run()
     except BaseException:
         traceback.print_exc()

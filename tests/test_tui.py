@@ -1053,7 +1053,7 @@ def test_mail_tab_renders_via_the_log_body_and_shows_only_check_port_25_without_
             assert pilot.app.query_one("#actable", DataTable).display is False
             assert pane.query_one("#acactions", detail_mod.Horizontal).display is True
             assert pilot.app.query_one("#check-port-25", detail_mod.Button)
-            assert list(pane.query(f"#{detail_mod._SEND_TEST_MAIL_ACTION[0]}")) == []
+            assert list(pane.query("#send-test-mail")) == []
 
     asyncio.run(go())
 

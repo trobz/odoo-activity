@@ -18,7 +18,6 @@ import select
 import signal
 import socket
 import subprocess
-import sys
 import time
 from collections import Counter
 from collections.abc import Mapping
@@ -2758,131 +2757,6 @@ _LOGO = r"""
     +yhhyhohhy        '/shhhyhhhys/'    -oyhhhyhhhyo:ossssssssssss+'
      '-///:///          '.-://:-'          .:///:.' -:::::::::::::::
 """
-
-
-# ---------------------------------------------------------------- odooly ---
-# odooly connects to an instance over the network, so its config is read from
-# *this* machine even when the instances being watched are on a remote host:
-# `oa openerp@somehost` still runs odooly locally, against the same envs the
-# user has in their own `~/odooly.ini`.
-ODOOLY_CONFIG = Path("~/odooly.ini").expanduser()
-
-# Trobz names instances after the environment they serve, and odooly envs
-# after the same thing abbreviated (or not) -- `openerp-acme18-integration`
-# is configured as `acme18-integration` or `acme18-int`.
-_ENV_ABBREVIATIONS = {"integration": "int", "staging": "stag", "production": "prod"}
-# what a manager prefixes an instance name with, which no odooly env repeats
-_INSTANCE_PREFIXES = ("openerp-", "odoo-")
-
-
-class OdoolyEnv(TypedDict):
-    """One section of `odooly.ini`: the env name, and the database it pins
-    (absent when the section leaves `database` unset)."""
-
-    name: str
-    db: str
-
-
-def read_odooly_envs(path: Path = ODOOLY_CONFIG) -> list[OdoolyEnv]:
-    """Every environment in `path`, as (name, database).
-
-    Read with configparser rather than `odooly.read_config`, which returns
-    the password too: matching only needs the name and the database, and
-    what isn't read can't be leaked into a log or a screen.
-
-    Empty when the file is missing or unparseable -- odooly support is
-    opt-in and best-effort, and a broken ini shouldn't take the app down.
-    """
-    parser = configparser.RawConfigParser()
-    try:
-        parser.read_string(path.read_text())
-    except (OSError, configparser.Error):
-        return []
-
-    return [{"name": name, "db": parser.get(name, "database", fallback="")} for name in parser.sections()]
-
-
-def _name_variants(name: str) -> set[str]:
-    """`name` as it may appear on either side of the match: as written, and
-    with each environment word abbreviated or spelled out."""
-    variants = {name}
-
-    for long, short in _ENV_ABBREVIATIONS.items():
-        variants |= {variant.replace(long, short) for variant in variants if long in variant}
-        variants |= {variant.replace(short, long) for variant in variants if short in variant}
-
-    return variants
-
-
-def instance_env_name(instance_name: str) -> str:
-    """`instance_name` stripped of what only a process manager adds --
-    `openerp-acme18-integration.service` is the `acme18-integration` an
-    odooly env would be named after."""
-    name = instance_name.removesuffix(".service")
-
-    for prefix in _INSTANCE_PREFIXES:
-        name = name.removeprefix(prefix)
-
-    return name
-
-
-def match_odooly_env(instance_name: str, db: str, envs: list[OdoolyEnv]) -> str | None:
-    """The odooly env serving `db` on `instance_name`, or None.
-
-    An env qualifies when its name matches the instance's -- exactly, in
-    either spelling (`-integration` / `-int`), or as that name plus a suffix,
-    since a multi-db instance is usually configured one env per database
-    (`acme18-int-db1`). The database has to match exactly whenever the env
-    names one, which is what keeps those per-db envs apart.
-
-    Ranked, best first: an env that names this database beats one that names
-    none, and among equals the closest name wins. Ties are broken by name so
-    the answer doesn't depend on the ini's ordering.
-    """
-    wanted = _name_variants(instance_env_name(instance_name))
-    matches = []
-
-    for env in envs:
-        if env["db"] and env["db"] != db:
-            continue
-
-        names = _name_variants(env["name"])
-        exact = bool(names & wanted)
-        prefixed = any(name.startswith(f"{want}-") for name in names for want in wanted)
-        if not (exact or prefixed):
-            continue
-
-        # a db-pinned env first, then an exact name, then the shortest suffix
-        matches.append((not env["db"], not exact, len(env["name"]), env["name"]))
-
-    return min(matches)[3] if matches else None
-
-
-def run_odooly_script(script: str, env: str, *extra_args: str, timeout: int = 300) -> str:
-    """Run one of `odoo_activity.scripts` against odooly env `env`, and
-    return what it printed (stdout, then stderr).
-
-    Deliberately local and never over `Host`: odooly reaches the instance
-    over the network using this machine's `~/odooly.ini`, which the watched
-    host neither has nor should be asked for.
-
-    `sys.executable -m` rather than a console script, so it is the
-    interpreter running odoo-activity -- the one odooly is installed in --
-    whatever `PATH` says.
-
-    `extra_args` is appended verbatim after `--env <env>`, for a script
-    that needs more than the env to run (e.g. send_test_mail's `--to`).
-    """
-    argv = [sys.executable, "-m", f"odoo_activity.scripts.{script}", "--env", env, *extra_args]
-
-    try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return f"({script} timed out after {timeout}s)"
-    except OSError as exc:
-        return f"(cannot run {script}: {exc})"
-
-    return "\n".join(part for part in (done.stdout.strip(), done.stderr.strip()) if part)
 
 
 def about_text() -> str:

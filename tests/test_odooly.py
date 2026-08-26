@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import cast
 
 from odoo_activity import probes
+from odoo_activity.plugins import odooly as odooly_plugin
 
 _INI = """\
 [acme18-int]
@@ -32,7 +33,7 @@ def _envs(tmp_path, text=_INI):
     path = tmp_path / "odooly.ini"
     path.write_text(text)
 
-    return probes.read_odooly_envs(path)
+    return odooly_plugin.read_odooly_envs(path)
 
 
 def test_reads_only_the_name_and_database_of_each_env(tmp_path):
@@ -46,7 +47,7 @@ def test_reads_only_the_name_and_database_of_each_env(tmp_path):
 def test_missing_or_broken_ini_is_not_an_error(tmp_path):
     """Odooly support is opt-in and best-effort — a file the user never wrote
     (or wrote badly) must not take the app down."""
-    assert probes.read_odooly_envs(tmp_path / "absent.ini") == []
+    assert odooly_plugin.read_odooly_envs(tmp_path / "absent.ini") == []
     assert _envs(tmp_path, "this is not an ini") == []
 
 
@@ -55,7 +56,7 @@ def test_matches_an_instance_to_its_env_however_it_is_spelled(tmp_path):
     after the same thing — abbreviated or not, with the manager's prefix
     dropped, and with the database appended for a multi-db instance."""
     envs = _envs(tmp_path)
-    match = probes.match_odooly_env
+    match = odooly_plugin.match_odooly_env
 
     # the manager's own prefix/suffix, and `integration` spelled either way
     assert match("openerp-acme18-integration.service", "acme18_int", envs) == "acme18-int"
@@ -77,8 +78,8 @@ def test_a_db_pinned_env_wins_over_a_looser_one(tmp_path):
     that is the one whose credentials belong to it."""
     envs = _envs(tmp_path, "[demo-int]\nusername = admin\n\n[demo-int-db1]\ndatabase = db1\nusername = admin\n")
 
-    assert probes.match_odooly_env("openerp-demo-integration", "db1", envs) == "demo-int-db1"
-    assert probes.match_odooly_env("openerp-demo-integration", "db9", envs) == "demo-int"
+    assert odooly_plugin.match_odooly_env("openerp-demo-integration", "db1", envs) == "demo-int-db1"
+    assert odooly_plugin.match_odooly_env("openerp-demo-integration", "db9", envs) == "demo-int"
 
 
 def test_scripts_run_in_this_interpreter_and_report_what_they_printed(monkeypatch):
@@ -91,11 +92,11 @@ def test_scripts_run_in_this_interpreter_and_report_what_they_printed(monkeypatc
         seen["argv"] = argv
         return SimpleNamespace(stdout="Complete — 12 menu(s) restored.\n", stderr="", returncode=0)
 
-    monkeypatch.setattr(probes.subprocess, "run", fake_run)
+    monkeypatch.setattr(odooly_plugin.subprocess, "run", fake_run)
 
-    assert probes.run_odooly_script("restore_app_icons", "acme18-int") == "Complete — 12 menu(s) restored."
-    assert seen["argv"][1:] == ["-m", "odoo_activity.scripts.restore_app_icons", "--env", "acme18-int"]
-    assert seen["argv"][0] == probes.sys.executable
+    assert odooly_plugin.run_odooly_script("restore_app_icons", "acme18-int") == "Complete — 12 menu(s) restored."
+    assert seen["argv"][1:] == ["-m", "odoo_activity.plugins.odooly.scripts.restore_app_icons", "--env", "acme18-int"]
+    assert seen["argv"][0] == odooly_plugin.sys.executable
 
 
 def test_run_odooly_script_appends_extra_args_after_env(monkeypatch):
@@ -109,14 +110,14 @@ def test_run_odooly_script_appends_extra_args_after_env(monkeypatch):
             stdout="Test mail sent on acme18-int: mail.mail #9, to a@example.com\n", stderr="", returncode=0
         )
 
-    monkeypatch.setattr(probes.subprocess, "run", fake_run)
+    monkeypatch.setattr(odooly_plugin.subprocess, "run", fake_run)
 
-    result = probes.run_odooly_script("send_test_mail", "acme18-int", "--to", "a@example.com")
+    result = odooly_plugin.run_odooly_script("send_test_mail", "acme18-int", "--to", "a@example.com")
 
     assert "mail.mail #9" in result
     assert seen["argv"][1:] == [
         "-m",
-        "odoo_activity.scripts.send_test_mail",
+        "odoo_activity.plugins.odooly.scripts.send_test_mail",
         "--env",
         "acme18-int",
         "--to",
@@ -126,18 +127,18 @@ def test_run_odooly_script_appends_extra_args_after_env(monkeypatch):
 
 def test_a_failing_script_shows_its_error_rather_than_nothing(monkeypatch):
     monkeypatch.setattr(
-        probes.subprocess,
+        odooly_plugin.subprocess,
         "run",
         lambda *_a, **_k: SimpleNamespace(stdout="", stderr="no such odooly env: 'nope'\n", returncode=1),
     )
 
-    assert probes.run_odooly_script("create_test_job", "nope") == "no such odooly env: 'nope'"
+    assert odooly_plugin.run_odooly_script("create_test_job", "nope") == "no such odooly env: 'nope'"
 
     def timeout(*_a, **_k):
-        raise probes.subprocess.TimeoutExpired(cmd="x", timeout=300)
+        raise odooly_plugin.subprocess.TimeoutExpired(cmd="x", timeout=300)
 
-    monkeypatch.setattr(probes.subprocess, "run", timeout)
-    assert "timed out" in probes.run_odooly_script("create_test_job", "slow")
+    monkeypatch.setattr(odooly_plugin.subprocess, "run", timeout)
+    assert "timed out" in odooly_plugin.run_odooly_script("create_test_job", "slow")
 
 
 def test_the_marker_lands_in_the_same_column_as_an_instances_status():
@@ -163,8 +164,8 @@ def _row_text(item) -> str:
 
 
 def _odooly_pilot(monkeypatch, envs):
-    """An app on one instance with one db, with `envs` standing in for what
-    `--enable-odooly` would have read out of ~/odooly.ini."""
+    """An app on one instance with one db, plus the odooly plugin to hand to
+    it -- `envs` stands in for what it would have read out of ~/odooly.ini."""
     from odoo_activity import tui
     from odoo_activity.panes import detail as detail_mod
 
@@ -175,7 +176,11 @@ def _odooly_pilot(monkeypatch, envs):
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     monkeypatch.setattr(tui, "databases_of", lambda *_: (["demo_db"], None))
     monkeypatch.setattr(detail_mod, "pg_target_of", lambda *_a, **_k: probes.PgTarget())
-    monkeypatch.setattr(tui, "read_odooly_envs", lambda *_: envs)
+
+    plugin = odooly_plugin.OdoolyPlugin()
+    plugin.envs = envs
+
+    return plugin
 
 
 def test_a_matched_database_is_marked_and_offers_the_odooly_tools(monkeypatch):
@@ -186,11 +191,11 @@ def test_a_matched_database_is_marked_and_offers_the_odooly_tools(monkeypatch):
     from odoo_activity import tui
     from odoo_activity.panes import detail as detail_mod
 
-    _odooly_pilot(monkeypatch, [{"name": "demo-int", "db": "demo_db"}])
+    plugin = _odooly_pilot(monkeypatch, [{"name": "demo-int", "db": "demo_db"}])
     monkeypatch.setattr(detail_mod, "job_groups", lambda *_: ([], ""))
 
     async def go():
-        async with tui.OdooActivity(enable_odooly=True).run_test(size=(100, 40)) as pilot:
+        async with tui.OdooActivity(plugins=[plugin]).run_test(size=(100, 40)) as pilot:
             await pilot.app.workers.wait_for_complete()
             await pilot.pause()
 
@@ -199,7 +204,7 @@ def test_a_matched_database_is_marked_and_offers_the_odooly_tools(monkeypatch):
 
             await pilot.press("down")  # onto the db row
             await pilot.pause()
-            assert cast("tui.OdooActivity", pilot.app).highlighted_odooly_env() == "demo-int"
+            assert plugin.env_for(cast("tui.OdooActivity", pilot.app).highlighted_db()) == "demo-int"
 
             pane = pilot.app.query_one(tui.ActivityPane)
             pane.select_tab_by_name("Toolbox")
@@ -207,19 +212,18 @@ def test_a_matched_database_is_marked_and_offers_the_odooly_tools(monkeypatch):
                 await pilot.pause()
 
             table = pane.query_one("#actable", detail_mod.DataTable)
-            assert table.row_count == len(pane.DB_TOOLBOX_TOOLS)
-            assert "demo-int" in str(next(iter(table.columns.values())).label)
+            assert table.row_count == len(pane._db_tools)
 
             # the copied command carries the config path: odooly's own CLI
             # looks for `odooly.ini` in the working directory, so the bare
             # `--env` only works from whichever folder happens to hold one
             copied = []
-            monkeypatch.setattr(detail_mod, "try_local_clipboard", lambda cmd: copied.append(cmd) or True)
+            monkeypatch.setattr(odooly_plugin, "try_local_clipboard", lambda cmd: copied.append(cmd) or True)
             table.action_select_cursor()  # enter on "Open odooly"
             for _ in range(20):
                 await pilot.pause()
 
-            assert copied == [f"odooly -c {probes.ODOOLY_CONFIG} --env demo-int"]
+            assert copied == [f"odooly -c {odooly_plugin.ODOOLY_CONFIG} --env demo-int"]
 
     asyncio.run(go())
 
@@ -256,7 +260,7 @@ def test_mail_tab_offers_send_test_mail_only_with_a_matching_odooly_env(monkeypa
     from odoo_activity.panes import detail as detail_mod
     from odoo_activity.panes.confirm import PromptScreen
 
-    _odooly_pilot(monkeypatch, [{"name": "demo-int", "db": "demo_db"}])
+    plugin = _odooly_pilot(monkeypatch, [{"name": "demo-int", "db": "demo_db"}])
     monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeMailProc())
 
     sent = []
@@ -265,10 +269,10 @@ def test_mail_tab_offers_send_test_mail_only_with_a_matching_odooly_env(monkeypa
         sent.append(args)
         return "Test mail sent on demo-int: mail.mail #9, to a@example.com"
 
-    monkeypatch.setattr(detail_mod, "run_odooly_script", fake_run_odooly_script)
+    monkeypatch.setattr(odooly_plugin, "run_odooly_script", fake_run_odooly_script)
 
     async def go():
-        async with tui.OdooActivity(enable_odooly=True).run_test(size=(100, 40)) as pilot:
+        async with tui.OdooActivity(plugins=[plugin]).run_test(size=(100, 40)) as pilot:
             await pilot.app.workers.wait_for_complete()
             await pilot.pause()
             await pilot.press("down")  # onto the db row
@@ -309,14 +313,14 @@ def test_send_test_mail_button_is_cancelled_by_an_empty_prompt(monkeypatch):
     from odoo_activity.panes import detail as detail_mod
     from odoo_activity.panes.confirm import PromptScreen
 
-    _odooly_pilot(monkeypatch, [{"name": "demo-int", "db": "demo_db"}])
+    plugin = _odooly_pilot(monkeypatch, [{"name": "demo-int", "db": "demo_db"}])
     monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeMailProc())
 
     sent = []
-    monkeypatch.setattr(detail_mod, "run_odooly_script", lambda *args, **_k: sent.append(args))
+    monkeypatch.setattr(odooly_plugin, "run_odooly_script", lambda *args, **_k: sent.append(args))
 
     async def go():
-        async with tui.OdooActivity(enable_odooly=True).run_test(size=(100, 40)) as pilot:
+        async with tui.OdooActivity(plugins=[plugin]).run_test(size=(100, 40)) as pilot:
             await pilot.app.workers.wait_for_complete()
             await pilot.pause()
             await pilot.press("down")
@@ -347,20 +351,19 @@ def test_without_a_match_the_marker_turns_red_and_nothing_odooly_is_offered(monk
     from odoo_activity import tui
     from odoo_activity.panes import detail as detail_mod
 
-    _odooly_pilot(monkeypatch, [{"name": "elsewhere-int", "db": "other"}])
+    plugin = _odooly_pilot(monkeypatch, [{"name": "elsewhere-int", "db": "other"}])
 
     async def go():
-        async with tui.OdooActivity(enable_odooly=True).run_test(size=(100, 40)) as pilot:
+        async with tui.OdooActivity(plugins=[plugin]).run_test(size=(100, 40)) as pilot:
             await pilot.app.workers.wait_for_complete()
             await pilot.pause()
 
             rows = pilot.app.query_one("#instances", tui.ListView).children
             assert "ODOOLY" in _row_text(rows[1])
-            assert tui._odooly_marker(None) == "[red]ODOOLY[/]"
 
             await pilot.press("down")
             await pilot.pause()
-            assert cast("tui.OdooActivity", pilot.app).highlighted_odooly_env() is None
+            assert plugin.env_for(cast("tui.OdooActivity", pilot.app).highlighted_db()) is None
 
             pane = pilot.app.query_one(tui.ActivityPane)
             pane.select_tab_by_name("Toolbox")
@@ -377,7 +380,7 @@ def test_errors_never_echo_the_password_the_ini_hides_in_the_url():
     the server URL carries the password — and libraries quote what they were
     given: urllib answers a bad one with `nonnumeric port: 's3cr3t@host'`.
     These messages land in a terminal and in odoo-activity's pane."""
-    from odoo_activity.scripts import redact
+    from odoo_activity.plugins.odooly.scripts import redact
 
     assert redact("nonnumeric port: 's3cr3t@host.invalid'", "s3cr3t") == "nonnumeric port: '***@host.invalid'"
     assert redact("<urlopen error https://bob:hunter2@host/x>") == "<urlopen error https://***:***@host/x>"
@@ -413,7 +416,7 @@ def test_only_the_menus_whose_icon_is_actually_gone_are_rewritten():
     its file. A lost filestore leaves the attachment row in place with only
     the file missing, which `_file_read` answers with empty bytes — so the
     data, not the row, is what says a menu is broken."""
-    from odoo_activity.scripts.restore_app_icons import restore_app_icons
+    from odoo_activity.plugins.odooly.scripts.restore_app_icons import restore_app_icons
 
     menus = [
         {"id": 1, "name": "Apps", "web_icon": "base,static/description/modules.png", "web_icon_data": False},
@@ -512,14 +515,14 @@ def _mail_client(company_email="acme@example.com", *, send_state="sent", failure
 def test_company_email_reads_the_connecting_users_own_company():
     """`from` needs no asking: it's the same address a real notification from
     this login would carry."""
-    from odoo_activity.scripts.send_test_mail import _company_email
+    from odoo_activity.plugins.odooly.scripts.send_test_mail import _company_email
 
     assert _company_email(_mail_client("acme@example.com")) == "acme@example.com"
     assert _company_email(_mail_client(company_email=None)) is None
 
 
 def test_send_test_mail_creates_and_sends_one_mail():
-    from odoo_activity.scripts.send_test_mail import send_test_mail
+    from odoo_activity.plugins.odooly.scripts.send_test_mail import send_test_mail
 
     client = _mail_client("acme@example.com")
 
@@ -541,7 +544,7 @@ def test_send_test_mail_omits_email_from_when_the_company_has_none():
     # fills a field's default when it's *absent* from values, so an explicit
     # None here would suppress mail.message.default_get's own sender
     # fallback and the mail would go out with no `from` address at all.
-    from odoo_activity.scripts.send_test_mail import send_test_mail
+    from odoo_activity.plugins.odooly.scripts.send_test_mail import send_test_mail
 
     client = _mail_client(company_email=None)
 
@@ -559,7 +562,7 @@ def test_send_test_mail_raises_when_the_record_ends_in_exception_state():
     # to catch.
     import pytest
 
-    from odoo_activity.scripts.send_test_mail import send_test_mail
+    from odoo_activity.plugins.odooly.scripts.send_test_mail import send_test_mail
 
     client = _mail_client(send_state="exception", failure_reason="Connection refused")
 
@@ -570,7 +573,7 @@ def test_send_test_mail_raises_when_the_record_ends_in_exception_state():
 def test_send_test_mail_raises_a_generic_message_when_no_failure_reason_recorded():
     import pytest
 
-    from odoo_activity.scripts.send_test_mail import send_test_mail
+    from odoo_activity.plugins.odooly.scripts.send_test_mail import send_test_mail
 
     client = _mail_client(send_state="exception", failure_reason=None)
 
