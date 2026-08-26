@@ -1,5 +1,6 @@
 import configparser
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -570,3 +571,102 @@ def test_a_containers_workdir_comes_off_the_image_not_a_running_process(monkeypa
 
     assert probes.instance_workdir(_DOCKER_INSTANCE, Host()) == Path("/opt/odoo")
     assert calls == [["docker", "inspect", "-f", "{{.Config.WorkingDir}}", "acme-odoo-1"]]
+
+
+def _fake_psql(tmp_path, monkeypatch, cases: dict[str, str]):
+    """A stub `psql` on PATH answering per database name, and a `Host.run`
+    that really executes the shell loop -- so the quoting of the multi-line
+    SQL argument is checked rather than assumed. Returns the recorded argv
+    list, to assert on the round trip count."""
+    body = "".join(f"  {db}) {answer} ;;\n" for db, answer in cases.items())
+    psql = tmp_path / "psql"
+    # the db name is the last argument (`-d <db>`)
+    psql.write_text('#!/bin/sh\ndb=$(eval echo \\$$#)\ncase "$db" in\n' + body + "esac\n")
+    psql.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+
+    calls: list[list[str]] = []
+
+    def run(_self, argv, input_text=None):
+        calls.append(argv)
+        return subprocess.run(argv, capture_output=True, text=True)  # noqa: S603 -- our own argv, through a stub psql
+
+    monkeypatch.setattr(Host, "run", run)
+    return calls
+
+
+def _signals(**overrides) -> str:
+    """One database's JSON row, as the real query would answer it."""
+    row = {"flag": "true", "version": "19.0.1.3", "stub": 1, "live_relays": 0, "live_crons": 0}
+    row.update(overrides)
+    return "echo '" + json.dumps(row) + "'"
+
+
+def test_neutralization_of_reads_each_db_in_one_round_trip(tmp_path, monkeypatch):
+    """Every classification path, through one shell loop and one `host.run`.
+    A db psql cannot read (exit != 0) is left out of the map entirely:
+    unknown, which the UI shows as no status rather than as a guess."""
+    calls = _fake_psql(
+        tmp_path,
+        monkeypatch,
+        {
+            "staging": _signals(),
+            # the whole point of the extra signals: the flag says safe, a
+            # cron switched back on says otherwise
+            "reheated": _signals(live_crons=7),
+            "claimed": _signals(stub=0),  # flag without the stub -- written by hand
+            "halfway": _signals(flag=None),  # the script ran but the flag never landed
+            "prod": _signals(flag=None, stub=0, live_relays=2, live_crons=20),
+            # 14/15 neutralize without a stub (odoo.sh's own, no
+            # neutralize.sql upstream yet) -- demanding one there would paint
+            # every correctly neutralized old staging yellow
+            "ancient": _signals(stub=0, version="14.0.1.3"),
+            "unversioned": _signals(stub=0, version=None),  # unreadable version costs a yellow, never a green
+            "garbled": _signals(stub=0, version="rubbish"),  # ... and so does an unparseable one
+            # Odoo Online: `release.py` lets the major version be an
+            # arbitrary string and `adapt_version` prefixes it, so base
+            # reports `saas~16.4.1.3`. Read as 0 it graded pre-16, skipped
+            # the stub requirement, and turned a hand-written flag green.
+            "online": _signals(stub=0, version="saas~16.4.1.3"),
+            "broken": "exit 1",  # no such table / postgres down
+        },
+    )
+
+    states = {db: report["state"] for db, report in probes.neutralization_of(list("x"), "5432", Host()).items()}
+    assert states == {}  # the stub answers nothing for an unknown name
+    assert len(calls) == 1
+
+    dbs = ["staging", "reheated", "claimed", "halfway", "prod", "ancient", "unversioned", "garbled", "online", "broken"]
+    reports = probes.neutralization_of(dbs, "5432", Host())
+
+    assert {db: report["state"] for db, report in reports.items()} == {
+        "staging": probes.NEUTRALIZED,
+        "reheated": probes.PARTIAL,
+        "claimed": probes.PARTIAL,
+        "halfway": probes.PARTIAL,
+        "prod": probes.NOT_NEUTRALIZED,
+        "ancient": probes.NEUTRALIZED,
+        "unversioned": probes.PARTIAL,
+        "garbled": probes.PARTIAL,
+        "online": probes.PARTIAL,
+    }
+    # the counts ride along, so a PARTIAL can say which half is the problem
+    assert reports["reheated"]["live_crons"] == 7
+    assert len(calls) == 2
+
+    assert probes.neutralization_of([], "5432", Host()) == {}  # no dbs, no call
+    assert len(calls) == 2
+
+
+def test_a_mail_catcher_is_not_counted_as_a_live_relay():
+    """A dev stack's catcher accepts mail and never relays it -- `panes/mail.py`
+    already says so, via odoo-db's `is_test_catcher`. Counting one as a live
+    relay would paint every neutralized dev database yellow forever, and would
+    have the two halves of the app contradicting each other."""
+    for host in ("invalid", "mailhog", "mailpit", "maildev"):
+        assert f"'{host}'" in probes._DEAD_END_HOSTS
+
+    # and they are excluded where it counts, not just listed
+    assert f"NOT IN ({probes._DEAD_END_HOSTS})" in probes._NEUTRALIZATION_SQL
+    # a NULL host is no relay at all, and NOT IN would swallow the whole row
+    assert "coalesce(smtp_host, '')" in probes._NEUTRALIZATION_SQL
