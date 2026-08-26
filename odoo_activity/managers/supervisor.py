@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from odoo_activity import probes
 from odoo_activity.managers.base import Manager
 from odoo_activity.managers.systemd import _run_controller
-from odoo_activity.probes import LOCAL, supervisor_instances
+from odoo_activity.probes import LOCAL
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -19,7 +20,7 @@ class SupervisorManager(Manager):
     name = "supervisor"
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
-        return supervisor_instances(host)
+        return probes.supervisor_instances(host)
 
     def pid(self, inst: Instance, host: Host = LOCAL) -> str | None:
         out = host.run(["supervisorctl", "pid", inst["name"]]).stdout.strip()

@@ -25,13 +25,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from odoo_activity import probes
 from odoo_activity.managers.base import Manager
 from odoo_activity.managers.docker import DockerManager
 from odoo_activity.managers.local import LocalManager
 from odoo_activity.managers.odoosh import OdooshManager
 from odoo_activity.managers.supervisor import SupervisorManager
 from odoo_activity.managers.systemd import SystemdManager
-from odoo_activity import probes
 from odoo_activity.probes import (
     LOCAL,
     container_host,

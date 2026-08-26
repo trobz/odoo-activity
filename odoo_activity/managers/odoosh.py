@@ -9,8 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from odoo_activity import probes
 from odoo_activity.managers.base import Manager
-from odoo_activity.probes import LOCAL, _odoosh_master_pid, odoosh_instances
+from odoo_activity.probes import LOCAL
 
 if TYPE_CHECKING:
     from odoo_activity.host import Host
@@ -21,10 +22,10 @@ class OdooshManager(Manager):
     name = "odoosh"
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
-        return odoosh_instances(host)
+        return probes.odoosh_instances(host)
 
     def pid(self, inst: Instance, host: Host = LOCAL) -> str | None:
-        return _odoosh_master_pid(host)
+        return probes._odoosh_master_pid(host)
 
     def workdir(self, inst: Instance, host: Host = LOCAL) -> Path:
         if host.is_local:
@@ -51,3 +52,16 @@ class OdooshManager(Manager):
                 return out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
 
         return ""
+
+    def config_file(self, inst: Instance, host: Host = LOCAL) -> Path | None:
+        """The fixed `~/.config/odoo/odoo.conf` odoo.sh always writes."""
+        path = self.workdir(inst, host) / ".config" / "odoo" / "odoo.conf"
+
+        return path if host.is_file(path) else None
+
+    def logfile(self, inst: Instance, host: Host = LOCAL) -> Path | None:
+        """odoo.sh's fixed `~/logs/odoo.log` -- its config is sparse and
+        carries no `logfile` key at all."""
+        path = self.workdir(inst, host) / "logs" / "odoo.log"
+
+        return path if host.is_file(path) else None

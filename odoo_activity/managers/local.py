@@ -7,10 +7,12 @@ carries, and run nothing.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from odoo_activity import probes
 from odoo_activity.managers.base import Manager
-from odoo_activity.probes import LOCAL, local_instances
+from odoo_activity.probes import LOCAL
 
 if TYPE_CHECKING:
     from odoo_activity.host import Host
@@ -21,7 +23,7 @@ class LocalManager(Manager):
     name = "local"
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
-        return local_instances(host)
+        return probes.local_instances(host)
 
     def pid(self, inst: Instance, host: Host = LOCAL) -> str | None:
         """Straight off the row: there is no MainPID to re-ask for, and
@@ -31,3 +33,13 @@ class LocalManager(Manager):
 
     def control(self, inst: Instance, action: str, host: Host = LOCAL) -> str:
         return "no process manager — a directly-run instance can't be started or stopped from here"
+
+    def argv_settings(self, inst: Instance) -> str:
+        """Its own command line is where a shell-run instance's settings are,
+        whether or not it also has a config file."""
+        return inst.get("command", "")
+
+    def logfile(self, inst: Instance, host: Host = LOCAL) -> Path | None:
+        """The config's `logfile`, else stdout when it was redirected to a
+        file -- the closest thing to one for a runner that never set it."""
+        return super().logfile(inst, host) or probes._redirected_stdout(inst, host)

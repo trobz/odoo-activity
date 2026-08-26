@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from odoo_activity import probes
 from odoo_activity.managers.base import Manager
-from odoo_activity.probes import LOCAL, _systemd_workdir, systemd_instances
+from odoo_activity.probes import LOCAL
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -19,7 +20,7 @@ class SystemdManager(Manager):
     name = "systemd"
 
     def instances(self, host: Host = LOCAL) -> list[Instance]:
-        return systemd_instances(host)
+        return probes.systemd_instances(host)
 
     def pid(self, inst: Instance, host: Host = LOCAL) -> str | None:
         out = host.run(["systemctl", "--user", "show", inst["name"], "-p", "MainPID"]).stdout
@@ -29,7 +30,7 @@ class SystemdManager(Manager):
         return found.group(1) if found and found.group(1) != "0" else None
 
     def workdir(self, inst: Instance, host: Host = LOCAL) -> Path:
-        return _systemd_workdir(inst["name"], host)
+        return probes._systemd_workdir(inst["name"], host)
 
     def control(self, inst: Instance, action: str, host: Host = LOCAL) -> str:
         # synchronous; --user odoo units activate fast. Move to a worker

@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import re
+import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from odoo_activity import probes
 from odoo_activity.probes import LOCAL
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from odoo_activity.host import Host
     from odoo_activity.probes import Instance
+
+
+def _config_names(instance_name: str) -> list[str]:
+    """Config filenames to try, in order.
+
+    A multi-node instance's name is suffixed `-NN` (e.g. `foo-01`), and its
+    config is `odooNN.conf` rather than `odoo.conf` -- `server.conf` is never
+    node-numbered, so it's only ever tried plain.
+    """
+    if found := re.search(r"-(\d+)$", instance_name):
+        return [f"odoo{found.group(1)}.conf", "odoo.conf", "server.conf"]
+
+    return ["odoo.conf", "server.conf"]
 
 
 class Manager:
@@ -45,10 +60,71 @@ class Manager:
 
     def workdir(self, inst: Instance, host: Host = LOCAL) -> Path:
         """The directory this instance's relative paths resolve against."""
-        from pathlib import Path
-
         return Path(inst.get("directory") or ".")
 
     def control(self, inst: Instance, action: str, host: Host = LOCAL) -> str:
         """Run start/stop/restart. "" on success, else what went wrong."""
         return f"{self.name or 'this manager'} cannot start or stop an instance"
+
+    def config(self, inst: Instance, host: Host = LOCAL) -> tuple[Path | None, str | None]:
+        """(path, contents) of the odoo config, or (None, None).
+
+        Both together, deliberately: for a manager that has to copy the file
+        out of a container to read it, locating and reading it are the same
+        copy.
+        """
+        path = self.config_file(inst, host)
+
+        return (path, host.read_text(path)) if path is not None else (None, None)
+
+    def config_file(self, inst: Instance, host: Host = LOCAL) -> Path | None:
+        """The first `<workdir>/config/` file matching this instance's name."""
+        workdir = self.workdir(inst, host)
+
+        for name in _config_names(inst["name"]):
+            path = workdir / "config" / name
+            if host.is_file(path):
+                return path
+
+        return None
+
+    def argv_settings(self, inst: Instance) -> str:
+        """The command line whose odoo options layer *over* the config file,
+        for a manager where argv carries real settings. Empty when the file
+        is the whole story."""
+        return ""
+
+    def logfile(self, inst: Instance, host: Host = LOCAL) -> Path | None:
+        """The odoo logfile, from the `logfile` key of the parsed config.
+
+        None means there is no *file*, which is not the same as no log: a
+        manager that keeps the stream itself says so here and answers in
+        `log_snapshot` instead.
+        """
+        workdir, parser = probes.instance_config(inst, host)
+        logfile = probes._opt(parser, "logfile")
+        if logfile is None:
+            return None
+
+        path = Path(logfile)
+
+        return path if path.is_absolute() else workdir / path
+
+    def log_snapshot(self, inst: Instance, host: Host = LOCAL, lines: int = 200) -> str | None:
+        """The last `lines` of the log, or None when there is none to read."""
+        path = self.logfile(inst, host)
+
+        return None if path is None else probes.tail(path, lines, host)
+
+    def log_stream(self, inst: Instance, host: Host = LOCAL) -> subprocess.Popen | None:
+        """A child streaming *new* log output, or None when the caller should
+        poll a local file instead. Callers must `.kill()` it.
+
+        `-n 0` because the lines already on screen came from `log_snapshot`:
+        without it every follow replays the whole file into the pane.
+        """
+        path = self.logfile(inst, host)
+        if path is None or host.is_local:
+            return None
+
+        return host.popen(["tail", "-f", "-n", "0", str(path)], stderr=subprocess.DEVNULL, text=False)

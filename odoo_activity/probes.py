@@ -1257,75 +1257,19 @@ def _cli_options(cmd: str) -> dict[str, str]:
 
 # Where an odoo container image renders its config, most specific first:
 # doodba's generated one, then the official image's packaged default.
-_DOCKER_CONFIG_PATHS = ("/opt/odoo/auto/odoo.conf", "/etc/odoo/odoo.conf")
-
-
-def _config_names(instance_name: str) -> list[str]:
-    """Config filenames to try, in order.
-
-    A multi-node instance's name is suffixed `-NN` (e.g. `foo-01`), and its
-    config is `odooNN.conf` rather than `odoo.conf` — `server.conf` is never
-    node-numbered, so it's only ever tried plain.
-    """
-    if m := re.search(r"-(\d+)$", instance_name):
-        return [f"odoo{m.group(1)}.conf", "odoo.conf", "server.conf"]
-    return ["odoo.conf", "server.conf"]
-
-
-def _container_config(host: Host) -> tuple[Path | None, str | None]:
-    """(path, contents) of the odoo config inside `host`'s container, or
-    (None, None).
-
-    An image puts the config where it likes, so there is no
-    `<workdir>/config/` convention to walk: doodba renders one at
-    /opt/odoo/auto/odoo.conf, the official image ships /etc/odoo/odoo.conf,
-    and anything else names it on the command line (which `_config_file`
-    handles before it gets here).
-
-    Read with `docker cp`, not `docker exec cat`: exec needs the container
-    running, and a config is exactly what you want to read when an instance
-    won't start (verified: with the container stopped, an exec probe
-    reported no config at all).
-
-    Path *and* contents in one go, deliberately: locating the file and
-    reading it are the same copy, and doing them separately meant four
-    copies out of the container per `databases_of` -- 12 round trips, each
-    one an ssh hop on a remote box.
-    """
-    if host.container is None:
-        return None, None
-
-    for candidate in _DOCKER_CONFIG_PATHS:
-        text = _read_out_of_container(host.container, candidate, host.on_box)
-        if text is not None:
-            return Path(candidate), text
-
-    return None, None
-
-
 def _config_file(inst: Instance, host: Host = LOCAL) -> Path | None:
-    """The config file named on a directly-run instance's own command line,
-    the fixed `~/.config/odoo/odoo.conf` odoo.sh always writes, or the first
-    `<workdir>/config/` file matching `_config_names`."""
-    host = container_host(inst, host)
+    """The instance's config file, or None.
+
+    A path on the instance's own command line wins over whatever its manager
+    would go looking for -- an explicit `-c` is the answer, whoever started
+    it.
+    """
+    at = container_host(inst, host)
 
     if path := inst.get("config"):
-        return Path(path) if host.is_file(path) else None
+        return Path(path) if at.is_file(path) else None
 
-    if inst["manager"] == "docker":
-        return _container_config(host)[0]
-
-    if inst["manager"] == "odoosh":
-        path = instance_workdir(inst, host) / ".config" / "odoo" / "odoo.conf"
-        return path if host.is_file(path) else None
-
-    workdir = instance_workdir(inst, host)
-    for name in _config_names(inst["name"]):
-        path = workdir / "config" / name
-        if host.is_file(path):
-            return path
-
-    return None
+    return _manager_of(inst).config_file(inst, at)
 
 
 def configfile_of(inst: Instance, host: Host = LOCAL) -> Path | None:
@@ -1345,29 +1289,30 @@ def instance_config(inst: Instance, host: Host = LOCAL) -> tuple[Path, configpar
     back through this one parser whether they came from a file, the command
     line, or — with no config file at all — only the latter.
     """
+    manager = _manager_of(inst)
     workdir = instance_workdir(inst, host)
-    host = container_host(inst, host)  # the file lives in the container, if there is one
+    at = container_host(inst, host)  # the file lives in the container, if there is one
 
-    if host.container is not None:
-        path, text = _container_config(host)  # one copy out, path and contents together
+    if path := inst.get("config"):  # an explicit -c wins over the manager's own search
+        path = Path(path) if at.is_file(path) else None
+        text = at.read_text(path) if path is not None else None
     else:
-        path = _config_file(inst, host)
-        text = host.read_text(path) if path is not None else None
+        path, text = manager.config(inst, at)
 
-    if path is None and inst["manager"] not in ("local", "docker"):
+    argv = manager.argv_settings(inst)
+    if path is None and not argv:
         return workdir, None
 
     parser = configparser.RawConfigParser()  # odoo configs may contain `%`
     if text is not None:
         parser.read_string(text)
 
-    if inst["manager"] in ("local", "docker"):
-        # compose's `command:` is argv the same way a shell-run instance's
-        # is, and doodba puts real settings there (--workers, --dev), so it
-        # layers over the file for both.
+    if argv:
+        # argv layers *over* the file: whatever started this instance had the
+        # last word on it
         if not parser.has_section("options"):
             parser.add_section("options")
-        for key, value in _cli_options(inst.get("command", "")).items():
+        for key, value in _cli_options(argv).items():
             parser.set("options", key, value)
 
     return workdir, parser
@@ -1385,17 +1330,7 @@ def logfile_of(inst: Instance, host: Host = LOCAL) -> Path | None:
     """The instance's odoo logfile, from the `logfile` key of its config, or
     odoo.sh's fixed `~/logs/odoo.log` (its config is sparse — no `logfile`
     key at all)."""
-    if inst["manager"] == "odoosh":
-        path = instance_workdir(inst, host) / "logs" / "odoo.log"
-        return path if host.is_file(path) else None
-
-    workdir, parser = instance_config(inst, host)
-    logfile = _opt(parser, "logfile")
-    if logfile is None:
-        return _redirected_stdout(inst, host) if inst["manager"] == "local" else None
-
-    path = Path(logfile)
-    return path if path.is_absolute() else workdir / path
+    return _manager_of(inst).logfile(inst, host)
 
 
 def _redirected_stdout(inst: Instance, host: Host = LOCAL) -> Path | None:
@@ -2439,17 +2374,7 @@ def log_snapshot(inst: Instance, host: Host = LOCAL, lines: int = 200) -> str | 
     stream itself. So the log is `docker logs`, not a path — which is also
     why `logfile_of` returning None can't mean "no log" for this manager.
     """
-    if inst["manager"] == "docker":
-        # Both streams: odoo logs to stderr, docker keeps the two apart, and
-        # a Logs tab showing only stdout would be empty on every instance.
-        # Concatenated rather than interleaved -- there is no shell here to
-        # `2>&1` with -- which is right for odoo (everything is on stderr)
-        # and the reason the follow stream below merges them properly.
-        out = host.run(["docker", "logs", "--tail", str(lines), inst["container"]])
-        return _untty(out.stderr + out.stdout)
-
-    path = logfile_of(inst, host)
-    return None if path is None else tail(path, lines, host)
+    return _manager_of(inst).log_snapshot(inst, host, lines)
 
 
 def log_stream(inst: Instance, host: Host = LOCAL) -> subprocess.Popen | None:
@@ -2460,18 +2385,7 @@ def log_stream(inst: Instance, host: Host = LOCAL) -> subprocess.Popen | None:
     lines already on screen came from `log_snapshot` -- without it every
     follow would replay the whole buffer into the pane.
     """
-    if inst["manager"] == "docker":
-        return host.popen(
-            ["docker", "logs", "-f", "--tail", "0", inst["container"]],
-            stderr=subprocess.STDOUT,
-            text=False,
-        )
-
-    path = logfile_of(inst, host)
-    if path is None or host.is_local:
-        return None  # a local file is polled by size, no child needed
-
-    return host.popen(["tail", "-f", "-n", "0", str(path)], stderr=subprocess.DEVNULL, text=False)
+    return _manager_of(inst).log_stream(inst, host)
 
 
 def tail(path: Path, lines: int = 200, host: Host = LOCAL) -> str:
