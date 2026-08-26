@@ -12,6 +12,7 @@ nav = [
     {Overview = "getting-started.md"},
     {"Keybindings & Tabs" = "keybindings.md"},
     {"MCP Server" = "mcp.md"},
+    {Plugins = "plugins.md"},
   ]},
   {Reference = [{Architecture = "reference/architecture.md"}]},
 ]

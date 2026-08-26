@@ -16,13 +16,23 @@ odoo_activity/
 ├── panes/processes.py # Processes tab: workers grouped by role
 ├── panes/stacks.py    # Stacks tab: parsed dumpstacks, busy-first
 ├── panes/mail.py      # Mail tab: one Rich table per section, into the log body
-├── scripts/           # odooly actions the Toolbox shells out to (network, not host)
+├── managers/          # one class per process manager: systemd, supervisor, odoosh, docker, local
+├── plugins/           # the plugin contract and loader, plus the bundled odooly plugin
 └── tui.py             # app shell: layout, list, timers, actions
 ```
 
 - **`host.py`** — a `Host` is this machine or an ssh destination. Every probe
   takes one and runs the same way against either, so nothing above this
   layer knows whether it is local or remote.
+- **`managers/`** — one class per process manager, found through entry
+  points (see [Plugins](../plugins.md)). A manager answers for its own
+  instances — discovery, pid, workdir, start/stop, config, logs, databases —
+  so nothing above it branches on which manager an instance came from.
+  `host_for` returns a `Host` already routed to where that instance lives,
+  which is what lets the shared probes below work unchanged against a
+  container.
+- **`plugins/`** — the contract an optional feature implements, and the
+  loader that finds it. `plugins/odooly/` is the bundled one.
 - **`probes.py`** — pure functions, no UI. Every `systemctl`/`supervisorctl`/
   `ps`/`psql` call and `/proc` read lives here, returning plain dicts/lists
   so it's testable without spinning up a screen. An instance's databases,
@@ -44,9 +54,11 @@ odoo_activity/
 
 ## Managers
 
-An instance's `manager` — `systemd`, `supervisor`, or `odoosh` — is
-discovered per instance, not configured, and decides which controller
-process/log/start-stop-restart lookups route through:
+An instance's `manager` — `systemd`, `supervisor`, `odoosh`, `docker` or
+`local` — is discovered per instance, not configured, and decides which
+controller process/log/start-stop-restart lookups route through. Each is a
+class in `managers/`, registered through an entry point like any plugin, so
+a new one is a package rather than an edit here:
 
 - **`systemd`** — a `systemd --user` unit, controlled via `systemctl --user`.
 - **`supervisor`** — a `supervisorctl status` program, controlled via
@@ -57,6 +69,11 @@ process/log/start-stop-restart lookups route through:
   supported (odoo.sh handles sleep/wake on its own); restart goes through
   `odoosh-restart`, needed on `PATH` — which ships pre-installed on
   odoo.sh hosts.
+- **`docker`** — a docker compose project running Odoo. One project is one
+  instance; everything is probed *inside* the odoo container, and the
+  database tabs reach postgres over the compose network.
+- **`local`** — an odoo somebody started from a shell, and the fallback for
+  a row no other manager claims. Nothing to start or stop.
 
 ### Config tab modes
 
