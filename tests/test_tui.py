@@ -4,25 +4,11 @@ import signal
 from types import SimpleNamespace
 from typing import cast
 
-import pytest
 from textual.widgets import DataTable
 
 from odoo_activity import managers, probes, tui
 from odoo_activity.host import Host
 from odoo_activity.panes import detail as detail_mod
-
-
-@pytest.fixture(autouse=True)
-def _no_neutralization_probe(monkeypatch):
-    """Keep the db-row neutralization probe off this file's real shell.
-
-    Every app test stubs `databases_of`; without this the follow-up probe
-    would still run `systemctl` and `psql` against whatever box the suite
-    happens to run on -- slow, and answering about the developer's own
-    databases. A test that is about the tag just sets its own stubs on top.
-    """
-    monkeypatch.setattr(tui, "pg_target_of", lambda *_a, **_k: probes.PgTarget())
-    monkeypatch.setattr(tui, "neutralization_of", lambda *_a, **_k: {})
 
 
 def test_bar_colors_by_htop_thresholds():
