@@ -654,6 +654,7 @@ def main_multi(
     bind_host: str = typer.Option("127.0.0.1", "--bind-host", help="streamable-http only"),
     bind_port: int = typer.Option(8000, "--bind-port", help="streamable-http only"),
     host_filter: str = typer.Option(
+        "",
         "--host-filter",
         help="regex (odoo dbfilter-style); only ssh targets it fullmatches are reachable. Unset: no restriction.",
     ),
