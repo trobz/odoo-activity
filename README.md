@@ -223,7 +223,7 @@ flat row list every `db_query` command shares — the same reason the TUI
 renders it through its own `panes/mail.py` instead of the generic table
 pane.
 
-`--enable-odooly` is the same launch-time-only pattern, for the one
+`--enable-plugins=odooly` is the same launch-time-only pattern, for the one
 non-read-only exception: `list_odooly_envs`, `instance_odooly_env`, and
 `odooly_run_script` match a database against `~/odooly.ini` and run the
 packaged scripts (`create_test_job`, `restore_app_icons`, `send_test_mail`

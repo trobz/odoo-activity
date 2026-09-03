@@ -101,19 +101,19 @@ def test_mail_audit_reports_when_odoo_db_is_not_on_path(monkeypatch):
 
 def test_odooly_tools_refuse_without_the_launch_time_flag(monkeypatch):
     """No tool call can turn odooly support on itself -- only the
-    --enable-odooly CLI flag can, mirroring _include_sensitive_information."""
-    monkeypatch.setattr(mcp_server, "_enable_odooly", False)
+    --enable-plugins=odooly CLI flag can, mirroring _include_sensitive_information."""
+    monkeypatch.setattr(mcp_server, "_enabled_plugins", set())
 
-    with pytest.raises(ValueError, match="--enable-odooly"):
+    with pytest.raises(ValueError, match="--enable-plugins=odooly"):
         mcp_server.list_odooly_envs()
-    with pytest.raises(ValueError, match="--enable-odooly"):
+    with pytest.raises(ValueError, match="--enable-plugins=odooly"):
         mcp_server.instance_odooly_env("openerp-acme18-integration", "acme18_int")
-    with pytest.raises(ValueError, match="--enable-odooly"):
+    with pytest.raises(ValueError, match="--enable-plugins=odooly"):
         mcp_server.odooly_run_script("restore_app_icons", "acme18-int")
 
 
 def test_odooly_tools_delegate_to_the_plugin_once_enabled(monkeypatch):
-    monkeypatch.setattr(mcp_server, "_enable_odooly", True)
+    monkeypatch.setattr(mcp_server, "_enabled_plugins", {"odooly"})
     monkeypatch.setattr(odooly_plugin, "read_odooly_envs", lambda: [{"name": "acme18-int", "db": "acme18_int"}])
 
     assert mcp_server.list_odooly_envs() == ["acme18-int"]
@@ -136,7 +136,7 @@ def test_odooly_tools_delegate_to_the_plugin_once_enabled(monkeypatch):
 def test_send_test_mail_needs_a_recipient(monkeypatch):
     """The script's own `--to` is mandatory -- catch a missing recipient here
     rather than let it fail one subprocess hop away from a clear error."""
-    monkeypatch.setattr(mcp_server, "_enable_odooly", True)
+    monkeypatch.setattr(mcp_server, "_enabled_plugins", {"odooly"})
 
     with pytest.raises(ValueError, match="`to`"):
         mcp_server.odooly_run_script("send_test_mail", "acme18-int")

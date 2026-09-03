@@ -7,13 +7,14 @@ tool call to that one target (local if omitted) -- the counterpart to `oa
 [host]`. `oa-mcp-multi` instead leaves the target per-call, gated by
 --host-filter.
 
-`--enable-odooly` adds the one non-read-only exception: list_odooly_envs,
-instance_odooly_env and odooly_run_script, matching a database against
-~/odooly.ini and running the odooly plugin's scripts -- the same actions
-that plugin offers a human through the TUI's Toolbox, now offered to the
-agent directly. It needs the extra installed (`odoo-activity[odooly]`); the
-flag stays because a server exposing them to an agent is a decision worth
-making explicitly, which installing a package is not.
+`--enable-plugins=odooly` adds the one non-read-only exception:
+list_odooly_envs, instance_odooly_env and odooly_run_script, matching a
+database against ~/odooly.ini and running the odooly plugin's scripts -- the
+same actions that plugin offers a human through the TUI's Toolbox, now
+offered to the agent directly. It needs the extra installed
+(`odoo-activity[odooly]`); the flag stays because a server exposing them to
+an agent is a decision worth making explicitly, which installing a package
+is not.
 """
 
 import functools
@@ -29,7 +30,7 @@ import typer
 from mcp.server.fastmcp import FastMCP
 from typing_extensions import TypedDict
 
-from odoo_activity import managers, probes
+from odoo_activity import managers, plugins, probes
 from odoo_activity.host import Host
 from odoo_activity.probes import Instance, ProcRow, Worker
 
@@ -54,8 +55,8 @@ _pinned_target: Host | None = None
 _include_sensitive_information = False
 # Same launch-time-only spirit as _include_sensitive_information, but the
 # risk here is action rather than disclosure: odooly logs in and can write
-# to the database it matches. Set solely by --enable-odooly.
-_enable_odooly = False
+# to the database it matches. Set solely by --enable-plugins.
+_enabled_plugins: set[str] = set()
 
 
 def _allowed(alias: str | None) -> bool:
@@ -77,7 +78,7 @@ def _odooly() -> ModuleType:
 
     Imported here rather than at module scope because there are two distinct
     ways to be unavailable and an agent should be told which: the extra is
-    not installed, or the server was started without --enable-odooly.
+    not installed, or the server was started without --enable-plugins=odooly.
     """
     try:
         from odoo_activity.plugins import odooly
@@ -85,8 +86,8 @@ def _odooly() -> ModuleType:
         msg = "odooly support unavailable -- install the extra: pip install 'odoo-activity[odooly]'"
         raise ValueError(msg) from exc
 
-    if not _enable_odooly:
-        msg = "odooly support disabled -- restart the server with --enable-odooly"
+    if "odooly" not in _enabled_plugins:
+        msg = "odooly support disabled -- restart the server with --enable-plugins=odooly"
         raise ValueError(msg)
 
     return odooly
@@ -548,7 +549,7 @@ def mail_audit(db: str, port: str | None = None, *, target: Host) -> dict | str:
 def list_odooly_envs() -> list[str]:
     """Every environment section name in ~/odooly.ini -- what `env` on
     `odooly_run_script` accepts, and the set `instance_odooly_env` matches
-    against. Requires --enable-odooly.
+    against. Requires --enable-plugins=odooly.
     """
     return [env["name"] for env in _odooly().read_odooly_envs()]
 
@@ -556,7 +557,7 @@ def list_odooly_envs() -> list[str]:
 @mcp.tool()
 def instance_odooly_env(name: str, db: str) -> str | None:
     """The odooly env (a section of ~/odooly.ini) that serves `db` on
-    instance `name`, or None if none matches. Requires --enable-odooly.
+    instance `name`, or None if none matches. Requires --enable-plugins=odooly.
 
     Always resolved locally against this machine's own ~/odooly.ini,
     independent of any `host`/`ssh_port` used to discover the instance
@@ -574,7 +575,7 @@ def instance_odooly_env(name: str, db: str) -> str | None:
 @mcp.tool()
 def odooly_run_script(script: OdoolyScript, env: str, to: str | None = None) -> str:
     """Run one of odoo-activity's packaged odooly scripts against `env`, and
-    return what it printed (stdout, then stderr). Requires --enable-odooly.
+    return what it printed (stdout, then stderr). Requires --enable-plugins=odooly.
 
     create_test_job: queue one of queue_job's own test jobs, to check
         whether a runner picks it up.
@@ -622,22 +623,26 @@ def main(
         "-- no tool call can turn this on itself; set it only if every caller of this server should see "
         "plaintext secrets.",
     ),
-    enable_odooly: bool = typer.Option(
-        False,
-        "--enable-odooly",
-        help="Expose list_odooly_envs/instance_odooly_env/odooly_run_script, matching databases against "
-        "~/odooly.ini the same way `oa --enable-odooly` does. Launch-time only -- no tool call can turn "
-        "this on itself; set it only if the agent should be able to log in and act on a matched database.",
-    ),
+    enable_plugins: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--enable-plugins",
+            help="Plugins (comma-separated, or repeat the flag) whose non-read-only tools should be exposed, "
+            "e.g. --enable-plugins=odooly to expose list_odooly_envs/instance_odooly_env/odooly_run_script, "
+            "matching databases against ~/odooly.ini the same way `oa --enable-plugins=odooly` does. "
+            "Launch-time only -- no tool call can turn this on itself; set it only if the agent should be "
+            "able to log in and act on a matched database. Omit to expose none of them.",
+        ),
+    ] = None,
 ) -> None:
     """oa-mcp — MCP server exposing odoo-activity's read-only capacities,
     pinned to a single host: the counterpart to `oa host`, so a human on
     `oa host` and their agent on `oa-mcp host` are always looking at the
     same target. Omit `host` to pin to local, matching bare `oa`."""
-    global _pinned_target, _include_sensitive_information, _enable_odooly
+    global _pinned_target, _include_sensitive_information, _enabled_plugins
     _pinned_target = Host(alias=host, port=port)
     _include_sensitive_information = include_sensitive_information
-    _enable_odooly = enable_odooly
+    _enabled_plugins = set(plugins.split_names(enable_plugins))
 
     if transport == "streamable-http":
         mcp.settings.host = bind_host
@@ -669,16 +674,20 @@ def main_multi(
         "-- no tool call can turn this on itself; set it only if every caller of this server should see "
         "plaintext secrets.",
     ),
-    enable_odooly: bool = typer.Option(
-        False,
-        "--enable-odooly",
-        help="Expose list_odooly_envs/instance_odooly_env/odooly_run_script, matching databases against "
-        "~/odooly.ini the same way `oa --enable-odooly` does. Launch-time only -- no tool call can turn "
-        "this on itself; set it only if the agent should be able to log in and act on a matched database.",
-    ),
+    enable_plugins: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--enable-plugins",
+            help="Plugins (comma-separated, or repeat the flag) whose non-read-only tools should be exposed, "
+            "e.g. --enable-plugins=odooly to expose list_odooly_envs/instance_odooly_env/odooly_run_script, "
+            "matching databases against ~/odooly.ini the same way `oa --enable-plugins=odooly` does. "
+            "Launch-time only -- no tool call can turn this on itself; set it only if the agent should be "
+            "able to log in and act on a matched database. Omit to expose none of them.",
+        ),
+    ] = None,
 ) -> None:
     """oa-mcp-multi — same tools as oa-mcp, capped by --host-filter."""
-    global _host_filter, _host_file, _include_sensitive_information, _enable_odooly
+    global _host_filter, _host_file, _include_sensitive_information, _enabled_plugins
     if transport == "streamable-http":
         mcp.settings.host = bind_host
         mcp.settings.port = bind_port
@@ -686,7 +695,7 @@ def main_multi(
     _host_filter = re.compile(host_filter) if host_filter else None
     _host_file = host_file
     _include_sensitive_information = include_sensitive_information
-    _enable_odooly = enable_odooly
+    _enabled_plugins = set(plugins.split_names(enable_plugins))
 
     mcp.run(transport=transport)
 
