@@ -2,6 +2,44 @@
 
 <!-- version list -->
 
+## v0.22.0 (2026-09-03)
+
+### Bug Fixes
+
+- **mcp**: Default --host-filter to unset, not its own flag name
+  ([`3116938`](https://github.com/trobz/odoo-activity/commit/31169384bd2a0297e329b3362eda6b07243690d7))
+
+### Documentation
+
+- Add a plugins page, and catch the docs up with managers
+  ([`e796fe4`](https://github.com/trobz/odoo-activity/commit/e796fe450aab3a28d5b9c352cf798b4bb6f331e5))
+
+### Features
+
+- **managers**: Discover managers through entry points
+  ([`0c94456`](https://github.com/trobz/odoo-activity/commit/0c9445620c0b216ec949d379cf06f75d3b5119ad))
+
+- **odooly**: Offer a project's own scripts in the Toolbox
+  ([`4e1bd17`](https://github.com/trobz/odoo-activity/commit/4e1bd17e19f691a4de37e1ca44fb06ca7c62dc44))
+
+- **plugins**: Discover contributions over entry points, odooly first
+  ([`506ca85`](https://github.com/trobz/odoo-activity/commit/506ca85dad00ca3fc1d6f55cdd2e3a7d21d01ebb))
+
+### Refactoring
+
+- **managers**: Give each process manager a class of its own
+  ([`0e58be8`](https://github.com/trobz/odoo-activity/commit/0e58be869e5ffc2556f4603acd697b80d329326c))
+
+- **managers**: Move config and log lookup onto the manager
+  ([`bb0684b`](https://github.com/trobz/odoo-activity/commit/bb0684b7383e87150ea235d2ea1037705aa4c68a))
+
+- **managers**: Move database listing and pg target onto the manager
+  ([`7defe58`](https://github.com/trobz/odoo-activity/commit/7defe587bb06d7541c7c6ba2d5661ee1321a1882))
+
+- **managers**: Move version, data_dir and stack dumps onto the manager
+  ([`031e77c`](https://github.com/trobz/odoo-activity/commit/031e77c517edde5150d266c48aad16c1e0abc42c))
+
+
 ## v0.21.0 (2026-08-25)
 
 ### Bug Fixes
