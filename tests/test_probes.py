@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pyperclip
 
-from odoo_activity import probes
+from odoo_activity import managers, probes
 from odoo_activity.host import Host
 from odoo_activity.probes import Instance
 
@@ -300,7 +300,9 @@ def test_container_databases_ignore_the_boxs_db_role_convention(monkeypatch):
     doesn't reach here, or a container would be listed with the box's
     databases."""
     monkeypatch.setattr(probes, "DB_ROLE", "openerp")
-    monkeypatch.setattr(probes, "pg_target_of", lambda *_: probes.PgTarget(host="172.20.0.3", port="5432", user="odoo"))
+    monkeypatch.setattr(
+        probes, "_container_pg_target", lambda *_: probes.PgTarget(host="172.20.0.3", port="5432", user="odoo")
+    )
     asked: list[str] = []
     monkeypatch.setattr(probes, "databases_by_role", lambda role, *_a, **_k: asked.append(role) or ["devel", "e2e"])
 
@@ -361,12 +363,12 @@ def test_container_action_prefers_invoke_then_falls_back_to_compose(monkeypatch)
     calls = _recorder(monkeypatch)
     monkeypatch.setattr(Host, "is_file", lambda self, path: str(path) == "/srv/acme/tasks.py")
 
-    assert probes.instance_action("acme", "restart", "docker", Host(), "/srv/acme") == ""
+    assert managers.instance_action(_DOCKER_INSTANCE, "restart", Host()) == ""
     assert calls == [["invoke", "-r", "/srv/acme", "restart"]]
 
     calls.clear()
     monkeypatch.setattr(Host, "is_file", lambda self, path: False)
-    assert probes.instance_action("acme", "start", "docker", Host(), "/srv/acme") == ""
+    assert managers.instance_action(_DOCKER_INSTANCE, "start", Host()) == ""
     assert calls == [["docker", "compose", "--project-directory", "/srv/acme", "start"]]
 
 
@@ -379,7 +381,7 @@ def test_container_stop_never_goes_through_invoke(monkeypatch):
     calls = _recorder(monkeypatch)
     monkeypatch.setattr(Host, "is_file", lambda self, path: True)  # tasks.py is right there
 
-    assert probes.instance_action("acme", "stop", "docker", Host(), "/srv/acme") == ""
+    assert managers.instance_action(_DOCKER_INSTANCE, "stop", Host()) == ""
     assert calls == [["docker", "compose", "--project-directory", "/srv/acme", "stop"]]
 
 
@@ -398,7 +400,7 @@ def test_container_action_falls_through_to_compose_when_invoke_fails(monkeypatch
 
     monkeypatch.setattr(Host, "run", fake_run)
 
-    assert probes.instance_action("acme", "start", "docker", Host(), "/srv/acme") == ""
+    assert managers.instance_action(_DOCKER_INSTANCE, "start", Host()) == ""
     assert [c[0] for c in calls] == ["invoke", "docker"]
 
 
@@ -407,7 +409,7 @@ def test_container_action_without_a_project_directory_says_so(monkeypatch):
     project label has nothing to act on, and saying so beats a confusing
     `docker compose` error from the wrong cwd."""
     _recorder(monkeypatch)
-    assert "nothing to act on" in probes.instance_action("acme", "restart", "docker", Host(), None)
+    assert "nothing to act on" in managers.instance_action({**_DOCKER_INSTANCE, "workdir": ""}, "restart", Host())
 
 
 def test_a_stopped_project_never_falls_back_to_the_boxs_own_cluster(monkeypatch):

@@ -6,7 +6,7 @@ from typing import cast
 
 from textual.widgets import DataTable
 
-from odoo_activity import probes, tui
+from odoo_activity import managers, probes, tui
 from odoo_activity.host import Host
 from odoo_activity.panes import detail as detail_mod
 
@@ -674,6 +674,11 @@ def test_proc_cpu_ticks_many_batches_a_remote_host_into_one_call(monkeypatch):
     assert len(calls) == 1  # one round trip, not three
 
 
+def _managed(name: str, manager: str) -> probes.Instance:
+    """A minimal row for `manager`, with the fields discovery always sets."""
+    return {"name": name, "status": "running", "uptime": "0:01", "manager": manager}
+
+
 def test_instance_action_routes_by_manager(monkeypatch):
     calls = []
 
@@ -682,8 +687,8 @@ def test_instance_action_routes_by_manager(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(probes.subprocess, "run", fake_run)
-    assert probes.instance_action("demo.service", "restart") == ""
-    probes.instance_action("openerp-odoo-staging", "stop", manager="supervisor")
+    assert managers.instance_action(_managed("demo.service", "systemd"), "restart") == ""
+    managers.instance_action(_managed("openerp-odoo-staging", "supervisor"), "stop")
     assert calls == [
         ["systemctl", "--user", "restart", "demo.service"],
         ["supervisorctl", "stop", "openerp-odoo-staging"],
@@ -698,12 +703,12 @@ def test_instance_action_odoosh_restarts_both_services(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(probes.subprocess, "run", fake_run)
-    assert probes.instance_action("demo", "restart", manager="odoosh") == ""
+    assert managers.instance_action(_managed("demo", "odoosh"), "restart") == ""
     assert calls == [
         ["odoosh-restart", "http"],
         ["odoosh-restart", "cron"],
     ]
-    assert probes.instance_action("demo", "start", manager="odoosh") != ""
+    assert managers.instance_action(_managed("demo", "odoosh"), "start") != ""
 
 
 def test_rebuild_instances_sorts_by_status_and_nests_dbs(monkeypatch):
@@ -746,7 +751,7 @@ def test_instance_action_waits_for_confirmation(monkeypatch):
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     monkeypatch.setattr(tui, "databases_of", lambda _inst, *_: ([], None))
     monkeypatch.setattr(
-        tui, "instance_action", lambda name, action, manager, *_: calls.append((name, action, manager)) or ""
+        tui, "instance_action", lambda inst, action, *_: calls.append((inst["name"], action, inst["manager"])) or ""
     )
 
     async def go():
@@ -1053,7 +1058,7 @@ def test_mail_tab_renders_via_the_log_body_and_shows_only_check_port_25_without_
             assert pilot.app.query_one("#actable", DataTable).display is False
             assert pane.query_one("#acactions", detail_mod.Horizontal).display is True
             assert pilot.app.query_one("#check-port-25", detail_mod.Button)
-            assert list(pane.query(f"#{detail_mod._SEND_TEST_MAIL_ACTION[0]}")) == []
+            assert list(pane.query("#send-test-mail")) == []
 
     asyncio.run(go())
 

@@ -37,12 +37,16 @@ itself. `mail_audit` (outbound mail config) follows the same rule for
 The one non-read-only exception: `list_odooly_envs`, `instance_odooly_env`,
 and `odooly_run_script` match a database against `~/odooly.ini` and run the
 packaged scripts (`create_test_job`, `restore_app_icons`, `send_test_mail`),
-the same actions the TUI's `oa --enable-odooly` offers a human through the
+the same actions the TUI's odooly plugin offers a human through the
 Toolbox — now callable by the agent directly. Odooly logs in and can write
 to the matched database, so following the same launch-time-only pattern as
 `--include-sensitive-information`, the flag can only be set on the command
 line when the server starts — no tool call can enable it from within a
 session, and all three tools raise if `--enable-odooly` wasn't passed.
+It needs the `odooly` extra installed too. Unlike the TUI, the flag stays:
+exposing write actions to an agent is worth deciding explicitly, and
+installing a package is not that decision.
+
 `odooly_run_script`/`instance_odooly_env` always resolve locally against
 this machine's own `~/odooly.ini`, regardless of `host`/`ssh_port` used to
 pin the server — odooly reaches instances over the network, not over ssh.
@@ -51,5 +55,5 @@ pin the server — odooly reaches instances over the network, not over ssh.
 mail actually reaches an inbox; it requires a `to` recipient, validated
 before the script is even invoked.
 
-See [Keybindings & Tabs — Odooly](keybindings.md#odooly-experimental) for
+See [Keybindings & Tabs — Odooly](keybindings.md#odooly) for
 what each script does.

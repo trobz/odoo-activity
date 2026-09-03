@@ -18,7 +18,6 @@ import select
 import signal
 import socket
 import subprocess
-import sys
 import time
 from collections import Counter
 from collections.abc import Mapping
@@ -162,40 +161,6 @@ def _is_sidecar_unit(unit_id: str) -> bool:
     """True for a systemd --user unit that manages a task *for* an Odoo
     instance (backups, log rotation) rather than being the instance itself."""
     return unit_id.lower().startswith(_SIDECAR_UNIT_PREFIXES)
-
-
-def list_instances(host: Host = LOCAL) -> list[Instance]:
-    """All Odoo instances on `host`, from systemd --user, supervisor, odoo.sh,
-    docker compose and directly-run processes.
-
-    Each row carries its `manager` so actions route to the right controller;
-    managers can even expose the same name (e.g. odoo-demo).
-    """
-    return (
-        systemd_instances(host)
-        + supervisor_instances(host)
-        + odoosh_instances(host)
-        + docker_instances(host)
-        + local_instances(host)
-    )
-
-
-def instance_status(inst: Instance, host: Host = LOCAL) -> str:
-    """The instance's corrected status: `running`, `stopped`, or a manager
-    failure state (`failed`/`exited`/`fatal`).
-
-    A manager may report "stopped" while a bare shell runs it, so a live
-    process promotes an ambiguous *stopped* report to running. An explicit
-    failure (systemd "failed", supervisor "exited"/"fatal") is authoritative
-    even if a process serving the same db is alive — `procs_of` matches by
-    db name, not manager, so that process may belong to the *other*
-    manager's instance of the same name/db (see `list_instances`).
-    """
-    if inst["status"] == "running":
-        return "running"
-    if inst["status"] == "stopped" and procs_of(inst, host):
-        return "running"
-    return inst["status"]
 
 
 def systemd_instances(host: Host = LOCAL) -> list[Instance]:
@@ -952,17 +917,51 @@ def _read_out_of_container(container: str, path: str | Path, box: Host = LOCAL) 
         box.run(["rm", "-f", tmp])
 
 
+def _manager_of(inst: Instance):
+    """`inst`'s manager, imported here rather than at module scope.
+
+    This module is the low-level layer the managers are built on, so it must
+    not import them while it is still being defined. Only these few
+    instance-scoped probes need one at all -- everything else in here takes
+    a `Host` and never asks who runs it.
+    """
+    from odoo_activity.managers import manager_of
+
+    return manager_of(inst)
+
+
 def container_host(inst: Instance, host: Host = LOCAL) -> Host:
-    """`host` narrowed to the instance's own container, or unchanged for
-    every other manager — so a caller can probe without branching."""
-    return host.in_container(inst.get("container"))
+    """`host` narrowed to where this instance's own processes and files live
+    -- inside its container for docker, `host` unchanged for every other
+    manager, so a caller can probe without branching."""
+    return _manager_of(inst).host_for(inst, host)
 
 
 def db_container_host(inst: Instance, host: Host = LOCAL) -> Host:
-    """`host` narrowed to the instance's *postgres* container. Only the
-    Top tab's backend list needs this: everything else reaches postgres
-    over TCP (see `pg_target_of`), not by running commands next to it."""
-    return host.in_container(inst.get("db_container"))
+    """`host` narrowed to the instance's *postgres* container, where it has
+    one. Only the Top tab's backend list needs this: everything else reaches
+    postgres over TCP (see `pg_target_of`), not by running commands next to
+    it."""
+    manager = _manager_of(inst)
+    db_host_for = getattr(manager, "db_host_for", None)
+
+    return db_host_for(inst, host) if db_host_for else host
+
+
+def instance_pid(inst: Instance, host: Host = LOCAL) -> str | None:
+    """The instance's master pid, straight from its process manager.
+
+    Not matched by database name: in multi-db/config-only setups the odoo
+    process's argv never carries a db name at all (only postgres's own
+    backends do, since they connect to a specific db), so a db-name-in-argv
+    heuristic both misses the real process and can misfire on postgres.
+    """
+    return _manager_of(inst).pid(inst, host)
+
+
+def instance_workdir(inst: Instance, host: Host = LOCAL) -> Path:
+    """The directory every path this instance reports is resolved against."""
+    return _manager_of(inst).workdir(inst, host)
 
 
 # doodba ships a tasks.py with start/stop/restart, and a developer running
@@ -1013,60 +1012,6 @@ def _docker_action(action: str, host: Host = LOCAL, workdir: str | None = None) 
         error = out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
 
     return error
-
-
-def instance_action(
-    unit: str, action: str, manager: str = "systemd", host: Host = LOCAL, workdir: str | None = None
-) -> str:
-    """start/stop/restart an instance via its process manager.
-
-    Odoo instances run under systemd --user, supervisor, odoo.sh or docker
-    compose; the caller passes the `manager` recorded at discovery time so
-    the right controller is used. Returns "" on success, else the
-    controller's error output (so the UI can show why nothing happened
-    instead of failing silently).
-
-    `workdir` is docker's alone: compose acts on a project directory, not on
-    a name the way a unit does.
-    """
-    if manager == "docker":
-        return _docker_action(action, host, workdir)
-
-    if manager == "local":
-        return "no process manager — a directly-run instance can't be started or stopped from here"
-
-    if manager == "odoosh":
-        # odoo.sh has no separate start/stop — sleep/wake is the platform's
-        # call, not ours; only a restart of the http workers is exposed.
-        if action != "restart":
-            return "start/stop not supported — odoo.sh handles sleep/wake on its own"
-
-        # odoosh-restart takes one service at a time, unlike `supervisorctl
-        # restart` which restarts everything for the instance in one call —
-        # so restart both services it's equivalent to.
-        for service in ("http", "cron"):
-            try:
-                out = host.run(["odoosh-restart", service])
-            except FileNotFoundError:
-                return "odoosh-restart not found on PATH"
-
-            if out.returncode != 0:
-                return out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
-        return ""
-
-    # synchronous; --user odoo units activate fast. Move to a worker
-    # if a unit's start/restart ever blocks the UI.
-    cmd = ["supervisorctl", action, unit] if manager == "supervisor" else ["systemctl", "--user", action, unit]
-
-    try:
-        out = host.run(cmd)
-    except FileNotFoundError:
-        return f"{cmd[0]} not found on PATH"
-
-    if out.returncode == 0:
-        return ""
-
-    return out.stderr.strip() or out.stdout.strip() or f"exit {out.returncode}"
 
 
 # db ownership: a database belongs to an instance when its owner role matches
@@ -1200,9 +1145,18 @@ def pg_target_of(inst: Instance, host: Host = LOCAL, parser: configparser.RawCon
     environment, which is where the official image keeps them) — so the TUI
     reaches the database exactly the way the instance does.
     """
-    if inst["manager"] != "docker":
-        return PgTarget(port=db_port_of(inst, host))
+    return _manager_of(inst).pg_target(inst, host, parser)
 
+
+def _container_pg_target(inst: Instance, host: Host, parser: configparser.RawConfigParser | None) -> PgTarget:
+    """`pg_target_of` for a compose project, whose postgres is a container.
+
+    The address comes from the compose network, the role and password from
+    the odoo config that the odoo container is itself connecting with
+    (falling back to its environment, which is where the official image
+    keeps them) -- so the TUI reaches the database exactly the way the
+    instance does.
+    """
     if parser is None:  # `databases_of` already has one; reading it again is a copy out of the container
         _workdir, parser = instance_config(inst, host)
 
@@ -1256,34 +1210,6 @@ def _systemd_workdir(unit: str, host: Host = LOCAL) -> Path:
     if m := re.search(r"WorkingDirectory=(\S+)", show):
         return Path(m.group(1))
     return Path.cwd() if host.is_local else Path("/")
-
-
-def instance_workdir(inst: Instance, host: Host = LOCAL) -> Path:
-    """The instance's working directory (supervisor `directory=`, a
-    directly-run instance's own cwd, the systemd unit's WorkingDirectory, or
-    $HOME on odoo.sh)."""
-    if inst["manager"] in ("supervisor", "local"):
-        return Path(inst.get("directory") or ".")
-
-    if inst["manager"] == "docker":
-        # The container's own working directory, not the compose project
-        # directory on the host: this is the base every *path* here is
-        # resolved against (config, logfile, data_dir) and those all live
-        # inside. The project directory is `workdir` on the row, used only
-        # to run invoke/docker compose (see instance_action).
-        #
-        # Read off the image rather than /proc/<pid>/cwd: one call instead
-        # of a ps plus a readlink, and it answers for a stopped container
-        # too, which has no process to ask.
-        out = host.on_box.run(["docker", "inspect", "-f", "{{.Config.WorkingDir}}", inst["container"]]).stdout
-        return Path(out.strip() or "/")
-
-    if inst["manager"] == "odoosh":
-        if host.is_local:
-            return Path.home()
-        return Path(host.run(["sh", "-c", "echo $HOME"]).stdout.strip() or "/root")
-
-    return _systemd_workdir(inst["name"], host)
 
 
 # Odoo's CLI mirrors its config keys once `--` is stripped and dashes become
@@ -1340,75 +1266,19 @@ def _cli_options(cmd: str) -> dict[str, str]:
 
 # Where an odoo container image renders its config, most specific first:
 # doodba's generated one, then the official image's packaged default.
-_DOCKER_CONFIG_PATHS = ("/opt/odoo/auto/odoo.conf", "/etc/odoo/odoo.conf")
-
-
-def _config_names(instance_name: str) -> list[str]:
-    """Config filenames to try, in order.
-
-    A multi-node instance's name is suffixed `-NN` (e.g. `foo-01`), and its
-    config is `odooNN.conf` rather than `odoo.conf` — `server.conf` is never
-    node-numbered, so it's only ever tried plain.
-    """
-    if m := re.search(r"-(\d+)$", instance_name):
-        return [f"odoo{m.group(1)}.conf", "odoo.conf", "server.conf"]
-    return ["odoo.conf", "server.conf"]
-
-
-def _container_config(host: Host) -> tuple[Path | None, str | None]:
-    """(path, contents) of the odoo config inside `host`'s container, or
-    (None, None).
-
-    An image puts the config where it likes, so there is no
-    `<workdir>/config/` convention to walk: doodba renders one at
-    /opt/odoo/auto/odoo.conf, the official image ships /etc/odoo/odoo.conf,
-    and anything else names it on the command line (which `_config_file`
-    handles before it gets here).
-
-    Read with `docker cp`, not `docker exec cat`: exec needs the container
-    running, and a config is exactly what you want to read when an instance
-    won't start (verified: with the container stopped, an exec probe
-    reported no config at all).
-
-    Path *and* contents in one go, deliberately: locating the file and
-    reading it are the same copy, and doing them separately meant four
-    copies out of the container per `databases_of` -- 12 round trips, each
-    one an ssh hop on a remote box.
-    """
-    if host.container is None:
-        return None, None
-
-    for candidate in _DOCKER_CONFIG_PATHS:
-        text = _read_out_of_container(host.container, candidate, host.on_box)
-        if text is not None:
-            return Path(candidate), text
-
-    return None, None
-
-
 def _config_file(inst: Instance, host: Host = LOCAL) -> Path | None:
-    """The config file named on a directly-run instance's own command line,
-    the fixed `~/.config/odoo/odoo.conf` odoo.sh always writes, or the first
-    `<workdir>/config/` file matching `_config_names`."""
-    host = container_host(inst, host)
+    """The instance's config file, or None.
+
+    A path on the instance's own command line wins over whatever its manager
+    would go looking for -- an explicit `-c` is the answer, whoever started
+    it.
+    """
+    at = container_host(inst, host)
 
     if path := inst.get("config"):
-        return Path(path) if host.is_file(path) else None
+        return Path(path) if at.is_file(path) else None
 
-    if inst["manager"] == "docker":
-        return _container_config(host)[0]
-
-    if inst["manager"] == "odoosh":
-        path = instance_workdir(inst, host) / ".config" / "odoo" / "odoo.conf"
-        return path if host.is_file(path) else None
-
-    workdir = instance_workdir(inst, host)
-    for name in _config_names(inst["name"]):
-        path = workdir / "config" / name
-        if host.is_file(path):
-            return path
-
-    return None
+    return _manager_of(inst).config_file(inst, at)
 
 
 def configfile_of(inst: Instance, host: Host = LOCAL) -> Path | None:
@@ -1428,29 +1298,30 @@ def instance_config(inst: Instance, host: Host = LOCAL) -> tuple[Path, configpar
     back through this one parser whether they came from a file, the command
     line, or — with no config file at all — only the latter.
     """
+    manager = _manager_of(inst)
     workdir = instance_workdir(inst, host)
-    host = container_host(inst, host)  # the file lives in the container, if there is one
+    at = container_host(inst, host)  # the file lives in the container, if there is one
 
-    if host.container is not None:
-        path, text = _container_config(host)  # one copy out, path and contents together
+    if path := inst.get("config"):  # an explicit -c wins over the manager's own search
+        path = Path(path) if at.is_file(path) else None
+        text = at.read_text(path) if path is not None else None
     else:
-        path = _config_file(inst, host)
-        text = host.read_text(path) if path is not None else None
+        path, text = manager.config(inst, at)
 
-    if path is None and inst["manager"] not in ("local", "docker"):
+    argv = manager.argv_settings(inst)
+    if path is None and not argv:
         return workdir, None
 
     parser = configparser.RawConfigParser()  # odoo configs may contain `%`
     if text is not None:
         parser.read_string(text)
 
-    if inst["manager"] in ("local", "docker"):
-        # compose's `command:` is argv the same way a shell-run instance's
-        # is, and doodba puts real settings there (--workers, --dev), so it
-        # layers over the file for both.
+    if argv:
+        # argv layers *over* the file: whatever started this instance had the
+        # last word on it
         if not parser.has_section("options"):
             parser.add_section("options")
-        for key, value in _cli_options(inst.get("command", "")).items():
+        for key, value in _cli_options(argv).items():
             parser.set("options", key, value)
 
     return workdir, parser
@@ -1468,17 +1339,7 @@ def logfile_of(inst: Instance, host: Host = LOCAL) -> Path | None:
     """The instance's odoo logfile, from the `logfile` key of its config, or
     odoo.sh's fixed `~/logs/odoo.log` (its config is sparse — no `logfile`
     key at all)."""
-    if inst["manager"] == "odoosh":
-        path = instance_workdir(inst, host) / "logs" / "odoo.log"
-        return path if host.is_file(path) else None
-
-    workdir, parser = instance_config(inst, host)
-    logfile = _opt(parser, "logfile")
-    if logfile is None:
-        return _redirected_stdout(inst, host) if inst["manager"] == "local" else None
-
-    path = Path(logfile)
-    return path if path.is_absolute() else workdir / path
+    return _manager_of(inst).logfile(inst, host)
 
 
 def _redirected_stdout(inst: Instance, host: Host = LOCAL) -> Path | None:
@@ -1509,11 +1370,7 @@ def data_dir_of(inst: Instance, host: Host = LOCAL) -> str | None:
     """The instance's `data_dir`, from its odoo config, or odoo.sh's fixed
     `~/data` (its config has no `data_dir` key -- same reasoning as
     `logfile_of`'s odoosh case)."""
-    if inst["manager"] == "odoosh":
-        return str(instance_workdir(inst, host) / "data")
-
-    _, parser = instance_config(inst, host)
-    return _opt(parser, "data_dir")
+    return _manager_of(inst).data_dir(inst, host)
 
 
 def session_dir_of(inst: Instance, host: Host = LOCAL) -> str | None:
@@ -1553,29 +1410,7 @@ def databases_of(inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | N
     scratch) — cheap to duplicate locally, but each fetch is its own ssh
     round trip remotely.
     """
-    if inst["manager"] == "odoosh":
-        return [inst["db"]], None
-
-    _, parser = instance_config(inst, host)
-    port = _opt(parser, "db_port")
-
-    # `-d`/`db_name` pins it to one db; unpinned is genuinely multi-db
-    if inst["manager"] == "local" and (pinned := _opt(parser, "db_name")):
-        return [name.strip() for name in pinned.split(",") if name.strip()], port
-
-    if inst["manager"] == "docker":
-        # ODOO_ACTIVITY_DB_ROLE is about *this box's* cluster convention
-        # (locally every db is owned by `openerp`); a container's cluster is
-        # its own, and the role odoo connects as is right there in its
-        # config -- so the env override deliberately doesn't apply here.
-        target = pg_target_of(inst, host, parser)
-        if target.host is None or target.host.endswith(".invalid"):
-            return [], None  # postgres isn't up; nothing to list, and nothing to mistake for it
-
-        return databases_by_role(target.user or "odoo", target, host), target.port
-
-    role = DB_ROLE or _opt(parser, "db_user") or inst["name"].removesuffix(".service")
-    return databases_by_role(role, port, host), port
+    return _manager_of(inst).databases(inst, host)
 
 
 def databases_by_role(role: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> list[str]:
@@ -1913,38 +1748,6 @@ def proc_cpu_ticks_many(pids: list[str], host: Host = LOCAL) -> dict[str, int | 
         pid, _, data = block.partition("\n")
         result[pid.strip()] = _parse_cpu_ticks(data)
     return result
-
-
-def instance_pid(inst: Instance, host: Host = LOCAL) -> str | None:
-    """The instance's master pid, straight from its process manager.
-
-    Not matched by database name: in multi-db/config-only setups the odoo
-    process's argv never carries a db name at all (only postgres's own
-    backends do, since they connect to a specific db), so a db-name-in-argv
-    heuristic both misses the real process and can misfire on postgres.
-    """
-    if inst["manager"] == "odoosh":
-        return _odoosh_master_pid(host)
-
-    if inst["manager"] == "docker":
-        # compose has no MainPID to ask for, and the pid is the container's
-        # own (see docker_instances) -- so it comes from a ps inside it.
-        # Not cached on the row: a container that restarted keeps its name
-        # and gets a fresh pid, which a cached one would miss.
-        return _odoo_master_in(container_host(inst, host))
-
-    if inst["manager"] == "local":
-        # nothing to re-ask for a MainPID; `list_instances` re-runs on a timer,
-        # so a restart arrives as a fresh row rather than being tracked here
-        return inst.get("pid")
-
-    if inst["manager"] == "supervisor":
-        out = host.run(["supervisorctl", "pid", inst["name"]]).stdout.strip()
-        return out if out.isdigit() else None
-
-    out = host.run(["systemctl", "--user", "show", inst["name"], "-p", "MainPID"]).stdout
-    m = re.search(r"MainPID=(\d+)", out)
-    return m.group(1) if m and m.group(1) != "0" else None
 
 
 def _ps_snapshot(host: Host) -> tuple[dict[str, ProcRow], dict[str, list[str]]]:
@@ -2425,12 +2228,16 @@ def dump_and_parse_stacks(inst: Instance, host: Host = LOCAL) -> tuple[str, list
     if not procs:
         return "(no workers alive)", []
 
+    return _manager_of(inst).dump_stacks(inst, procs, host)
+
+
+def _dump_via_logfile(inst: Instance, procs: list[ProcRow], host: Host = LOCAL) -> tuple[str, list[Worker]]:
+    """`dump_and_parse_stacks` for an instance whose log is a file: note its
+    size, signal every worker, then read only what arrived after that offset.
+    """
     at = container_host(inst, host)  # whose pids these are, so whose namespace the signal goes to
     expected = {proc["pid"] for proc in procs}
     text = ""
-
-    if inst["manager"] == "docker":
-        return _dump_via_stream(inst, procs, host)
 
     path = logfile_of(inst, host)
     if path is None or not host.is_file(path):
@@ -2473,26 +2280,7 @@ def instance_version(inst: Instance, host: Host = LOCAL) -> str | None:
     """The instance's Odoo version, via the `odoo-addons-path` CLI (layout/
     addons-path detection lives there, not here) — or straight from
     odoo.sh's own `$ODOO_VERSION` env var, captured at discovery time."""
-    if inst["manager"] == "odoosh":
-        return inst.get("version")
-
-    if inst["manager"] == "docker":
-        # odoo-addons-path is one of our own tools, installed on the box and
-        # not in the image -- and the layout it would inspect is inside the
-        # container anyway. odoo can just say what it is.
-        out = container_host(inst, host).run(["odoo", "--version"]).stdout
-        m = re.search(r"(\d+\.\d+)", out)
-        return m.group(1) if m else None
-
-    try:
-        out = host.run(["odoo-addons-path", str(instance_workdir(inst, host)), "--verbose", "--format", "json"]).stdout
-    except FileNotFoundError:
-        return None
-
-    try:
-        return json.loads(out).get("version")
-    except (json.JSONDecodeError, ValueError):
-        return None
+    return _manager_of(inst).version(inst, host)
 
 
 def render_config(config: Path, version: str | None, mode: str, host: Host = LOCAL) -> str:
@@ -2554,17 +2342,7 @@ def log_snapshot(inst: Instance, host: Host = LOCAL, lines: int = 200) -> str | 
     stream itself. So the log is `docker logs`, not a path — which is also
     why `logfile_of` returning None can't mean "no log" for this manager.
     """
-    if inst["manager"] == "docker":
-        # Both streams: odoo logs to stderr, docker keeps the two apart, and
-        # a Logs tab showing only stdout would be empty on every instance.
-        # Concatenated rather than interleaved -- there is no shell here to
-        # `2>&1` with -- which is right for odoo (everything is on stderr)
-        # and the reason the follow stream below merges them properly.
-        out = host.run(["docker", "logs", "--tail", str(lines), inst["container"]])
-        return _untty(out.stderr + out.stdout)
-
-    path = logfile_of(inst, host)
-    return None if path is None else tail(path, lines, host)
+    return _manager_of(inst).log_snapshot(inst, host, lines)
 
 
 def log_stream(inst: Instance, host: Host = LOCAL) -> subprocess.Popen | None:
@@ -2575,18 +2353,7 @@ def log_stream(inst: Instance, host: Host = LOCAL) -> subprocess.Popen | None:
     lines already on screen came from `log_snapshot` -- without it every
     follow would replay the whole buffer into the pane.
     """
-    if inst["manager"] == "docker":
-        return host.popen(
-            ["docker", "logs", "-f", "--tail", "0", inst["container"]],
-            stderr=subprocess.STDOUT,
-            text=False,
-        )
-
-    path = logfile_of(inst, host)
-    if path is None or host.is_local:
-        return None  # a local file is polled by size, no child needed
-
-    return host.popen(["tail", "-f", "-n", "0", str(path)], stderr=subprocess.DEVNULL, text=False)
+    return _manager_of(inst).log_stream(inst, host)
 
 
 def tail(path: Path, lines: int = 200, host: Host = LOCAL) -> str:
@@ -2758,131 +2525,6 @@ _LOGO = r"""
     +yhhyhohhy        '/shhhyhhhys/'    -oyhhhyhhhyo:ossssssssssss+'
      '-///:///          '.-://:-'          .:///:.' -:::::::::::::::
 """
-
-
-# ---------------------------------------------------------------- odooly ---
-# odooly connects to an instance over the network, so its config is read from
-# *this* machine even when the instances being watched are on a remote host:
-# `oa openerp@somehost` still runs odooly locally, against the same envs the
-# user has in their own `~/odooly.ini`.
-ODOOLY_CONFIG = Path("~/odooly.ini").expanduser()
-
-# Trobz names instances after the environment they serve, and odooly envs
-# after the same thing abbreviated (or not) -- `openerp-acme18-integration`
-# is configured as `acme18-integration` or `acme18-int`.
-_ENV_ABBREVIATIONS = {"integration": "int", "staging": "stag", "production": "prod"}
-# what a manager prefixes an instance name with, which no odooly env repeats
-_INSTANCE_PREFIXES = ("openerp-", "odoo-")
-
-
-class OdoolyEnv(TypedDict):
-    """One section of `odooly.ini`: the env name, and the database it pins
-    (absent when the section leaves `database` unset)."""
-
-    name: str
-    db: str
-
-
-def read_odooly_envs(path: Path = ODOOLY_CONFIG) -> list[OdoolyEnv]:
-    """Every environment in `path`, as (name, database).
-
-    Read with configparser rather than `odooly.read_config`, which returns
-    the password too: matching only needs the name and the database, and
-    what isn't read can't be leaked into a log or a screen.
-
-    Empty when the file is missing or unparseable -- odooly support is
-    opt-in and best-effort, and a broken ini shouldn't take the app down.
-    """
-    parser = configparser.RawConfigParser()
-    try:
-        parser.read_string(path.read_text())
-    except (OSError, configparser.Error):
-        return []
-
-    return [{"name": name, "db": parser.get(name, "database", fallback="")} for name in parser.sections()]
-
-
-def _name_variants(name: str) -> set[str]:
-    """`name` as it may appear on either side of the match: as written, and
-    with each environment word abbreviated or spelled out."""
-    variants = {name}
-
-    for long, short in _ENV_ABBREVIATIONS.items():
-        variants |= {variant.replace(long, short) for variant in variants if long in variant}
-        variants |= {variant.replace(short, long) for variant in variants if short in variant}
-
-    return variants
-
-
-def instance_env_name(instance_name: str) -> str:
-    """`instance_name` stripped of what only a process manager adds --
-    `openerp-acme18-integration.service` is the `acme18-integration` an
-    odooly env would be named after."""
-    name = instance_name.removesuffix(".service")
-
-    for prefix in _INSTANCE_PREFIXES:
-        name = name.removeprefix(prefix)
-
-    return name
-
-
-def match_odooly_env(instance_name: str, db: str, envs: list[OdoolyEnv]) -> str | None:
-    """The odooly env serving `db` on `instance_name`, or None.
-
-    An env qualifies when its name matches the instance's -- exactly, in
-    either spelling (`-integration` / `-int`), or as that name plus a suffix,
-    since a multi-db instance is usually configured one env per database
-    (`acme18-int-db1`). The database has to match exactly whenever the env
-    names one, which is what keeps those per-db envs apart.
-
-    Ranked, best first: an env that names this database beats one that names
-    none, and among equals the closest name wins. Ties are broken by name so
-    the answer doesn't depend on the ini's ordering.
-    """
-    wanted = _name_variants(instance_env_name(instance_name))
-    matches = []
-
-    for env in envs:
-        if env["db"] and env["db"] != db:
-            continue
-
-        names = _name_variants(env["name"])
-        exact = bool(names & wanted)
-        prefixed = any(name.startswith(f"{want}-") for name in names for want in wanted)
-        if not (exact or prefixed):
-            continue
-
-        # a db-pinned env first, then an exact name, then the shortest suffix
-        matches.append((not env["db"], not exact, len(env["name"]), env["name"]))
-
-    return min(matches)[3] if matches else None
-
-
-def run_odooly_script(script: str, env: str, *extra_args: str, timeout: int = 300) -> str:
-    """Run one of `odoo_activity.scripts` against odooly env `env`, and
-    return what it printed (stdout, then stderr).
-
-    Deliberately local and never over `Host`: odooly reaches the instance
-    over the network using this machine's `~/odooly.ini`, which the watched
-    host neither has nor should be asked for.
-
-    `sys.executable -m` rather than a console script, so it is the
-    interpreter running odoo-activity -- the one odooly is installed in --
-    whatever `PATH` says.
-
-    `extra_args` is appended verbatim after `--env <env>`, for a script
-    that needs more than the env to run (e.g. send_test_mail's `--to`).
-    """
-    argv = [sys.executable, "-m", f"odoo_activity.scripts.{script}", "--env", env, *extra_args]
-
-    try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return f"({script} timed out after {timeout}s)"
-    except OSError as exc:
-        return f"(cannot run {script}: {exc})"
-
-    return "\n".join(part for part in (done.stdout.strip(), done.stderr.strip()) if part)
 
 
 def about_text() -> str:

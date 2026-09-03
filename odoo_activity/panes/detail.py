@@ -25,14 +25,14 @@ from textual.widgets import Button, DataTable, Input, RichLog, Static, Tree
 from textual.widgets.data_table import RowDoesNotExist
 
 from odoo_activity.host import Host, to_thread
-from odoo_activity.panes.confirm import ConfirmScreen, PromptScreen
+from odoo_activity.managers import db_host_for, host_for, instance_pid
+from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.mail import render_mail
 from odoo_activity.panes.processes import render_processes
 from odoo_activity.panes.stacks import filter_workers, render_stacks
 from odoo_activity.probes import (
     ALL_ROW_FLAGS,
     CLK_TCK,
-    ODOOLY_CONFIG,
     Instance,
     PgTarget,
     ProcRow,
@@ -40,9 +40,6 @@ from odoo_activity.probes import (
     _read_new_bytes,
     _untty,
     configfile_of,
-    container_host,
-    db_container_host,
-    instance_pid,
     instance_procs,
     instance_version,
     instance_workers,
@@ -61,7 +58,6 @@ from odoo_activity.probes import (
     render_config,
     requeue_jobs,
     row_matches,
-    run_odooly_script,
     session_count,
     session_dir_of,
     shell_command,
@@ -73,6 +69,7 @@ from odoo_activity.probes import (
 )
 
 if TYPE_CHECKING:
+    from odoo_activity.plugins import Handler, Tool
     from odoo_activity.tui import OdooActivity
 
 _log = logging.getLogger("odoo_activity")
@@ -95,8 +92,6 @@ def _inst_key(inst: Instance | None) -> str | None:
 # `on_button_pressed`. Tab-wide, not row-scoped: they act on the database,
 # whatever the cursor happens to be on.
 _REQUEUE_ACTION = ("requeue-jobs", "⟳  Requeue jobs")
-_TEST_JOB_ACTION = ("create-test-job", "+  Create test job")
-_SEND_TEST_MAIL_ACTION = ("send-test-mail", "✉  Send test mail")
 _CHECK_PORT_25_ACTION = ("check-port-25", "🔌 Check port 25")
 
 
@@ -119,6 +114,7 @@ class _DbTab:
         self.rows: list[dict] = []  # raw (untruncated) rows behind #actable, outlives the fetch
         self.no_all = False  # this host's odoo-db rejected --all (see _fetch_db_tab)
         self.actions: list[tuple[str, str]] = []  # (id, label) of the tab's own actions
+        self.handlers: dict[str, Handler] = {}  # action id -> the plugin handler behind it
         self.numbered = False  # prefix rows with a 1..n column, for counting long lists by eye
 
     def abandon(self) -> None:
@@ -287,14 +283,6 @@ class ActivityPane(Vertical):
         ("Open shell (copy command)", None),
         ("Count sessions", "count_sessions"),
     ]
-    # (label, script) for the database-mode Toolbox -- `None` copies the
-    # odooly command instead of running anything. Every one of them needs a
-    # login, so the tab only lists them for a db odooly can reach (see
-    # _render_db_toolbox).
-    DB_TOOLBOX_TOOLS: ClassVar = [
-        ("Open odooly (copy command)", None),
-        ("Restore app icons", "restore_app_icons"),
-    ]
     MODE_TITLE: ClassVar = {"instance": "Instance", "database": "Database"}
 
     # Top's search fields -- deliberately not every column, or e.g. "1" would
@@ -344,6 +332,7 @@ class ActivityPane(Vertical):
         self._dbtab = _DbTab()
         self._jobs_group: tuple[str, str] | None = None  # (function, state) the Jobs tab drilled into
         self._actions_shown: list[str] = []  # action ids currently mounted in #acactions
+        self._db_tools: list[Tool] = []  # Toolbox rows currently listed, index-addressed by the table
         self._showing_raw = False  # viewing one row's raw json in #acbody
         self._stacks_cache: dict[str, tuple[list[Worker], Path]] = {}  # instance key -> its last dump
         self.query_one("#acstacks", Tree).show_root = False
@@ -594,12 +583,11 @@ class ActivityPane(Vertical):
             bar.mount(Button(label, id=action_id, variant="warning", compact=True))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == _REQUEUE_ACTION[0]:
+        handler = self._dbtab.handlers.get(event.button.id or "")
+        if handler is not None:
+            self.run_worker(self._run_plugin(handler))
+        elif event.button.id == _REQUEUE_ACTION[0]:
             self.run_worker(self._confirm_requeue())
-        elif event.button.id == _TEST_JOB_ACTION[0]:
-            self.run_worker(self._run_odooly_script("create_test_job", "Create test job"))
-        elif event.button.id == _SEND_TEST_MAIL_ACTION[0]:
-            self.run_worker(self._run_send_test_mail())
         elif event.button.id == _CHECK_PORT_25_ACTION[0]:
             self.run_worker(self._run_check_port_25())
 
@@ -658,7 +646,7 @@ class ActivityPane(Vertical):
         if not confirmed:
             return
 
-        at = container_host(inst, host)  # the pid is the container's, so the signal must be too
+        at = host_for(inst, host)  # the pid is the container's, so the signal must be too
         pid = await to_thread(instance_pid, inst, at)
         if pid is None:
             self.app.notify(f"{inst['name']}: no master pid found", severity="warning", timeout=3)
@@ -676,7 +664,7 @@ class ActivityPane(Vertical):
         # the argv, the paths in it and the shell that runs it are all the
         # container's when there is one -- Host.shell_invocation then wraps
         # the whole thing in `docker exec -it` (and ssh outside that)
-        host = container_host(inst, host)
+        host = host_for(inst, host)
         cmd = await to_thread(shell_command, inst, host)
         if cmd is None:
             self.app.notify(f"{inst['name']} isn't running — no shell command to copy", severity="warning", timeout=3)
@@ -696,7 +684,7 @@ class ActivityPane(Vertical):
         if not confirmed:
             return
 
-        host = container_host(inst, host)  # data_dir is a path inside the container
+        host = host_for(inst, host)  # data_dir is a path inside the container
         session_dir = await to_thread(session_dir_of, inst, host)
         if session_dir is None:
             self.app.notify(f"{inst['name']}: no data_dir configured", severity="warning", timeout=3)
@@ -1161,7 +1149,7 @@ class ActivityPane(Vertical):
         # the config file lives inside the container when there is one;
         # render_config copies it back out for odoo-config (which is on the
         # box, not in the image)
-        host = container_host(inst, self.app.host)
+        host = host_for(inst, self.app.host)
         config = await to_thread(configfile_of, inst, host)
 
         # each await above is an ssh round trip -- long enough remotely for
@@ -1208,7 +1196,7 @@ class ActivityPane(Vertical):
         port = await to_thread(pg_target_of, inst, host)
         # `ss`/`lsof` have to run where the odoo processes' sockets are: the
         # container's own network namespace, not the box's
-        jobrunners = await to_thread(jobrunner_pids, port, container_host(inst, host))
+        jobrunners = await to_thread(jobrunner_pids, port, host_for(inst, host))
 
         if self._instance is not inst or not self.is_processes_active():
             return  # instance or tab changed while this was fetching; the result is stale
@@ -1241,7 +1229,7 @@ class ActivityPane(Vertical):
         # different processes -- so ticks are read per group, and keyed by
         # group. Same host for every other manager, and then it stays one
         # round trip.
-        odoo_at, pg_at = container_host(inst, host), db_container_host(inst, host)
+        odoo_at, pg_at = host_for(inst, host), db_host_for(inst, host)
         if odoo_at == pg_at:
             flat = await to_thread(proc_cpu_ticks_many, [p["pid"] for p, _ in procs], odoo_at)
             ticks_by_pid = {(kind, p["pid"]): flat.get(p["pid"]) for p, kind in procs}
@@ -1497,9 +1485,7 @@ class ActivityPane(Vertical):
 
         # offered even with nothing to show: a queue whose jobs are all stuck
         # is exactly when the table above is unhelpful
-        self._dbtab.actions = [_REQUEUE_ACTION]
-        if self.app.highlighted_odooly_env() is not None:
-            self._dbtab.actions.append(_TEST_JOB_ACTION)
+        self._dbtab.actions = [_REQUEUE_ACTION, *self._plugin_actions("Jobs")]
         self._dbtab.numbered = True  # both depths are lists to count: groups, then jobs
         self._handle_rows(rows, _first_line(error))
         self._render_actions()
@@ -1524,10 +1510,8 @@ class ActivityPane(Vertical):
             return
 
         # Check port 25 always shows -- a plain network probe, not an
-        # authenticated Odoo action, so it doesn't need an odooly env.
-        self._dbtab.actions = [_CHECK_PORT_25_ACTION]
-        if self.app.highlighted_odooly_env() is not None:
-            self._dbtab.actions.append(_SEND_TEST_MAIL_ACTION)
+        # authenticated Odoo action, so it needs nothing a plugin provides.
+        self._dbtab.actions = [_CHECK_PORT_25_ACTION, *self._plugin_actions("Mail")]
         self._dbtab.rows = []  # not table-backed -- stale rows from a prior tab shouldn't feed `/` search here
         self._use("log")
         render_mail(self.query_one("#acbody", RichLog), rows[0] if rows else {})
@@ -1570,12 +1554,39 @@ class ActivityPane(Vertical):
         if had_focus:
             self.focus_active()
 
-    def _render_db_toolbox(self) -> None:
-        """The database-mode Toolbox: what odooly can do to this database.
+    def _plugin_tools(self) -> list[Tool]:
+        """Toolbox rows the installed plugins offer for the highlighted
+        database."""
+        target = self.app.highlighted_db()
+        if target is None:
+            return []
 
-        Every tool here logs in, so the tab says why it is empty rather than
-        listing tools that would only fail — no `--enable-odooly`, or no env
-        in `~/odooly.ini` matching this instance and database.
+        return [tool for plugin in self.app.plugins for tool in plugin.tools("database", target)]
+
+    def _plugin_actions(self, tab: str) -> list[tuple[str, str]]:
+        """Buttons the installed plugins add under `tab`, registering each
+        one's handler for `on_button_pressed` to dispatch by id."""
+        self._dbtab.handlers = {}
+        target = self.app.highlighted_db()
+        if target is None:
+            return []
+
+        buttons = []
+        for plugin in self.app.plugins:
+            for action_id, label, handler in plugin.actions(tab, target):
+                self._dbtab.handlers[action_id] = handler
+                buttons.append((action_id, label))
+
+        return buttons
+
+    def _render_db_toolbox(self) -> None:
+        """The database-mode Toolbox: what the installed plugins can do to
+        this database.
+
+        Every row here comes from a plugin, so a plain `oa` shows an empty
+        tab. A plugin that could have filled it but can't reach this database
+        says why through its `hint` — better than a list of tools that would
+        only fail.
         """
         self._dbtab.actions = []
         self._render_actions()
@@ -1584,89 +1595,71 @@ class ActivityPane(Vertical):
             self._log_body("(no database)")
             return
 
-        env = self.app.highlighted_odooly_env()
-        if env is None:
-            self._log_body(
-                "(no odooly env for this database)\n\n"
-                "Odooly actions need a section in ~/odooly.ini whose name matches this instance "
-                "and whose database matches this one, and `oa --enable-odooly` to look for it."
-            )
+        self._db_tools = self._plugin_tools()
+        if not self._db_tools:
+            self._log_body(self._plugin_hints() or "(no plugin tools for this database)")
             return
 
         table = self.query_one("#actable", DataTable)
         table.clear(columns=True)
         self._use("table")
-        table.add_column(f"TOOL — odooly env: {env}")
-        for i, (label, _script) in enumerate(self.DB_TOOLBOX_TOOLS):
+        table.add_column(self._tools_column())
+        for i, (label, _handler) in enumerate(self._db_tools):
             table.add_row(label, key=str(i))
 
+    def _tools_column(self) -> str:
+        """`TOOL`, plus what each contributing plugin is acting through --
+        for odooly the env, so which credentials a row would use is visible
+        before pressing it, on a tab where every action logs in."""
+        target = self.app.highlighted_db()
+        if target is None:
+            return "TOOL"
+
+        via = " | ".join(label for plugin in self.app.plugins if (label := plugin.column("database", target)))
+
+        return f"TOOL — {via}" if via else "TOOL"
+
+    def _plugin_hints(self) -> str:
+        """Why the Toolbox is empty, in the words of the plugins that could
+        have filled it."""
+        target = self.app.highlighted_db()
+        if target is None:
+            return ""
+
+        return "\n\n".join(hint for plugin in self.app.plugins if (hint := plugin.hint("database", target)))
+
     async def _run_db_toolbox_tool(self, idx: int) -> None:
-        """Run the selected database Toolbox row: copy the odooly command, or
-        shell out to one of the packaged scripts."""
-        if not (0 <= idx < len(self.DB_TOOLBOX_TOOLS)):
+        """Run the selected database Toolbox row."""
+        if not (0 <= idx < len(self._db_tools)):
             return
 
-        label, script = self.DB_TOOLBOX_TOOLS[idx]
-        env = self.app.highlighted_odooly_env()
-        if env is None:
-            return
+        _label, handler = self._db_tools[idx]
+        await self._run_plugin(handler)
 
-        if script is None:
-            # `-c`, because odooly's CLI looks for `odooly.ini` in the working
-            # directory, not the home one -- the bare command only works if
-            # you happen to paste it while sitting in the right folder
-            command = f"odooly -c {ODOOLY_CONFIG} --env {env}"
-            if try_local_clipboard(command):
-                self.app.notify("Copied: " + command, timeout=3)
-            else:
-                self.app.notify(command, title="Copy manually", timeout=10)
-            return
+    async def _run_plugin(self, handler: Handler) -> None:
+        """Hand the highlighted database to a plugin's handler and show
+        whatever it hands back.
 
-        await self._run_odooly_script(script, label)
-
-    async def _run_odooly_script(self, script: str, label: str) -> None:
-        """Run one of the packaged odooly scripts against the highlighted
-        database's env, on confirmation, and show its output in the body.
-
-        Always local, even against a remote host: odooly reaches the instance
-        over the network, from this machine's own `~/odooly.ini` — the script
-        would not find that file on the far end (see scripts/__init__.py).
+        The handler owns its own confirmation and progress reporting — some
+        prompt for a value rather than a yes/no, and only it knows what it is
+        about to do. Nothing shows when it returns None: a clipboard copy has
+        already notified, and a cancelled confirm has nothing to say.
         """
-        env = self.app.highlighted_odooly_env()
-        if env is None:
+        target = self.app.highlighted_db()
+        if target is None:
             return
 
-        if not await self.app.push_screen_wait(ConfirmScreen(f"{label} — odooly env {env}?")):
-            return
-
-        self._log_body(f"Running {label} on {env}…")
-        result = await to_thread(run_odooly_script, script, env)
-        self._log_body(result or "(no output)")
-
-    async def _run_send_test_mail(self) -> None:
-        """Send test mail needs a recipient, which a plain yes/no confirm
-        can't collect -- PromptScreen asks for it instead, and typing an
-        address in and pressing Send *is* the confirmation: there's no
-        separate step after it.
-        """
-        env = self.app.highlighted_odooly_env()
-        if env is None:
-            return
-
-        to = await self.app.push_screen_wait(PromptScreen(f"Send a real test email via odooly env {env} — to address:"))
-        if not to:
-            return
-
-        self._log_body(f"Sending test mail via {env} to {to}…")
-        result = await to_thread(run_odooly_script, "send_test_mail", env, "--to", to)
-        self._log_body(result or "(no output)")
+        result = await handler(self.app, target)
+        if result is not None:
+            self._log_body(result or "(no output)")
 
     async def _run_check_port_25(self) -> None:
         """Whether *something* is listening for SMTP on the target host at
         all -- the question that matters once `mail_servers` is empty and
         Odoo falls back to `localhost:25` (see odoo-db's own `get_mail_servers`
-        "none defined" case). No odooly env needed, unlike Send test mail --
-        this is a plain network check, not an authenticated Odoo action.
+        "none defined" case). Core rather than a plugin contribution: a plain
+        network check, not an authenticated Odoo action, so it needs no login
+        and shows for every database.
 
         `-z` (scan, no data exchange) plus a short timeout: without them, a
         successful connection to an *open* port would leave `nc` sitting

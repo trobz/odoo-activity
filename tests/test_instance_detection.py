@@ -8,7 +8,7 @@ The argv strings below are trimmed from real processes on a dev machine.
 
 from types import SimpleNamespace
 
-from odoo_activity import probes
+from odoo_activity import managers, probes
 from odoo_activity.host import Host
 from odoo_activity.probes import Instance, ProcRow
 
@@ -257,15 +257,15 @@ def _inst(status: str) -> Instance:
 def test_instance_status_promotes_ambiguous_stopped_but_not_explicit_failure(monkeypatch):
     # a live process promotes an ambiguous "stopped" report to running
     monkeypatch.setattr(probes, "procs_of", lambda *_: [{"pid": "1"}])
-    assert probes.instance_status(_inst("stopped")) == "running"
+    assert managers.instance_status(_inst("stopped")) == "running"
 
     # regression: an explicit failure is authoritative even with a live
     # process matching the same db — procs_of() matches by db name, not
     # manager, so that process may belong to the *other* manager's instance
-    assert probes.instance_status(_inst("failed")) == "failed"
+    assert managers.instance_status(_inst("failed")) == "failed"
 
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
-    assert probes.instance_status(_inst("stopped")) == "stopped"
+    assert managers.instance_status(_inst("stopped")) == "stopped"
 
 
 # --- docker ---------------------------------------------------------------
@@ -399,3 +399,30 @@ def test_docker_instances_are_empty_without_docker(monkeypatch):
 
     monkeypatch.setattr(Host, "run", no_docker)
     assert probes.docker_instances(Host()) == []
+
+
+def test_managers_are_discovered_through_entry_points(monkeypatch):
+    """The five bundled managers register the same way a third-party one
+    would, and keep their intended display order rather than whatever order
+    the metadata happens to list them in."""
+    managers._installed.cache_clear()
+    found = managers.installed()
+
+    assert [m.name for m in found] == ["systemd", "supervisor", "odoosh", "docker", "local"]
+    assert managers.failures() == []
+
+
+def test_stale_metadata_says_so_instead_of_showing_an_empty_list(monkeypatch):
+    """Entry points come from the installed dist-info, not the source tree:
+    an editable install whose metadata predates them finds no manager at all
+    while running this very code. An empty instance list would read as `this
+    box has no Odoo`, so it is reported and the fallback keeps the app up."""
+    monkeypatch.setattr(managers.plugins, "load", lambda *_a, **_k: ([], []))
+    managers._installed.cache_clear()
+
+    assert [m.name for m in managers.installed()] == ["local"]
+    assert "metadata is stale" in managers.failures()[0]
+    # and nothing tracebacks on a row whose manager is now missing
+    assert managers.manager_of(_inst("running")).name == "local"
+
+    managers._installed.cache_clear()

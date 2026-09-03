@@ -4,6 +4,7 @@ import re
 import pytest
 
 from odoo_activity import mcp_server
+from odoo_activity.plugins import odooly as odooly_plugin
 
 
 def test_host_filter_fullmatch_not_prefix(monkeypatch):
@@ -111,9 +112,9 @@ def test_odooly_tools_refuse_without_the_launch_time_flag(monkeypatch):
         mcp_server.odooly_run_script("restore_app_icons", "acme18-int")
 
 
-def test_odooly_tools_delegate_to_probes_once_enabled(monkeypatch):
+def test_odooly_tools_delegate_to_the_plugin_once_enabled(monkeypatch):
     monkeypatch.setattr(mcp_server, "_enable_odooly", True)
-    monkeypatch.setattr(mcp_server.probes, "read_odooly_envs", lambda: [{"name": "acme18-int", "db": "acme18_int"}])
+    monkeypatch.setattr(odooly_plugin, "read_odooly_envs", lambda: [{"name": "acme18-int", "db": "acme18_int"}])
 
     assert mcp_server.list_odooly_envs() == ["acme18-int"]
     assert mcp_server.instance_odooly_env("openerp-acme18-integration", "acme18_int") == "acme18-int"
@@ -121,7 +122,7 @@ def test_odooly_tools_delegate_to_probes_once_enabled(monkeypatch):
 
     captured = {}
     monkeypatch.setattr(
-        mcp_server.probes,
+        odooly_plugin,
         "run_odooly_script",
         lambda script, env, *extra: captured.update(script=script, env=env, extra=extra) or "ok",
     )

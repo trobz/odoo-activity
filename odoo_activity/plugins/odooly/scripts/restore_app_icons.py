@@ -9,7 +9,7 @@ Ported from emoi's `restore_app_icons_-_from_api.py`, with two changes: the
 CLI is typer, to match the rest of this package, and only the menus whose
 icon is actually missing are rewritten (see restore_app_icons).
 
-    python -m odoo_activity.scripts.restore_app_icons --env acme18-int
+    python -m odoo_activity.plugins.odooly.scripts.restore_app_icons --env acme18-int
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import sys
 import odooly
 import typer
 
-from odoo_activity.scripts import redact, use_user_config
+from odoo_activity.plugins.odooly.scripts import redact, use_user_config
 
 app = typer.Typer(add_completion=False)
 

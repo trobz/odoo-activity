@@ -119,9 +119,24 @@ client port. An instance on a unix socket reports no port and can't be traced
 that way; if nothing can account for it, the runner just stays under HTTP
 Worker.
 
-### Odooly (experimental)
+### Odooly (a plugin)
 
-`oa --enable-odooly` reads `~/odooly.ini` at startup and matches each
+Odooly ships as a plugin behind an extra, so it is installed rather than
+switched on:
+
+```
+uv tool install "odoo-activity[odooly]"     # or [all] for every bundled plugin
+```
+
+Installed is active — `--enable-plugins=odooly` (only these) and
+`--disable-plugins=odooly` (everything but these) narrow that for one run;
+both take a comma list or repeat, and disabling wins. A name matching
+nothing installed is an error rather than a silent no-op.
+
+Without the extra, the plugin's `import odooly` fails, the loader skips it,
+and none of the actions below are offered at all.
+
+The plugin reads `~/odooly.ini` at startup and matches each
 database against it. Every database then carries an `ODOOLY` tag in the
 instance rows' status column — green where an environment reaches it, and
 the actions that need a login appear with it; red where none does, so a
@@ -156,12 +171,12 @@ once `mail_servers` is empty and Odoo falls back to `localhost:25` for
 outgoing mail. `-z` (scan, no data exchange) and the timeout keep it from
 hanging forever if the port turns out to be open.
 
-All three scripts live in `odoo_activity/scripts/` and run on their own too:
+All three scripts live in `odoo_activity/plugins/odooly/scripts/` and run on their own too:
 
 ```bash
-python -m odoo_activity.scripts.restore_app_icons --env acme18-int
-python -m odoo_activity.scripts.create_test_job --env acme18-int
-python -m odoo_activity.scripts.send_test_mail --env acme18-int --to me@example.com
+python -m odoo_activity.plugins.odooly.scripts.restore_app_icons --env acme18-int
+python -m odoo_activity.plugins.odooly.scripts.create_test_job --env acme18-int
+python -m odoo_activity.plugins.odooly.scripts.send_test_mail --env acme18-int --to me@example.com
 ```
 
 They always run on **this** machine, even when `oa` is watching a remote
@@ -212,7 +227,7 @@ pane.
 non-read-only exception: `list_odooly_envs`, `instance_odooly_env`, and
 `odooly_run_script` match a database against `~/odooly.ini` and run the
 packaged scripts (`create_test_job`, `restore_app_icons`, `send_test_mail`
-— the last needs `to`), the same actions the TUI's `oa --enable-odooly`
+— the last needs `to`), the same actions the TUI's odooly plugin
 offers a human through the Toolbox — now callable by the agent directly.
 
 `oa-mcp-multi` instead leaves the target per-call, capped by
@@ -288,7 +303,8 @@ odoo_activity/
 ├── panes/processes.py   # Processes tab: workers grouped by role
 ├── panes/stacks.py    # Stacks tab: parsed dumpstacks, busy-first
 ├── panes/mail.py       # Mail tab: one Rich table per section, into the log body
-├── scripts/           # odooly actions the Toolbox shells out to (network, not host)
+├── plugins/__init__.py  # the plugin contract and its entry-point loader
+├── plugins/odooly/    # the odooly plugin: env matching, its scripts, its contributions
 └── tui.py             # app shell: layout, list, timers, actions
 ```
 
@@ -368,7 +384,8 @@ in database mode).
   database (`database.is_neutralized` — every odoo.sh staging build)
   leads with its own red banner, since it's the single most
   common reason mail never leaves an Odoo database at all.
-  `--enable-odooly` grows a **Send test mail** button (see Odooly below).
+  With the odooly plugin installed, it grows a **Send test mail** button
+  (see Odooly below).
 
 [odoo-config-cli]: https://github.com/trobz/odoo-config/blob/main/CLI.md
 [docs-getting-started]: ./site-docs/docs/getting-started.md

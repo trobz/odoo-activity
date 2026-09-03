@@ -9,9 +9,11 @@ tool call to that one target (local if omitted) -- the counterpart to `oa
 
 `--enable-odooly` adds the one non-read-only exception: list_odooly_envs,
 instance_odooly_env and odooly_run_script, matching a database against
-~/odooly.ini and running the packaged scripts -- the same actions the TUI's
-`oa --enable-odooly` offers a human through the Toolbox, now offered to the
-agent directly.
+~/odooly.ini and running the odooly plugin's scripts -- the same actions
+that plugin offers a human through the TUI's Toolbox, now offered to the
+agent directly. It needs the extra installed (`odoo-activity[odooly]`); the
+flag stays because a server exposing them to an agent is a decision worth
+making explicitly, which installing a package is not.
 """
 
 import functools
@@ -20,13 +22,14 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Annotated, Literal
 
 import typer
 from mcp.server.fastmcp import FastMCP
 from typing_extensions import TypedDict
 
-from odoo_activity import probes
+from odoo_activity import managers, probes
 from odoo_activity.host import Host
 from odoo_activity.probes import Instance, ProcRow, Worker
 
@@ -69,10 +72,24 @@ def _check_host(alias: str | None) -> None:
         raise ValueError(msg)
 
 
-def _check_odooly_enabled() -> None:
+def _odooly() -> ModuleType:
+    """The odooly plugin module, or a clear reason why it can't be used.
+
+    Imported here rather than at module scope because there are two distinct
+    ways to be unavailable and an agent should be told which: the extra is
+    not installed, or the server was started without --enable-odooly.
+    """
+    try:
+        from odoo_activity.plugins import odooly
+    except ImportError as exc:
+        msg = "odooly support unavailable -- install the extra: pip install 'odoo-activity[odooly]'"
+        raise ValueError(msg) from exc
+
     if not _enable_odooly:
         msg = "odooly support disabled -- restart the server with --enable-odooly"
         raise ValueError(msg)
+
+    return odooly
 
 
 def _resolve_host(host: str | None, ssh_port: int | None) -> Host:
@@ -162,13 +179,13 @@ def _instances(host: Host) -> list[Instance]:
     now = time.monotonic()
 
     if cached is None or now - cached[0] >= _DISCOVERY_TTL:
-        _discovered[key] = (now, probes.list_instances(host))
+        _discovered[key] = (now, managers.list_instances(host))
 
     return _discovered[key][1]
 
 
 def _with_status(inst: Instance, host: Host) -> Instance:
-    return {**inst, "status": probes.instance_status(inst, host)}
+    return {**inst, "status": managers.instance_status(inst, host)}
 
 
 def _find(name: str, host: Host) -> Instance | None:
@@ -533,8 +550,7 @@ def list_odooly_envs() -> list[str]:
     `odooly_run_script` accepts, and the set `instance_odooly_env` matches
     against. Requires --enable-odooly.
     """
-    _check_odooly_enabled()
-    return [env["name"] for env in probes.read_odooly_envs()]
+    return [env["name"] for env in _odooly().read_odooly_envs()]
 
 
 @mcp.tool()
@@ -550,8 +566,9 @@ def instance_odooly_env(name: str, db: str) -> str | None:
         name: instance name as `list_instances` reports it.
         db: database name, as `instance_databases` reports it.
     """
-    _check_odooly_enabled()
-    return probes.match_odooly_env(name, db, probes.read_odooly_envs())
+    odooly = _odooly()
+
+    return odooly.match_odooly_env(name, db, odooly.read_odooly_envs())
 
 
 @mcp.tool()
@@ -577,14 +594,14 @@ def odooly_run_script(script: OdoolyScript, env: str, to: str | None = None) -> 
         to: recipient address -- required for send_test_mail, ignored
             otherwise.
     """
-    _check_odooly_enabled()
+    odooly = _odooly()
     if script == "send_test_mail":
         if not to:
             msg = "send_test_mail needs `to` (recipient address)"
             raise ValueError(msg)
-        return probes.run_odooly_script(script, env, "--to", to)
+        return odooly.run_odooly_script(script, env, "--to", to)
 
-    return probes.run_odooly_script(script, env)
+    return odooly.run_odooly_script(script, env)
 
 
 @app.command()
@@ -637,6 +654,7 @@ def main_multi(
     bind_host: str = typer.Option("127.0.0.1", "--bind-host", help="streamable-http only"),
     bind_port: int = typer.Option(8000, "--bind-port", help="streamable-http only"),
     host_filter: str = typer.Option(
+        "",
         "--host-filter",
         help="regex (odoo dbfilter-style); only ssh targets it fullmatches are reachable. Unset: no restriction.",
     ),

@@ -197,9 +197,16 @@ that matters once `mail_servers` is empty and Odoo falls back to
 
 ![Mail tab](images/tabs/database-mail.svg)
 
-## Odooly (experimental)
+## Odooly
 
-`oa --enable-odooly` reads `~/odooly.ini` at startup and matches each
+Odooly ships as a plugin behind an extra — install it and it is active (see
+[Plugins](plugins.md)):
+
+```
+uv tool install "odoo-activity[odooly]"
+```
+
+It then reads `~/odooly.ini` at startup and matches each
 database against it. Every database then carries an `ODOOLY` tag in the
 instance rows' status column — green where an environment reaches it, and
 the actions that need a login appear with it; red where none does, so a
@@ -231,13 +238,13 @@ one real email (calling `.send()` directly, so it goes out synchronously
 rather than waiting on the mail queue cron) from the connecting user's own
 company address.
 
-All three scripts live in `odoo_activity/scripts/` and run on their own
+All three scripts live in `odoo_activity/plugins/odooly/scripts/` and run on their own
 too:
 
 ```bash
-python -m odoo_activity.scripts.restore_app_icons --env acme18-int
-python -m odoo_activity.scripts.create_test_job --env acme18-int
-python -m odoo_activity.scripts.send_test_mail --env acme18-int --to me@example.com
+python -m odoo_activity.plugins.odooly.scripts.restore_app_icons --env acme18-int
+python -m odoo_activity.plugins.odooly.scripts.create_test_job --env acme18-int
+python -m odoo_activity.plugins.odooly.scripts.send_test_mail --env acme18-int --to me@example.com
 ```
 
 They always run on **this** machine, even when `oa` is watching a remote
