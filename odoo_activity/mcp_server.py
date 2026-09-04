@@ -642,13 +642,20 @@ def main(
     global _pinned_target, _include_sensitive_information, _enabled_plugins
     _pinned_target = Host(alias=host, port=port)
     _include_sensitive_information = include_sensitive_information
-    installed, _ = plugins.load()
-    try:
-        active = plugins.select(installed, plugins.split_names(enable_plugins), [])
-    except plugins.UnknownPlugin as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(2) from exc
-    _enabled_plugins = {plugin.name for plugin in active}
+    names = plugins.split_names(enable_plugins)
+    if names:
+        installed, _ = plugins.load()
+        try:
+            active = plugins.select(installed, names, [])
+        except plugins.UnknownPlugin as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(2) from exc
+        _enabled_plugins = {plugin.name for plugin in active}
+    else:
+        # select() treats an empty `enable` as "everything installed" -- the
+        # right default for oa, but oa-mcp is opt-in only: omitting the flag
+        # must expose none of these tools, not all of them.
+        _enabled_plugins = set()
 
     if transport == "streamable-http":
         mcp.settings.host = bind_host
@@ -701,13 +708,20 @@ def main_multi(
     _host_filter = re.compile(host_filter) if host_filter else None
     _host_file = host_file
     _include_sensitive_information = include_sensitive_information
-    installed, _ = plugins.load()
-    try:
-        active = plugins.select(installed, plugins.split_names(enable_plugins), [])
-    except plugins.UnknownPlugin as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(2) from exc
-    _enabled_plugins = {plugin.name for plugin in active}
+    names = plugins.split_names(enable_plugins)
+    if names:
+        installed, _ = plugins.load()
+        try:
+            active = plugins.select(installed, names, [])
+        except plugins.UnknownPlugin as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(2) from exc
+        _enabled_plugins = {plugin.name for plugin in active}
+    else:
+        # select() treats an empty `enable` as "everything installed" -- the
+        # right default for oa, but oa-mcp is opt-in only: omitting the flag
+        # must expose none of these tools, not all of them.
+        _enabled_plugins = set()
 
     mcp.run(transport=transport)
 
