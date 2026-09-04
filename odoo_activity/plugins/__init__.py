@@ -56,6 +56,12 @@ class Plugin:
 
     name = ""
 
+    # Whether this plugin runs when --enable-plugins is omitted entirely.
+    # False by default: a plugin installed later (third-party or ours)
+    # doesn't suddenly start acting on every instance just by being present
+    # -- it has to earn a place in the default set, the way odooly does.
+    default = False
+
     def marker(self, target: DbTarget) -> str:
         """A short tag for this database's row in the instances list, or ""
         for no tag at all."""
@@ -119,10 +125,11 @@ def load(group: str = GROUP) -> tuple[list, list[str]]:
 def select(plugins: list[Plugin], enable: list[str], disable: list[str]) -> list[Plugin]:
     """`plugins` filtered by the two flags.
 
-    `enable` is exclusive: with everything active by default, "also run
-    odooly" would be a no-op, so naming any plugin means only those.
-    `disable` subtracts from whatever that leaves, and wins on a conflict,
-    which is the rule that needs no thinking about.
+    `enable` is exclusive: with every default-on plugin active by default,
+    "also run odooly" would be a no-op, so naming any plugin means only
+    those -- default-on or not. `disable` subtracts from whatever that
+    leaves, and wins on a conflict, which is the rule that needs no
+    thinking about.
     """
     installed = {plugin.name for plugin in plugins}
     unknown = sorted((set(enable) | set(disable)) - installed)
@@ -131,6 +138,6 @@ def select(plugins: list[Plugin], enable: list[str], disable: list[str]) -> list
         msg = f"no such plugin: {', '.join(unknown)} (installed: {known})"
         raise UnknownPlugin(msg)
 
-    wanted = set(enable) if enable else installed
+    wanted = set(enable) if enable else {plugin.name for plugin in plugins if plugin.default}
 
     return [plugin for plugin in plugins if plugin.name in wanted - set(disable)]
