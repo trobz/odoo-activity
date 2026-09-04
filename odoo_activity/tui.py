@@ -553,6 +553,11 @@ class OdooActivity(App):
             self.refresh_instances()
             return
 
+        if not self.is_running:
+            # this tick's worker got scheduled before quit/teardown started
+            # and only ran after -- the widgets below are already gone
+            return
+
         self._instances = fresh
         for item in self.query_one("#instances", InstanceList).children:
             inst = fresh.get(item.name or "")
