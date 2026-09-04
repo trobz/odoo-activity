@@ -19,8 +19,9 @@ uv tool install "odoo-activity[odooly]"     # one
 uv tool install "odoo-activity[all]"        # every bundled plugin
 ```
 
-Installed is active: installing was the deliberate act, so there is no
-second opt-in to remember. Two flags narrow it for a single run:
+Installed is active for a plugin that opts into running by default —
+odooly does, so installing it is enough; a plugin added later stays off
+until named explicitly. Two flags narrow or extend that for a single run:
 
 ```
 oa --enable-plugins=odooly        # only these

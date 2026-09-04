@@ -40,8 +40,9 @@ def main(
         list[str] | None,
         typer.Option(
             "--enable-plugins",
-            help="Run only these plugins, by name (comma-separated, or repeat the flag). "
-            "Every installed plugin runs when this is omitted.",
+            help="Run only these plugins, by name (comma-separated, or repeat the flag), overriding "
+            "which ones run by default. Only default-on plugins (currently: odooly) run when this "
+            "is omitted -- a plugin installed later stays off until named here.",
         ),
     ] = None,
     disable_plugins: Annotated[

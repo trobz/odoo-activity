@@ -193,6 +193,7 @@ class OdoolyPlugin(Plugin):
     Toolbox, and the two tab buttons that need a login."""
 
     name = "odooly"
+    default = True  # bundled, and the only plugin oa has ever run without asking
 
     def __init__(self) -> None:
         # read once, at startup: the file is the user's own and small, and a
