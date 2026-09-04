@@ -151,6 +151,7 @@ class HostStats(TypedDict):
 class InstanceDatabases(TypedDict):
     databases: list[str]
     db_port: str | None
+    neutralized: dict[str, dict]
 
 
 class InstanceTop(TypedDict):
@@ -278,6 +279,31 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
     """The instance's databases and the postgres port they live on, or None
     if the instance isn't found.
 
+    `neutralized` maps each database to a report: the raw signals it was
+    read from, plus the `state` those signals add up to.
+
+    - `neutralized` — claimed and confirmed: nothing on it can reach the
+      outside (a staging/test copy, safe to act on).
+    - `partial` — the signals disagree: a flag written by hand, a
+      neutralization that died halfway, or a cron switched back on
+      afterwards. Treat as live until a human checks.
+    - `not_neutralized` — a live database, where every action is production.
+
+    The signals behind it: `flag` is `database.is_neutralized` as the db
+    claims it, `version` is base's own, `stub` counts Odoo's dead-end relay
+    (only written from Odoo 16, so it is not required on older versions),
+    and `live_relays`/`live_crons` count what can still fire — which of the
+    two is non-zero is what makes a `partial` actionable.
+
+    Only `base` tables are read. The per-module credential surfaces a
+    neutralized database must also not have live (payment providers, IAP
+    credits, bank feeds, …) are Odoo domain knowledge and live in odoo-db,
+    where one place tracks them across versions — `odoo-db
+    check-sensitive-information` is the tool for that question.
+
+    A database missing from the map is one psql could not read (postgres
+    down, or not an odoo database) — unknown, never a guess either way.
+
     Args:
         name: instance name as `list_instances` reports it.
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
@@ -289,7 +315,10 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
         return None
 
     databases, db_port = probes.databases_of(inst, target)
-    return {"databases": databases, "db_port": db_port}
+    # pg_target_of, not db_port: a docker instance's postgres also needs its
+    # container address and credentials to be reachable at all.
+    neutralized = probes.neutralization_of(databases, probes.pg_target_of(inst, target), target) if databases else {}
+    return {"databases": databases, "db_port": db_port, "neutralized": neutralized}
 
 
 @mcp.tool()

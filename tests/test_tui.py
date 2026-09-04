@@ -2059,3 +2059,40 @@ def test_an_empty_docker_db_list_is_retried_by_the_poll(monkeypatch):
             assert keys == ["docker:acme", "docker:acme::db::devel", "docker:idle"]
 
     asyncio.run(go())
+
+
+def test_db_rows_carry_their_neutralization_status(monkeypatch):
+    """The whole point of the tag: a live database is called out in red, a
+    confirmed-neutralized one in green, one whose signals disagree (flag set
+    but a cron still live) in yellow, and a db postgres could not answer for
+    carries no tag at all rather than a guess."""
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda *_: (["staging", "reheated", "prod", "unknown"], None))
+    monkeypatch.setattr(tui, "pg_target_of", lambda *_: probes.PgTarget())
+    monkeypatch.setattr(
+        tui,
+        "neutralization_of",
+        lambda *_: {
+            "staging": {"state": probes.NEUTRALIZED},
+            "reheated": {"state": probes.PARTIAL, "extras": {"iap_account": 1}},
+            "prod": {"state": probes.NOT_NEUTRALIZED},
+        },
+    )
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(120, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            labels = {
+                item.name: str(next(iter(item.query(tui.Label))).content)
+                for item in pilot.app.query_one("#instances", tui.ListView).children
+            }
+            assert "[green]NEUTRALIZED[/]" in str(labels["systemd:b.service::db::staging"])
+            assert "[yellow]PARTIALLY NEUTRALIZED[/]" in str(labels["systemd:b.service::db::reheated"])
+            assert "[red]NOT NEUTRALIZED[/]" in str(labels["systemd:b.service::db::prod"])
+            assert "NEUTRALIZED" not in str(labels["systemd:b.service::db::unknown"])
+
+    asyncio.run(go())
