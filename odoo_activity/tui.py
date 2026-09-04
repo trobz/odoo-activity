@@ -548,14 +548,17 @@ class OdooActivity(App):
     @work(exclusive=True, group="instances")
     async def _poll_instances(self) -> None:
         fresh_list = await to_thread(list_instances, self.host)
-        fresh = {f"{i['manager']}:{i['name']}": i for i in fresh_list}
-        if set(fresh) != set(self._instances):
-            self.refresh_instances()
-            return
 
         if not self.is_running:
             # this tick's worker got scheduled before quit/teardown started
-            # and only ran after -- the widgets below are already gone
+            # and only ran after -- the widgets below are already gone, and
+            # a membership change must not schedule the equally unguarded
+            # _rebuild_instances() into that same torn-down tree
+            return
+
+        fresh = {f"{i['manager']}:{i['name']}": i for i in fresh_list}
+        if set(fresh) != set(self._instances):
+            self.refresh_instances()
             return
 
         self._instances = fresh
