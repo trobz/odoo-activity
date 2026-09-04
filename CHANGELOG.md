@@ -2,6 +2,31 @@
 
 <!-- version list -->
 
+## v0.23.0 (2026-09-04)
+
+### Bug Fixes
+
+- **mcp**: Keep --enable-plugins opt-in when omitted
+  ([`c19a55b`](https://github.com/trobz/odoo-activity/commit/c19a55b2055ff0e7402f19ee356d4edcf6fb6651))
+
+- **mcp**: Validate --enable-plugins names like oa does
+  ([`b9ad03c`](https://github.com/trobz/odoo-activity/commit/b9ad03c48b72fff685ff2afbaad72b1bf59a7188))
+
+- **tui**: Guard _poll_instances against a mid-shutdown tick
+  ([`7a24ac3`](https://github.com/trobz/odoo-activity/commit/7a24ac39072a260a34f9e8a93756ea1360d5c487))
+
+- **tui**: Move the shutdown guard before the rebuild dispatch
+  ([`a785e06`](https://github.com/trobz/odoo-activity/commit/a785e0654dec7ffda75af5af85ac667d8837fa76))
+
+### Features
+
+- **mcp**: Align oa-mcp/oa-mcp-multi with oa's --enable-plugins
+  ([`ae60499`](https://github.com/trobz/odoo-activity/commit/ae604990f7f9f7a8c5c0f0ea336b7a38a8fbadd4))
+
+- **plugins**: Make default-on a per-plugin opt-in, not "everything installed"
+  ([`9ba0031`](https://github.com/trobz/odoo-activity/commit/9ba003152e8bc292603611a20c52af1a07bea321))
+
+
 ## v0.22.0 (2026-09-03)
 
 ### Bug Fixes
