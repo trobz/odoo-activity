@@ -1,6 +1,8 @@
 import asyncio
 import json
 import signal
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -2002,6 +2004,384 @@ def test_the_logs_tab_streams_docker_logs_for_a_container_instance(monkeypatch):
             body = pane.query_one("#acbody", detail_mod.RichLog)
             assert [line.text for line in body.lines if line.text] == ["INFO devel odoo: ready"]
             assert followed == ["acme-odoo-1"]
+
+    asyncio.run(go())
+
+
+_LOG_ANALYSIS_ROWS = [
+    {"type": "AccessError", "error": "Access Denied", "count": 3, "first": "2026-01-01", "last": "2026-01-02"},
+]
+
+
+def _logs_analysis_setup(monkeypatch, rows: list[dict] | None = None) -> list[list[str]]:
+    """One instance, one resolvable log file, `odoo-logs` stubbed to `rows`
+    (or `_LOG_ANALYSIS_ROWS`). Returns the argv `start_odoo_logs` was called
+    with, one entry per call."""
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(detail_mod, "instance_log_files", lambda *_a, **_k: [Path("/var/log/server.log")])
+
+    calls: list[list[str]] = []
+    payload = _LOG_ANALYSIS_ROWS if rows is None else rows
+
+    def fake_start(command, files, host):
+        calls.append([command, *(str(f) for f in files)])
+        return _FakeOdooDbProc(payload)
+
+    monkeypatch.setattr(detail_mod, "start_odoo_logs", fake_start)
+    return calls
+
+
+def test_logs_analysis_lists_commands_before_running_anything(monkeypatch):
+    """Nothing runs until a row is picked -- the tab opens on the same
+    list-then-select shape Toolbox already uses."""
+    calls = _logs_analysis_setup(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            listed = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+            assert listed == list(detail_mod.LOG_ANALYSIS_COMMANDS)
+            assert calls == []
+
+            # each row also carries the command's own odoo-logs --help line,
+            # not just its bare name (see LOG_ANALYSIS_HELP)
+            assert [str(col.label) for col in table.columns.values()] == ["ANALYSIS", "DESCRIPTION"]
+            described = [str(table.get_row_at(i)[1]) for i in range(table.row_count)]
+            assert described == [detail_mod.LOG_ANALYSIS_HELP[c] for c in detail_mod.LOG_ANALYSIS_COMMANDS]
+
+    asyncio.run(go())
+
+
+def test_logs_analysis_runs_the_picked_command_as_a_limited_subprocess(monkeypatch):
+    calls = _logs_analysis_setup(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            row = detail_mod.LOG_ANALYSIS_COMMANDS.index("errors")
+            table.focus()
+            table.move_cursor(row=row)
+            table.action_select_cursor()
+            await _settle(pilot)
+
+            assert calls == [["errors", "/var/log/server.log"]]
+            assert pane._log_analysis_command == "errors"
+            table = pane.query_one("#actable", DataTable)
+            assert [str(col.label) for col in table.columns.values()] == ["TYPE", "ERROR", "COUNT", "FIRST", "LAST"]
+            assert str(table.get_row_at(0)[0]) == "AccessError"
+
+    asyncio.run(go())
+
+
+def test_logs_analysis_filters_the_result_rows(monkeypatch):
+    rows = [
+        {"type": "AccessError", "error": "Access Denied", "count": 3, "first": "2026-01-01", "last": "2026-01-02"},
+        {"type": "ValidationError", "error": "Bad value", "count": 1, "first": "2026-01-03", "last": "2026-01-03"},
+    ]
+    _logs_analysis_setup(monkeypatch, rows)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            table.action_select_cursor()
+            await _settle(pilot)
+            assert table.row_count == 2
+
+            pane.open_search()
+            await pilot.pause()
+            await pilot.press(*"Access")
+            await pilot.press("enter")
+            await pilot.pause()
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            assert table.row_count == 1
+            assert next(iter(table.rows)).value == "0"  # index into the unfiltered list
+
+    asyncio.run(go())
+
+
+def test_logs_analysis_enter_opens_a_result_rows_raw_json(monkeypatch):
+    _logs_analysis_setup(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            table.action_select_cursor()  # run "errors"
+            await _settle(pilot)
+
+            shown = []
+            monkeypatch.setattr(pane, "_show_raw", lambda row: shown.append(row))
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            table.action_select_cursor()  # open the result row, not run another command
+            await pilot.pause()
+
+            assert shown == [_LOG_ANALYSIS_ROWS[0]]
+
+    asyncio.run(go())
+
+
+def test_traceback_key_fetches_and_shows_the_full_exception_text(monkeypatch):
+    """`T` on an errors row runs the second, scoped odoo-logs call (see
+    probes.error_traceback) and shows its raw text, not the row's json."""
+    _logs_analysis_setup(monkeypatch)
+    monkeypatch.setattr(detail_mod, "error_traceback", lambda *_a, **_k: "KeyError: 'socket'\nTraceback...")
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            table.action_select_cursor()  # run "errors"
+            await _settle(pilot)
+
+            shown = []
+            monkeypatch.setattr(pane, "_show_raw_text", lambda text, lexer: shown.append((text, lexer)))
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("T")
+            await _settle(pilot)
+
+            assert shown == [("KeyError: 'socket'\nTraceback...", "python")]
+
+    asyncio.run(go())
+
+
+def test_traceback_key_twice_in_a_row_still_resolves_the_same_row(monkeypatch):
+    """Regression guard: pressing `T` straight from the table (never opening
+    the row's raw json first) used to leave `_raw_row` stale/unset, so a
+    second `T` while already viewing the traceback -- e.g. to check again --
+    silently did nothing instead of refetching the same row."""
+    _logs_analysis_setup(monkeypatch)
+    calls = []
+
+    def fake_error_traceback(files, error_type, error, host):
+        calls.append((error_type, error))
+        return f"traceback #{len(calls)}"
+
+    monkeypatch.setattr(detail_mod, "error_traceback", fake_error_traceback)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            table.action_select_cursor()  # run "errors"
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("T")  # straight from the table, no raw json opened first
+            await _settle(pilot)
+
+            assert pane._showing_raw is True
+            assert pane._raw_row == _LOG_ANALYSIS_ROWS[0]
+            assert pane.can_show_traceback() is True  # not silently disabled
+
+            await pilot.press("T")  # a second time, while already viewing the traceback
+            await _settle(pilot)
+
+            assert calls == [("AccessError", "Access Denied"), ("AccessError", "Access Denied")]
+
+    asyncio.run(go())
+
+
+def test_traceback_key_disabled_outside_errors(monkeypatch):
+    """Every other analysis's rows have no exception type/message to look
+    a traceback up by -- `T` must not fire for them."""
+    rows = [{"cron": "Send emails", "t_total": 1.2, "count": 3}]
+    _logs_analysis_setup(monkeypatch, rows)
+
+    called = []
+    monkeypatch.setattr(detail_mod, "error_traceback", lambda *_a, **_k: called.append(1) or "")
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=detail_mod.LOG_ANALYSIS_COMMANDS.index("crons"))
+            table.action_select_cursor()  # run "crons", not "errors"
+            await _settle(pilot)
+
+            assert pane.can_show_traceback() is False
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("T")
+            await _settle(pilot)
+
+            assert called == []
+
+    asyncio.run(go())
+
+
+def test_traceback_ignores_a_stale_fetch_from_a_different_row(monkeypatch):
+    """`T` on row A, then on row B before A's fetch returns -- A's (now
+    stale) result must not land after B's, overwriting what the user is
+    actually looking at. Uses real thread events (error_traceback runs via
+    to_thread, a real OS thread) to force A to finish only after B already
+    has, instead of hoping for a lucky scheduling order."""
+    rows = [
+        {"type": "KeyError", "error": "'socket'", "count": 1, "first": "x", "last": "y"},
+        {"type": "ValueError", "error": "boom", "count": 1, "first": "x", "last": "y"},
+    ]
+    _logs_analysis_setup(monkeypatch, rows)
+
+    b_started = threading.Event()
+    release_a = threading.Event()
+
+    def fake_error_traceback(files, error_type, error, host):
+        if error_type == "KeyError":  # row A: block until B has already resolved
+            assert b_started.wait(timeout=2)
+            assert release_a.wait(timeout=2)
+            return "A's traceback (stale)"
+        b_started.set()  # row B: resolves immediately
+        return "B's traceback"
+
+    monkeypatch.setattr(detail_mod, "error_traceback", fake_error_traceback)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            table.action_select_cursor()  # run "errors"
+            await _settle(pilot)
+
+            shown = []
+            monkeypatch.setattr(pane, "_show_raw_text", lambda text, lexer: shown.append(text))
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # row A: KeyError -- blocks in fake_error_traceback
+            await pilot.press("T")
+            await pilot.pause()
+
+            table.move_cursor(row=1)  # row B: ValueError -- resolves immediately
+            await pilot.press("T")
+
+            # poll rather than _settle(): A's worker is still deliberately
+            # blocked, and wait_for_complete() would hang waiting for it too
+            for _ in range(50):
+                await pilot.pause()
+                if shown:
+                    break
+            assert shown == ["B's traceback"]
+
+            release_a.set()
+            await _settle(pilot)  # safe now: A is unblocked and can finish
+
+            assert shown == ["B's traceback"]  # A's late result must not have landed
+
+    asyncio.run(go())
+
+
+def test_logs_analysis_escape_backs_out_to_the_list(monkeypatch):
+    _logs_analysis_setup(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            table.action_select_cursor()
+            await _settle(pilot)
+            assert pane._log_analysis_command is not None
+
+            await pilot.press("escape")
+            await pilot.pause()
+
+            assert pane._log_analysis_command is None
+            table = pane.query_one("#actable", DataTable)
+            listed = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+            assert listed == list(detail_mod.LOG_ANALYSIS_COMMANDS)
+
+    asyncio.run(go())
+
+
+def test_logs_analysis_refresh_reruns_the_picked_command(monkeypatch):
+    """`R` stays on the analysis picked, the same way it stays on a drilled-
+    into Jobs group instead of backing out to the top level."""
+    calls = _logs_analysis_setup(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Logs Analysis")
+            await _settle(pilot)
+
+            table = pane.query_one("#actable", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            table.action_select_cursor()
+            await _settle(pilot)
+            assert len(calls) == 1
+
+            await pilot.press("R")
+            await _settle(pilot)
+
+            assert len(calls) == 2
+            assert calls[0] == calls[1]
+            assert pane._log_analysis_command == calls[1][0]
 
     asyncio.run(go())
 

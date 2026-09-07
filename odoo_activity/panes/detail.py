@@ -34,6 +34,8 @@ from odoo_activity.panes.stacks import filter_workers, render_stacks
 from odoo_activity.probes import (
     ALL_ROW_FLAGS,
     CLK_TCK,
+    LOG_ANALYSIS_COMMANDS,
+    LOG_ANALYSIS_HELP,
     Instance,
     PgTarget,
     ProcRow,
@@ -41,6 +43,8 @@ from odoo_activity.probes import (
     _read_new_bytes,
     _untty,
     configfile_of,
+    error_traceback,
+    instance_log_files,
     instance_procs,
     instance_version,
     instance_workers,
@@ -64,6 +68,7 @@ from odoo_activity.probes import (
     shell_command,
     signal_process,
     start_odoo_db,
+    start_odoo_logs,
     stringify,
     table_columns,
     try_local_clipboard,
@@ -277,7 +282,7 @@ class ActivityPane(Vertical):
     CONFIG_MODES: ClassVar = ["compact", "explain", "expand", "clean"]
 
     TABS: ClassVar = {
-        "instance": ["Top", "Processes", "Stacks", "Logs", "Config", "Toolbox"],
+        "instance": ["Top", "Processes", "Stacks", "Logs", "Logs Analysis", "Config", "Toolbox"],
         "database": [
             "Queries",
             "Users",
@@ -347,10 +352,16 @@ class ActivityPane(Vertical):
         self._inflight: dict[str, object] = {}  # key -> ident of the run in progress
         self._pending: dict[str, tuple[object, Callable[[], Awaitable[None]]]] = {}
         self._dbtab = _DbTab()
+        self._log_analysis_command: str | None = None  # None: showing the list; else the row picked
+        self._log_analysis_ident: tuple[str | None, str] | None = None  # (instance key, command) in flight
+        self._log_analysis_proc: subprocess.Popen[str] | None = None  # its still-running odoo-logs, if any
+        self._log_analysis_rows: list[dict] = []
         self._jobs_group: tuple[str, str] | None = None  # (function, state) the Jobs tab drilled into
         self._actions_shown: list[str] = []  # action ids currently mounted in #acactions
         self._db_tools: list[Tool] = []  # Toolbox rows currently listed, index-addressed by the table
         self._showing_raw = False  # viewing one row's raw json in #acbody
+        self._raw_row: dict | None = None  # the row _show_raw last displayed (see show_traceback)
+        self._traceback_ident: object | None = None  # (log-analysis ident, row id) most recently requested
         self._stacks_cache: dict[str, tuple[list[Worker], Path]] = {}  # instance key -> its last dump
         self._tab_plugins: dict[str, Plugin] = {  # tab name -> the plugin that fetches it (see fetch_tab)
             tab: plugin for plugin in self.app.plugins if (tab := plugin.db_tab()) is not None
@@ -372,6 +383,7 @@ class ActivityPane(Vertical):
         # an ssh streaming child isn't reaped on drop -- kill it explicitly
         # so quitting the app doesn't leave a `tail -f` running on the remote.
         self._stop_log_stream()
+        self._abandon_log_analysis()
 
     def on_resize(self, event: events.Resize) -> None:
         # COMMAND's width is derived from table.size, which is still 0 the
@@ -435,6 +447,9 @@ class ActivityPane(Vertical):
     def is_logs_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Logs"
 
+    def is_log_analysis_active(self) -> bool:
+        return self._mode == "instance" and self._active_tab() == "Logs Analysis"
+
     def is_config_active(self) -> bool:
         return self._mode == "instance" and self._active_tab() == "Config"
 
@@ -461,10 +476,14 @@ class ActivityPane(Vertical):
     def has_search(self) -> bool:
         """Logs and Config render plain text into #acbody with a substring
         filter (see _render_log); every database table filters its rows the
-        same way (see _visible_db_rows), as do Top (_visible_proc_rows) and
-        Stacks (filter_workers)."""
+        same way (see _visible_db_rows), as do Top (_visible_proc_rows),
+        Stacks (filter_workers) and Logs Analysis, once it's showing a
+        result rather than the command list (_visible_log_analysis_rows)."""
         if self._mode == "database":
             return True
+
+        if self.is_log_analysis_active():
+            return self._log_analysis_command is not None
 
         return self.is_logs_active() or self.is_config_active() or self.is_top_active() or self.is_stacks_active()
 
@@ -472,7 +491,7 @@ class ActivityPane(Vertical):
         """The active tab's search query, for the border-title hint (_title)
         -- Logs/Config excluded, since that hint already shows their log/config
         path there instead."""
-        if self._mode == "database" or self.is_top_active() or self.is_stacks_active():
+        if self._mode == "database" or self.is_top_active() or self.is_stacks_active() or self.is_log_analysis_active():
             return self._filters.get(self._active_tab())
         return None
 
@@ -522,6 +541,73 @@ class ActivityPane(Vertical):
         idx = int(key) if key is not None else -1
         return self._proc_rows[idx] if 0 <= idx < len(self._proc_rows) else None
 
+    def _log_analysis_error_row(self) -> dict | None:
+        """The `errors` row currently in view, if any -- the one behind an
+        open raw json, or the one under the table cursor otherwise (same
+        row-key-not-position lookup as selected_process, for the same
+        under-a-filter reason)."""
+        if not self.is_log_analysis_active() or self._log_analysis_command != "errors":
+            return None
+
+        if self._showing_raw:
+            return self._raw_row
+
+        if not self._log_analysis_rows:
+            return None
+
+        table = self.query_one("#actable", DataTable)
+        if not table.row_count:
+            return None
+
+        key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        idx = int(key) if key is not None else -1
+        return self._log_analysis_rows[idx] if 0 <= idx < len(self._log_analysis_rows) else None
+
+    def can_show_traceback(self) -> bool:
+        """Gates the `T` binding (see tui.py's check_action)."""
+        return self._log_analysis_error_row() is not None
+
+    def show_traceback(self) -> None:
+        row = self._log_analysis_error_row()
+        if row is None or self._instance is None:
+            return
+
+        # keyed on the log-analysis ident too, not just the row: that's what
+        # already invalidates on a tab switch/different command/refresh, so
+        # a late result from either kind of "moved on since" is caught
+        ident = (self._log_analysis_ident, id(row))
+        self._traceback_ident = ident
+        self.run_worker(self._do_show_traceback(ident, self._instance, row))
+
+    async def _do_show_traceback(self, ident: object, inst: Instance, row: dict) -> None:
+        """Fetch and show the full traceback behind one `errors` row (see
+        probes.error_traceback for why this needs a second odoo-logs run).
+
+        `ident` guards against two `T` presses on different rows racing:
+        without it, whichever odoo-logs call happens to finish last would
+        win, even if it's the stale one."""
+        at = host_for(inst, self.app.host)
+        files = await to_thread(instance_log_files, inst, at)
+        if ident != self._traceback_ident:
+            return
+
+        if not files:
+            self.app.notify("no log file found", severity="warning", timeout=3)
+            return
+
+        error_type = str(row.get("type", ""))
+        error = str(row.get("error", ""))
+        text = await to_thread(error_traceback, files, error_type, error, at)
+        if ident != self._traceback_ident:
+            return
+
+        if not text:
+            self.app.notify("no matching traceback found", severity="warning", timeout=3)
+            return
+
+        self._raw_row = row  # so a second `T` while viewing this still resolves to it
+        self._show_raw_text(text, "python")
+
     def open_search(self) -> None:
         if not self.has_search():
             return
@@ -550,6 +636,12 @@ class ActivityPane(Vertical):
             self._jobs_group = None  # back out of one group, to all of them
             self._reload_jobs()
             event.stop()
+            return
+
+        if event.key == "escape" and self.is_log_analysis_active() and self._log_analysis_command is not None:
+            self._abandon_log_analysis()  # back out of the running/finished analysis, to the list
+            self._render_log_analysis()
+            event.stop()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.row_key.value is None:
@@ -567,6 +659,10 @@ class ActivityPane(Vertical):
 
         if self.is_top_active():
             self.run_worker(self._jump_from_process_row(idx))
+            return
+
+        if self.is_log_analysis_active():
+            self._select_log_analysis_row(idx)
             return
 
         # only db-mode tabs drill into raw json
@@ -753,11 +849,14 @@ class ActivityPane(Vertical):
         table.move_cursor(row=position)
 
     def _show_raw(self, row: dict) -> None:
+        self._raw_row = row  # so `T` (see show_traceback) knows which row it's for
+        self._show_raw_text(json.dumps(row, indent=2, default=str), "json")
+
+    def _show_raw_text(self, text: str, lexer: str) -> None:
         self._showing_raw = True
         self._use("raw")
-        text = json.dumps(row, indent=2, default=str)
         theme = "ansi_dark" if self.app.current_theme.dark else "ansi_light"
-        syntax = Syntax(text, "json", theme=theme, background_color="default", word_wrap=True)
+        syntax = Syntax(text, lexer, theme=theme, background_color="default", word_wrap=True)
         self.query_one("#acraw-body", Static).update(syntax)
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -793,6 +892,8 @@ class ActivityPane(Vertical):
             self._show_process_table()
         elif self.is_stacks_active():
             self._populate_stacks(self._instance)
+        elif self.is_log_analysis_active():
+            self._show_log_analysis_table()
         else:
             self._render_log()
 
@@ -917,8 +1018,9 @@ class ActivityPane(Vertical):
         to update Top on a remote host now that `tick` skips it.
 
         A refresh stays where the user is: on Jobs that means the group they
-        drilled into, which a plain `_render_active` would back out of."""
-        self._render_active(keep_group=self.is_jobs_active())
+        drilled into, on Logs Analysis the analysis they picked -- either of
+        which a plain `_render_active` would back out of to the top level."""
+        self._render_active(keep_group=self.is_jobs_active() or self.is_log_analysis_active())
 
     def _stop_log_stream(self) -> None:
         if self._log_proc is not None:
@@ -989,6 +1091,12 @@ class ActivityPane(Vertical):
         elif self.is_logs_active() and self._log_path:
             title += f" — {self._log_path}"
 
+        elif self.is_log_analysis_active():
+            if self._log_analysis_command:
+                title += f" — {self._log_analysis_command}"
+            if query := self._active_filter():
+                title += f" (filter: {query})"
+
         elif query := self._active_filter():
             # once the search input hides itself, this border is the only thing
             # left saying the view is filtered rather than short.
@@ -1011,6 +1119,7 @@ class ActivityPane(Vertical):
 
         active = tabs[self._tab]
         self._stop_log_stream()
+        self._abandon_log_analysis()
         self._log_path = None
         self._config_path = None
         # never while focused: hiding it drops focus to the ListView mid-typing
@@ -1025,48 +1134,52 @@ class ActivityPane(Vertical):
             # would offer the last database's ones against nothing
             self._dbtab.actions = []
             self._render_actions()
-
-            if active == "Logs":
-                # clear whatever the prior tab left in #acbody (e.g.
-                # Top' "Loading top…") instead of leaving it
-                # visible until the async tail fetch lands
-                self._log_body("Loading logs…")
-                self._load_log(self._instance)
-            elif active == "Config":
-                self._use("log")
-                self._render_config()
-            elif active == "Processes":
-                self._use("processes")
-                tree = self.query_one("#acprocesses", Tree)
-                tree.clear()
-                tree.root.add_leaf("Loading…")
-                self._render_processes()
-            elif active == "Stacks":
-                # deferred here (not on every instance nav — see
-                # _restore_stacks) until the tab a user actually switches to.
-                # Populating is O(total frames) (80-250ms measured for a
-                # realistic multi-worker dump) and mutates the Tree on the
-                # main thread (can't to_thread a widget update) -- push it
-                # past this switch's own repaint so the keypress that
-                # triggered it isn't what stalls.
-                self._use("stacks")
-                self.call_after_refresh(self._populate_stacks, self._instance)
-            elif active == "Toolbox":
-                self._render_toolbox()
-            else:  # Top
-                # loading text now, table (_do_render_top flips _use
-                # back once ready) -- a remote fetch is slow enough that an
-                # empty, already-visible table read as "nothing happened"
-                self._log_body("Loading top…")
-                # _top_prev is not cleared here: it is the baseline CPU% is
-                # derived from, and _do_render_top rebuilds it from the
-                # live pid set anyway. Dropping it made every tab switch show
-                # 0.0% until a second refresh -- remotely, a second `R`.
-                self._render_top()
+            self._render_instance_tab(active, keep_group)
         elif active == "Toolbox":
             self._render_db_toolbox()
         else:
             self._load_db_tab(active, keep_group)
+
+    def _render_instance_tab(self, active: str, keep_group: bool) -> None:
+        if active == "Logs":
+            # clear whatever the prior tab left in #acbody (e.g.
+            # Top' "Loading top…") instead of leaving it
+            # visible until the async tail fetch lands
+            self._log_body("Loading logs…")
+            self._load_log(self._instance)
+        elif active == "Logs Analysis":
+            self._render_log_analysis_tab(keep_group)
+        elif active == "Config":
+            self._use("log")
+            self._render_config()
+        elif active == "Processes":
+            self._use("processes")
+            tree = self.query_one("#acprocesses", Tree)
+            tree.clear()
+            tree.root.add_leaf("Loading…")
+            self._render_processes()
+        elif active == "Stacks":
+            # deferred here (not on every instance nav — see
+            # _restore_stacks) until the tab a user actually switches to.
+            # Populating is O(total frames) (80-250ms measured for a
+            # realistic multi-worker dump) and mutates the Tree on the
+            # main thread (can't to_thread a widget update) -- push it
+            # past this switch's own repaint so the keypress that
+            # triggered it isn't what stalls.
+            self._use("stacks")
+            self.call_after_refresh(self._populate_stacks, self._instance)
+        elif active == "Toolbox":
+            self._render_toolbox()
+        else:  # Top
+            # loading text now, table (_do_render_top flips _use
+            # back once ready) -- a remote fetch is slow enough that an
+            # empty, already-visible table read as "nothing happened"
+            self._log_body("Loading top…")
+            # _top_prev is not cleared here: it is the baseline CPU% is
+            # derived from, and _do_render_top rebuilds it from the
+            # live pid set anyway. Dropping it made every tab switch show
+            # 0.0% until a second refresh -- remotely, a second `R`.
+            self._render_top()
 
     def _load_log(self, inst: Instance | None) -> None:
         self._coalesce("log", _inst_key(inst), lambda: self._do_load_log(inst))
@@ -1763,6 +1876,175 @@ class ActivityPane(Vertical):
         table.add_column("TOOL")
         for i, (label, _sig) in enumerate(self.TOOLBOX_TOOLS):
             table.add_row(label, key=str(i))
+
+    def _abandon_log_analysis(self) -> None:
+        """Kill this tab's still-running odoo-logs, if any -- called before
+        every re-render (tab switch, refresh, a new row picked) so a
+        superseded run doesn't keep going unseen. odoo-logs can't be
+        interrupted any other way once it starts reading (see
+        start_odoo_logs); this only works because it runs as a real,
+        killable subprocess instead of in-process."""
+        if self._log_analysis_proc is not None:
+            self._log_analysis_proc.kill()
+            self._log_analysis_proc = None
+
+    def _render_log_analysis_tab(self, keep_group: bool) -> None:
+        """A refresh (keep_group) re-runs the analysis already picked;
+        anything else (a real tab switch) shows the list, same as a plain
+        Jobs re-render backs out of its drilled-into group."""
+        if keep_group and self._log_analysis_command is not None:
+            self.run_worker(self._do_run_log_analysis(self._log_analysis_command))
+        else:
+            self._render_log_analysis()
+
+    def _render_log_analysis(self) -> None:
+        """List odoo-logs's analyses for this instance -- nothing runs until
+        one is picked (see _run_log_analysis): the same list-then-select
+        shape `_render_toolbox` already uses, just swapping in odoo-logs as
+        the thing that runs."""
+        self._log_analysis_command = None
+        self._log_analysis_ident = None
+        self._log_analysis_rows = []
+        self._filters.pop("Logs Analysis", None)  # a stale filter means nothing once back at the list
+        table = self.query_one("#actable", DataTable)
+        table.clear(columns=True)
+        self._use("table")
+        table.add_column("ANALYSIS")
+        table.add_column("DESCRIPTION")
+        for i, command in enumerate(LOG_ANALYSIS_COMMANDS):
+            table.add_row(command, LOG_ANALYSIS_HELP[command], key=str(i))
+
+    def _select_log_analysis_row(self, idx: int) -> None:
+        """Route a row selection by what's currently shown: the list of
+        commands (run the one picked) or a result (drill into its raw
+        json, same as a db tab -- just keyed off this tab's own rows
+        instead of _dbtab.rows)."""
+        if self._log_analysis_command is None:
+            self.run_worker(self._run_log_analysis(idx))
+        elif idx < len(self._log_analysis_rows):
+            self._show_raw(self._log_analysis_rows[idx])
+
+    async def _run_log_analysis(self, idx: int) -> None:
+        """Run the Logs Analysis row the user picked."""
+        if not (0 <= idx < len(LOG_ANALYSIS_COMMANDS)):
+            return
+
+        await self._do_run_log_analysis(LOG_ANALYSIS_COMMANDS[idx])
+
+    def _log_analysis_superseded(
+        self, ident: tuple[str | None, str], proc: subprocess.Popen[str] | None = None
+    ) -> bool:
+        """True if a newer pick or tab switch moved on from `ident` while an
+        `await` was in flight -- killing `proc` first if one was started, so
+        an abandoned run doesn't keep going unseen (see _abandon_log_analysis
+        for why that's the one way to actually stop it)."""
+        if ident == self._log_analysis_ident:
+            return False
+
+        if proc is not None:
+            proc.kill()
+        return True
+
+    @staticmethod
+    def _wait_log_analysis(proc: subprocess.Popen[str]) -> tuple[str, str] | None:
+        try:
+            return proc.communicate(timeout=90)
+        except subprocess.TimeoutExpired:  # backstop for a genuinely stuck call
+            proc.kill()
+            return None
+
+    def _show_log_analysis_result(self, rows: list[dict] | None, raw: str) -> None:
+        if rows is None:
+            self._log_body(raw or "(no output)")
+            return
+        if not rows:
+            self._log_analysis_rows = []
+            self._log_body("(empty)")
+            return
+
+        self._log_analysis_rows = rows
+        self._show_log_analysis_table()
+
+    async def _do_run_log_analysis(self, command: str) -> None:
+        """Run odoo-logs `command` against this instance's log files, as a
+        memory/CPU-limited subprocess (see start_odoo_logs) -- escape backs
+        out to the list (see on_key)."""
+        if self._instance is None:
+            return
+
+        inst = self._instance
+        at = host_for(inst, self.app.host)
+        ident = (_inst_key(inst), command)
+
+        if ident != self._log_analysis_ident:
+            # a different analysis: its filter means nothing here, while `R`
+            # on the same one keeps it (same reasoning as _load_db_tab)
+            self._filters.pop("Logs Analysis", None)
+
+        self._abandon_log_analysis()
+        self._log_analysis_command = command
+        self._log_analysis_ident = ident
+        self._log_body(f"Loading {command}…")
+
+        files = await to_thread(instance_log_files, inst, at)
+        if self._log_analysis_superseded(ident):
+            return
+
+        if not files:
+            self._log_body("(no log file found)")
+            return
+
+        proc = await to_thread(start_odoo_logs, command, files, at)
+        if self._log_analysis_superseded(ident, proc):
+            return
+        if proc is None:
+            self._log_body("(couldn't start odoo-logs)")
+            return
+
+        self._log_analysis_proc = proc
+        result = await to_thread(self._wait_log_analysis, proc)
+        if self._log_analysis_superseded(ident):
+            return
+
+        self._log_analysis_proc = None
+        if result is None:
+            self._log_body("(odoo-logs timed out after 90s)")
+            return
+
+        self._show_log_analysis_result(*parse_odoo_db_output(*result))
+
+    def _visible_log_analysis_rows(self) -> list[tuple[int, dict]]:
+        """(original index, row) passing the search filter -- same shape as
+        _visible_db_rows, since raw-json drill-in keys off the same
+        row_key-is-the-original-index convention."""
+        query = self._filters.get("Logs Analysis")
+        if not query:
+            return list(enumerate(self._log_analysis_rows))
+
+        return [(i, row) for i, row in enumerate(self._log_analysis_rows) if row_matches(row, query)]
+
+    def _show_log_analysis_table(self) -> None:
+        if not self._log_analysis_rows:
+            return  # nothing loaded yet (error/(empty)) -- don't clobber that message
+
+        pairs = self._visible_log_analysis_rows()
+        if not pairs:
+            query = self._filters.get("Logs Analysis")
+            self._log_body(f"(no match: {query})" if query else "(empty)")
+            return
+
+        self.query_one("#actable", DataTable).clear(columns=True)  # drop stale rows before the reveal
+        self._use("table")
+        self.call_after_refresh(self._populate_log_analysis_table, pairs)
+
+    def _populate_log_analysis_table(self, pairs: list[tuple[int, dict]]) -> None:
+        table = self.query_one("#actable", DataTable)
+        table.clear(columns=True)
+        rows = [row for _i, row in pairs]
+        columns = table_columns(rows)
+        table.add_columns(*(c.upper() for c in columns))
+        for i, row in pairs:
+            table.add_row(*(stringify(row.get(c, "")) for c in columns), key=str(i))
 
     def _visible_db_rows(self) -> list[tuple[int, dict]]:
         """(original index, row) for the db rows passing the active-flag and

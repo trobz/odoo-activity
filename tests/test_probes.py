@@ -134,6 +134,34 @@ def test_logfile_falls_back_to_redirected_stdout(monkeypatch):
     assert probes.logfile_of(inst, Host()) is None
 
 
+def test_instance_log_files_orders_rotations_numerically(tmp_path):
+    """`.9` has to sort before `.10` — plain name order would get that
+    backwards."""
+    logfile = tmp_path / "server.log"
+    logfile.write_text("current")
+    for rotation in (1, 9, 10, 2):
+        suffix = "" if rotation == 1 else ".gz"
+        (tmp_path / f"server.log.{rotation}{suffix}").write_text("old")
+
+    inst = _argv_inst(f"odoo-bin -d demo --logfile {logfile}")
+
+    assert probes.instance_log_files(inst, Host()) == [
+        logfile,
+        tmp_path / "server.log.1",
+        tmp_path / "server.log.2.gz",
+        tmp_path / "server.log.9.gz",
+        tmp_path / "server.log.10.gz",
+    ]
+
+
+def test_instance_log_files_empty_when_logfile_missing(tmp_path):
+    """A configured `logfile` that was never actually created — handing
+    odoo-logs a missing path would refuse the whole command."""
+    inst = _argv_inst(f"odoo-bin -d demo --logfile {tmp_path / 'server.log'}")
+
+    assert probes.instance_log_files(inst, Host()) == []
+
+
 def test_row_matches_values_only_case_insensitive():
     row = {"key": "database.secret", "value": "********"}
     assert probes.row_matches(row, "SECRET") is True  # case-insensitive
@@ -180,6 +208,162 @@ def test_start_odoo_db_asks_for_every_row_only_when_told(monkeypatch):
     # a command with no such flag must never be handed it
     probes.start_odoo_db("locks", "demo", include_inactive=True)
     assert "--all" not in seen[-1]
+
+
+def test_start_odoo_logs_wraps_in_a_resource_limited_shell(monkeypatch):
+    """`RLIMIT_AS`/`RLIMIT_CPU` are per-process, so the cap has to be on the
+    subprocess itself, via a wrapping shell (works the same over ssh)."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(Host, "popen", lambda self, argv, **_: seen.append(argv) or "proc")
+
+    probes.start_odoo_logs("errors", [Path("/var/log/server.log")], Host())
+
+    assert seen[-1][:2] == ["sh", "-c"]
+    wrapped = seen[-1][2]
+    assert "ulimit -t 60;" in wrapped
+    assert "ulimit -v 1048576;" in wrapped
+    assert wrapped.endswith("exec odoo-logs --output-format json errors /var/log/server.log")
+
+
+def test_start_odoo_logs_passes_every_file(monkeypatch):
+    seen: list[list[str]] = []
+    monkeypatch.setattr(Host, "popen", lambda self, argv, **_: seen.append(argv) or "proc")
+
+    probes.start_odoo_logs("crons", [Path("/var/log/server.log"), Path("/var/log/server.log.1.gz")], Host())
+
+    assert seen[-1][2].endswith(
+        "exec odoo-logs --output-format json crons /var/log/server.log /var/log/server.log.1.gz"
+    )
+
+
+def test_start_odoo_logs_with_verbose_and_extra_flags(monkeypatch):
+    """`--verbose` is a global option -- it must land before the subcommand;
+    `extra` (e.g. `--traceback-only`) lands after it, before the files."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(Host, "popen", lambda self, argv, **_: seen.append(argv) or "proc")
+
+    probes.start_odoo_logs(
+        "errors",
+        [Path("/var/log/server.log")],
+        Host(),
+        verbose_file="/tmp/oa-errors-1-abc.log",
+        extra=("--traceback-only",),
+    )
+
+    assert seen[-1][2].endswith(
+        "exec odoo-logs --verbose /tmp/oa-errors-1-abc.log --output-format json "
+        "errors --traceback-only /var/log/server.log"
+    )
+
+
+def test_matching_traceback_blocks_reverses_the_squashed_id():
+    """`error` comes off the grouped row already squashed ("(N)" instead of
+    a real pid) -- the search must still find the real pid in raw text."""
+    dumped = (
+        "2026-01-01 10:00:00,000 123 ERROR demo odoo.addons.base.models.ir_cron: "
+        "Job 'long cron' (3222624) server action #12 failed\n"
+        "Traceback (most recent call last):\n"
+        "  File demo.py, line 1\n"
+        "odoo.addons.base.models.ir_cron: Job 'long cron' (3222624) server action #12 failed\n"
+        "2026-01-01 11:00:00,000 124 ERROR demo odoo.modules.loading: "
+        "Some modules are not loaded\n"
+        "unrelated block\n"
+    )
+
+    result = probes._matching_traceback_blocks(
+        dumped, "odoo.addons.base.models.ir_cron", "Job 'long cron' (N) server action #12 failed"
+    )
+
+    assert "3222624" in result
+    assert "unrelated block" not in result
+
+
+def test_matching_traceback_blocks_no_match_is_empty():
+    dumped = "2026-01-01 10:00:00,000 123 ERROR demo odoo.modules.loading: something else\n"
+    assert probes._matching_traceback_blocks(dumped, "KeyError", "'socket'") == ""
+
+
+def test_matching_traceback_blocks_empty_dump_is_empty():
+    """Regression guard: `--traceback-only` can legitimately keep nothing at
+    all (every entry in scope was a single-line ERROR with no Traceback --
+    real staging logs hit this for e.g. `odoo.modules.loading`/`ir_model`
+    entries) -- `zip(starts, [*starts[1:], len(text)], strict=True)` used to
+    raise ValueError on an empty `starts` instead of returning ""."""
+    assert probes._matching_traceback_blocks("", "KeyError", "'socket'") == ""
+
+
+def test_error_traceback_end_to_end(monkeypatch, tmp_path):
+    """Orchestration: start_odoo_logs gets the right verbose/extra args, the
+    dumped file is read back and cleaned up, and the result is filtered."""
+    dumped_file = tmp_path / "dumped.log"
+    dumped_file.write_text(
+        "2026-01-01 10:00:00,000 1 ERROR demo x: y\nKeyError: 'socket'\n"
+        "2026-01-01 10:05:00,000 1 ERROR demo x: y\nValueError: nope\n"
+    )
+
+    seen_start_kwargs = {}
+    rm_calls = []
+
+    class _FakeProc:
+        def communicate(self, timeout=None):
+            return "", ""
+
+        def kill(self):
+            pass
+
+    def fake_start_odoo_logs(command, files, host, *, verbose_file: str, extra=()):
+        seen_start_kwargs["command"] = command
+        seen_start_kwargs["files"] = files
+        seen_start_kwargs["verbose_file"] = verbose_file
+        seen_start_kwargs["extra"] = extra
+        # simulate odoo-logs having written the verbose file
+        Path(verbose_file).write_text(dumped_file.read_text())
+        return _FakeProc()
+
+    def fake_run(self, argv, **_):
+        rm_calls.append(argv)
+        if argv[:2] == ["rm", "-f"]:
+            Path(argv[2]).unlink(missing_ok=True)  # keep the test's real /tmp file clean
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(probes, "start_odoo_logs", fake_start_odoo_logs)
+    monkeypatch.setattr(Host, "run", fake_run)
+
+    result = probes.error_traceback([Path("/var/log/server.log")], "KeyError", "'socket'", Host())
+
+    assert seen_start_kwargs["command"] == "errors"
+    assert seen_start_kwargs["extra"] == ("--traceback-only",)
+    assert seen_start_kwargs["verbose_file"].startswith("/tmp/oa-errors-")
+    assert "KeyError: 'socket'" in result
+    assert "ValueError" not in result
+    assert rm_calls and rm_calls[0][:2] == ["rm", "-f"]  # verbose file cleaned up
+
+
+def test_error_traceback_no_proc_is_empty(monkeypatch):
+    monkeypatch.setattr(probes, "start_odoo_logs", lambda *_a, **_k: None)
+    assert probes.error_traceback([Path("/var/log/server.log")], "KeyError", "'socket'", Host()) == ""
+
+
+def test_error_traceback_cleans_up_the_verbose_file_on_timeout(monkeypatch):
+    """Regression guard: the cleanup rm used to live in a `finally` around
+    just the read step, so a `communicate()` timeout returned early and
+    never ran it, leaking the temp file."""
+    rm_calls = []
+
+    class _FakeProc:
+        def communicate(self, timeout: float = 90) -> None:
+            raise subprocess.TimeoutExpired(cmd="odoo-logs", timeout=timeout)
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(probes, "start_odoo_logs", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(Host, "run", lambda self, argv, **_: rm_calls.append(argv) or SimpleNamespace(stdout=""))
+
+    result = probes.error_traceback([Path("/var/log/server.log")], "KeyError", "'socket'", Host())
+
+    assert result == ""
+    assert rm_calls and rm_calls[0][:2] == ["rm", "-f"]
 
 
 # --- docker ---------------------------------------------------------------

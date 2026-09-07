@@ -215,6 +215,7 @@ class OdooActivity(App):
         ("L", "quit_process", "Log dump -3"),
         ("D", "dumpstacks", "Dump stacks"),
         ("S", "copy_shell_command", "Copy shell cmd"),
+        ("T", "traceback", "Traceback"),
         ("A", "toggle_show_all", "All/active"),
         ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
         ("f", "toggle_maximize", "Maximize"),
@@ -717,6 +718,9 @@ class OdooActivity(App):
         if action in ("dumpstacks", "copy_shell_command"):
             return self.query_one(ActivityPane).is_instance_mode() and self.current_instance() is not None
 
+        if action == "traceback":
+            return self.query_one(ActivityPane).can_show_traceback()
+
         if action == "toggle_show_all":
             return self.query_one(ActivityPane).has_show_all()
 
@@ -904,6 +908,9 @@ class OdooActivity(App):
     @work(exclusive=True, group="shell-command")
     async def _copy_shell_command(self, inst: Instance) -> None:
         await self.query_one(ActivityPane).copy_shell_command(inst, self.host)
+
+    def action_traceback(self) -> None:
+        self.query_one(ActivityPane).show_traceback()
 
 
 def run() -> None:

@@ -1,5 +1,7 @@
 import inspect
+import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -39,6 +41,81 @@ def test_db_query_honors_launch_time_flag_only(monkeypatch):
     monkeypatch.setattr(mcp_server, "_include_sensitive_information", True)
     mcp_server.db_query("demo", "params")
     assert captured["include_sensitive_information"] is True
+
+
+def test_instance_log_analysis_no_such_instance(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: None)
+    assert mcp_server.instance_log_analysis("demo", "errors") == "(no such instance)"
+
+
+def test_instance_log_analysis_no_log_file(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [])
+    assert mcp_server.instance_log_analysis("demo", "errors") == "(no log file found)"
+
+
+def test_instance_log_analysis_runs_odoo_logs_against_resolved_files(monkeypatch):
+    """The tool body is the same shape as db_query's -- resolve, run,
+    parse -- just swapping instance_log_files/start_odoo_logs in."""
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [Path("/var/log/server.log")])
+
+    captured = {}
+
+    class _FakeProc:
+        def communicate(self, timeout=None):
+            return json.dumps([{"type": "AccessError", "count": 3}]), ""
+
+    def fake_start(command, files, host):
+        captured["command"] = command
+        captured["files"] = files
+        return _FakeProc()
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    result = mcp_server.instance_log_analysis("demo", "errors")
+    assert result == [{"type": "AccessError", "count": 3}]
+    assert captured == {"command": "errors", "files": [Path("/var/log/server.log")]}
+
+
+def test_instance_error_traceback_no_such_instance(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: None)
+    assert mcp_server.instance_error_traceback("demo", "KeyError", "'socket'") == "(no such instance)"
+
+
+def test_instance_error_traceback_no_log_file(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [])
+    assert mcp_server.instance_error_traceback("demo", "KeyError", "'socket'") == "(no log file found)"
+
+
+def test_instance_error_traceback_no_match(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [Path("/var/log/server.log")])
+    monkeypatch.setattr(mcp_server.probes, "error_traceback", lambda *_a, **_k: "")
+    assert mcp_server.instance_error_traceback("demo", "KeyError", "'socket'") == "(no matching traceback found)"
+
+
+def test_instance_error_traceback_resolves_files_and_forwards_type_error(monkeypatch):
+    """Same three-line shape as instance_log_analysis -- resolve, call,
+    return -- just swapping in error_traceback."""
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [Path("/var/log/server.log")])
+
+    captured = {}
+
+    def fake_error_traceback(files, error_type, error, host):
+        captured["files"] = files
+        captured["error_type"] = error_type
+        captured["error"] = error
+        return "Traceback (most recent call last):\nKeyError: 'socket'"
+
+    monkeypatch.setattr(mcp_server.probes, "error_traceback", fake_error_traceback)
+
+    result = mcp_server.instance_error_traceback("demo", "KeyError", "'socket'")
+
+    assert result == "Traceback (most recent call last):\nKeyError: 'socket'"
+    assert captured == {"files": [Path("/var/log/server.log")], "error_type": "KeyError", "error": "'socket'"}
 
 
 def test_mail_audit_has_no_include_sensitive_information_argument():
@@ -185,6 +262,8 @@ def test_mcp_tools_do_not_crash():
         assert isinstance(mcp_server.instance_top(name), dict)
         assert isinstance(mcp_server.instance_config(name), str)
         assert isinstance(mcp_server.instance_log_tail(name), str)
+        assert isinstance(mcp_server.instance_log_analysis(name, "errors"), (list, str))
+        assert isinstance(mcp_server.instance_error_traceback(name, "KeyError", "'socket'"), str)
 
         dbs = mcp_server.instance_databases(name)
         if dbs and dbs.get("databases"):

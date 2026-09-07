@@ -20,16 +20,17 @@ tags:
 | `L` | kill -3 the selected process, then jump to Stacks (Top tab) |
 | `D` | dump stacks of all workers, then jump to Stacks |
 | `S` | copy the instance's `odoo shell` launch command to the clipboard |
+| `T` | show the full traceback behind an `errors` row (Logs Analysis tab) |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
 | `A` | show all rows, inactive ones included |
-| enter | run the selected tool (Toolbox tab, confirm popup) / open a Jobs group / open a row's raw json (db tabs) |
-| escape | back out of a Jobs group, or of a row's raw json |
+| enter | run the selected tool (Toolbox tab, confirm popup) / run the selected analysis (Logs Analysis tab) / open a Jobs group / open a row's raw json (db tabs, Logs Analysis results) |
+| escape | back out of a Jobs group, of a Logs Analysis run, or of a row's raw json |
 | `/` | search |
 | `R` | refresh the active tab now |
 | `q` | quit |
 
-Two tabs on each side have no letter shortcut — cycle to them with
-`[`/`]` or click: **Processes** and **Stacks** (instance mode), **Queries**
+Some tabs on each side have no letter shortcut — cycle to them with
+`[`/`]` or click: **Processes**, **Stacks** and **Logs Analysis** (instance mode), **Queries**
 and **Modules** (database mode). A plugin-contributed tab (e.g. **POS**,
 see below) has none either.
 
@@ -68,7 +69,7 @@ The detail pane mode-switches on whatever's highlighted in the instances
 list:
 
 - **Instance mode** — an instance row is highlighted. Tabs: Top,
-  Processes, Stacks, Logs, Config, Toolbox.
+  Processes, Stacks, Logs, Logs Analysis, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
   Queries, Users, Locks, Jobs, Crons, Mail, Modules, Params, Toolbox, plus
   **POS** when the opt-in `pos` plugin is enabled (see below).
@@ -109,6 +110,23 @@ Tails the instance's configured `logfile`, reading backward in fixed-size
 chunks so a multi-GB file costs a few reads, not a full scan.
 
 ![Logs tab](images/tabs/instance-logs.svg)
+
+#### Logs Analysis
+
+Lists [odoo-logs][odoo-logs]'s 9 analyses (errors, cron history, logins,
+timing, ...), each with its own one-line description; nothing runs until one
+is picked — same list-then-select shape as Toolbox. The picked analysis runs
+as a memory/CPU-limited subprocess against the instance's logfile and its
+rotated `.gz` siblings; `R` re-runs it in place instead of backing out to
+the list. Once results are showing, `/` filters them and `enter` opens a
+row's raw json, same as a database tab. `escape` backs out: once from a
+row's raw json, again from the result to the list of analyses.
+
+On `errors`, its grouped row only carries a count and first/last seen — `T`
+runs a second, `--verbose`-backed odoo-logs call scoped to that exact group
+and shows the real traceback text instead of the row's json.
+
+[odoo-logs]: https://github.com/trobz/odoo-logs
 
 #### Config (`c`)
 
