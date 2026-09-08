@@ -204,8 +204,8 @@ tables like Mail. The db row's tag is the binary claim
 (`database.is_neutralized`, off `odoo-db list`); this tab checks it, and
 only when opened — it's a per-database read.
 
-The verdict leads: green where the claim holds and nothing below can reach
-the outside, yellow **PARTIALLY NEUTRALIZED** where the flag is set but a
+The verdict leads, in odoo-db's own words so the tab and the CLI agree:
+green where the claim holds and nothing below can reach the outside, yellow **PARTIALLY NEUTRALIZED** where the flag is set but a
 surface each module's `neutralize.sql` should have cleared is still live (a
 payment provider still enabled, an IAP token still billable, a live bank
 feed) — treat such a database as production until they're cleared — and red

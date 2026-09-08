@@ -408,10 +408,13 @@ in database mode).
   billable, a live bank feed), and what neutralization never clears at all,
   namely stored credentials — it disables what a database can *do*, not
   what it *holds*, and only for modules that ship a `neutralize.sql`, which
-  a client's own module never does. The verdict leads: green claimed and
-  clear, yellow **PARTIALLY NEUTRALIZED** where the flag is set but
-  something below is still live (treat as production until someone clears
-  it), red not neutralized at all. Only fetched when the tab is opened.
+  a client's own module never does. The verdict leads, in odoo-db's own
+  words (its `state`, so the tab and the CLI say the same thing): green
+  claimed and clear, yellow **PARTIALLY NEUTRALIZED** where the flag is set
+  but something below is still live (treat as production until someone
+  clears it), red not neutralized at all. A host whose odoo-db predates
+  `state` falls back to deriving it here. Only fetched when the tab is
+  opened.
 
 [odoo-config-cli]: https://github.com/trobz/odoo-config/blob/main/CLI.md
 [docs-getting-started]: ./site-docs/docs/getting-started.md

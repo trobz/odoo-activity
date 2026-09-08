@@ -2136,6 +2136,26 @@ def test_render_neutralization_leads_with_the_verdict_the_row_tag_cannot_carry()
     assert "NOT NEUTRALIZED" in str(red)
 
 
+def test_render_neutralization_takes_odoo_dbs_verdict_over_its_own():
+    """odoo-db decides (`neutralization_state`) -- it can see a surface the
+    connecting role couldn't count, which never reaches the tab. A host
+    whose odoo-db predates the key falls back to deriving it, the same
+    graceful degradation `panes/mail.py` does for `is_test_catcher`."""
+    from odoo_activity.panes.neutralization import _state
+
+    # a claim with nothing live here, but odoo-db saw a surface it could not
+    # read: its partial has to win, or the uncertainty turns into a green
+    assert _state({"state": "partial", "is_neutralized": True, "live_surfaces": []}) == "partial"
+
+    # an older odoo-db sends no `state` at all
+    assert _state({"is_neutralized": True, "live_surfaces": []}) == "neutralized"
+    assert _state({"is_neutralized": True, "live_surfaces": [{"table": "iap_account"}]}) == "partial"
+    assert _state({"is_neutralized": False, "live_surfaces": []}) == "not_neutralized"
+
+    # ... and an unrecognized one is treated as absent rather than crashing
+    assert _state({"state": "rubbish", "is_neutralized": False, "live_surfaces": []}) == "not_neutralized"
+
+
 def test_render_neutralization_says_what_a_green_database_still_holds():
     """Neutralization clears what a database can *do*, never what it holds:
     a client module's API keys survive it intact. A reader who sees only the
