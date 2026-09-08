@@ -4,6 +4,7 @@ description: Optional features ship as plugins — install the extra to get them
 tags:
   - plugins
   - odooly
+  - pos
 ---
 
 # Plugins
@@ -86,6 +87,47 @@ It has to be the directory you started `oa` from, not the instance's
 directory on the server: odooly runs locally, so a script on the far end is
 not somewhere it can reach.
 
+## pos
+
+Reports on `pos.config`: whether each till is closed or has an open session
+(and if so, its name and order count), when its latest session opened and
+when its latest order was actually rung up — a session can open and close
+with nothing sold on it, so the two dates can differ — the settings that
+decide whether it can even reach a physical till — the IoT Box on/off
+switch and its `proxy_ip`, cashdrawer/scale/printer-via-proxy — its payment
+methods (named explicitly, v14+ only — older versions configure payment
+through plain journals, which this doesn't try to name), and whether it's
+set to wait for the terminal's own confirmation before moving on — per
+payment method on v14+, or one flag for the whole till on the versions
+before that, where it lived directly on `pos.config`.
+
+Unlike odooly, **pos is opt-in** — most projects don't run Point of Sale, so
+it doesn't install or activate on its own:
+
+```
+uv tool install "odoo-activity[pos]"
+oa --enable-plugins=pos
+```
+
+It piggybacks entirely on odooly's own `~/odooly.ini` matching (installing
+`pos` pulls in the `odooly` extra too), so it needs the same section a
+database's `ODOOLY` tag already points at. It also declares odooly as a
+requirement (`Plugin.requires`), so naming just `pos` still runs odooly
+alongside it — `--enable-plugins=pos` behaves like
+`--enable-plugins=odooly,pos`, keeping the `ODOOLY` marker/Toolbox visible
+too; `--disable-plugins=odooly` still overrides that if you really only
+want the tab. Once enabled it adds one thing: a **POS** tab in database
+mode, after Toolbox — an added tab reads as beyond the built-in set, not one
+more of them. Reachable with `[`/`]` or a click, no letter shortcut. Without
+a matching env it says so instead of showing an empty table, the same way
+an unreachable Toolbox does.
+
+A field this instance's version doesn't have (an OCA module not installed,
+an older `pos.config` missing a newer field, `pos.payment.method` not
+existing at all before v14 — v12/v13 configure payment through plain
+`journal_ids` instead) shows as a blank cell rather than failing the whole
+tab. Verified back to v12.
+
 ## Writing one
 
 Plugins are found through Python entry points, so a plugin is a package that
@@ -102,17 +144,26 @@ from odoo_activity.plugins import Plugin
 
 class DemeterPlugin(Plugin):
     name = "demeter"
+    requires = ("odooly",)           # pulled in automatically, see below
 
     def marker(self, target):        # a tag on the database row
     def tools(self, mode, target):   # Toolbox rows
     def actions(self, tab, target):  # buttons under a database tab
     def hint(self, mode, target):    # why the Toolbox is empty, if it is
+    def db_tab(self):                # name of an extra database-mode tab, if any
+    def fetch_tab(self, tab, target):  # that tab's rows
 ```
 
 ```toml
 [project.entry-points."odoo_activity.plugins"]
 demeter = "oa_demeter:DemeterPlugin"
 ```
+
+`requires` names other plugins this one needs to work fully — `--enable-plugins=demeter`
+then runs odooly too, the way naming a package pulls in its own
+dependencies. It's still overridable: `--disable-plugins` wins even over a
+requirement pulled in this way. A name that isn't installed is just ignored,
+not fatal.
 
 `target` is the highlighted `(instance, database)` pair. A handler receives
 the app — so it can confirm, prompt or notify — and returns the text to show

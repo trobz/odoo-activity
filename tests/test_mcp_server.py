@@ -5,6 +5,7 @@ import pytest
 
 from odoo_activity import mcp_server
 from odoo_activity.plugins import odooly as odooly_plugin
+from odoo_activity.plugins import pos as pos_plugin
 
 
 def test_host_filter_fullmatch_not_prefix(monkeypatch):
@@ -140,6 +141,33 @@ def test_send_test_mail_needs_a_recipient(monkeypatch):
 
     with pytest.raises(ValueError, match="`to`"):
         mcp_server.odooly_run_script("send_test_mail", "acme18-int")
+
+
+def test_pos_status_refuses_without_the_launch_time_flag(monkeypatch):
+    """Same launch-time-only gate as odooly -- --enable-plugins=pos is what
+    turns this on, never a tool call."""
+    monkeypatch.setattr(mcp_server, "_enabled_plugins", set())
+
+    with pytest.raises(ValueError, match="--enable-plugins=pos"):
+        mcp_server.pos_status("acme18-int")
+
+
+def test_pos_status_delegates_to_the_plugin_once_enabled(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_enabled_plugins", {"pos"})
+    monkeypatch.setattr(pos_plugin, "fetch_pos_status", lambda env: ([{"name": "Caisse 01"}], ""))
+
+    assert mcp_server.pos_status("acme18-int") == [{"name": "Caisse 01"}]
+
+
+def test_pos_status_raises_the_plugins_message_when_it_cannot_connect(monkeypatch):
+    """`fetch_pos_status` reports failure as (None, message) for the TUI's
+    tab body -- the MCP tool has no tab body, so it raises that same
+    message instead of silently returning nothing."""
+    monkeypatch.setattr(mcp_server, "_enabled_plugins", {"pos"})
+    monkeypatch.setattr(pos_plugin, "fetch_pos_status", lambda env: (None, f"cannot connect to '{env}': boom"))
+
+    with pytest.raises(ValueError, match="cannot connect to 'acme18-int': boom"):
+        mcp_server.pos_status("acme18-int")
 
 
 def test_mcp_tools_do_not_crash():

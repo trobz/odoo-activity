@@ -62,6 +62,14 @@ class Plugin:
     # -- it has to earn a place in the default set, the way odooly does.
     default = False
 
+    # Other plugins (by name) this one needs active to work -- pulled in
+    # automatically by `select()`, the way installing an extra pulls in the
+    # packages it needs. A name that isn't installed is ignored rather than
+    # fatal: the plugin itself still loads, it just can't reach what it
+    # depends on (the same "optional, best-effort" shape as everything else
+    # here). See `select()`.
+    requires: tuple[str, ...] = ()
+
     def marker(self, target: DbTarget) -> str:
         """A short tag for this database's row in the instances list, or ""
         for no tag at all."""
@@ -86,6 +94,26 @@ class Plugin:
     def actions(self, tab: str, target: DbTarget) -> list[Action]:
         """Buttons to add to the strip under a database tab."""
         return []
+
+    def db_tab(self) -> str | None:
+        """Name of an extra tab this plugin adds to database mode, or None.
+
+        Static -- shown whenever the plugin is active, regardless of whether
+        it can reach the highlighted database. An unreachable one gets a
+        message in the tab body instead (via `fetch_tab`), the same way an
+        empty Toolbox explains itself through `hint()` rather than vanishing.
+        """
+        return None
+
+    def fetch_tab(self, tab: str, target: DbTarget) -> tuple[list[dict] | None, str]:
+        """Rows for `tab` (one this plugin declared through `db_tab()`), and
+        a message to show instead when there's nothing to show.
+
+        Same `(rows, raw)` contract the built-in db tabs already use (see
+        `panes.detail._run_odoo_db`/`_handle_rows`), so a plugin tab renders
+        through the exact same DataTable path as Queries/Users/Crons/etc.
+        """
+        return None, ""
 
 
 class UnknownPlugin(ValueError):
@@ -127,17 +155,38 @@ def select(plugins: list[Plugin], enable: list[str], disable: list[str]) -> list
 
     `enable` is exclusive: with every default-on plugin active by default,
     "also run odooly" would be a no-op, so naming any plugin means only
-    those -- default-on or not. `disable` subtracts from whatever that
-    leaves, and wins on a conflict, which is the rule that needs no
+    those -- default-on or not. Naming one also pulls in whatever it
+    `requires`, transitively (e.g. `--enable-plugins=pos` runs odooly too --
+    without it, pos would silently lose the ODOOLY marker/Toolbox a database
+    row would otherwise carry, while still technically working). `disable`
+    subtracts from whatever that leaves, and wins on a conflict -- including
+    over a requirement pulled in this way, which is the rule that needs no
     thinking about.
     """
-    installed = {plugin.name for plugin in plugins}
-    unknown = sorted((set(enable) | set(disable)) - installed)
+    installed = {plugin.name: plugin for plugin in plugins}
+    unknown = sorted((set(enable) | set(disable)) - installed.keys())
     if unknown:
         known = ", ".join(sorted(installed)) or "none"
         msg = f"no such plugin: {', '.join(unknown)} (installed: {known})"
         raise UnknownPlugin(msg)
 
-    wanted = set(enable) if enable else {plugin.name for plugin in plugins if plugin.default}
+    wanted = set(enable) if enable else {name for name, plugin in installed.items() if plugin.default}
+    wanted |= _transitive_requires(installed, wanted)
 
     return [plugin for plugin in plugins if plugin.name in wanted - set(disable)]
+
+
+def _transitive_requires(installed: dict[str, Plugin], wanted: set[str]) -> set[str]:
+    """Every plugin `wanted` needs, transitively. A `requires` name that
+    isn't installed is skipped rather than raised -- the plugin naming it
+    still loads and simply can't reach what it depends on."""
+    pulled_in: set[str] = set()
+    stack = list(wanted)
+
+    while stack:
+        for req in installed[stack.pop()].requires:
+            if req in installed and req not in wanted and req not in pulled_in:
+                pulled_in.add(req)
+                stack.append(req)
+
+    return pulled_in

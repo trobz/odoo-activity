@@ -59,3 +59,22 @@ before the script is even invoked.
 
 See [Keybindings & Tabs — Odooly](keybindings.md#odooly) for
 what each script does.
+
+## `--enable-plugins=pos`
+
+Adds `pos_status(env)`: the same point-of-sale status the TUI's opt-in POS
+tab shows — each `pos.config`'s session status/order count, latest session
+open time and latest order date, payment methods and whether they wait for
+the terminal's own confirmation, and IoT Box/proxy/device settings. Unlike
+odooly's tools it's read-only, but it still needs a login, so it's gated
+the same launch-time-only way: naming `pos` pulls in `odooly` too (matching
+`Plugin.requires`, the same as `oa --enable-plugins=pos` does), and it
+needs the `pos` extra installed (`odoo-activity[pos]`).
+
+Resolves locally against this machine's own `~/odooly.ini`, same as
+`odooly_run_script` — reaches the instance over the network, not over ssh,
+regardless of `host`/`ssh_port` used to pin the server.
+
+See [Keybindings & Tabs — POS](keybindings.md#pos) for what each field
+means, including how it degrades on an instance whose version is missing a
+field.

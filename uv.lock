@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -796,6 +796,9 @@ build = [
 odooly = [
     { name = "odooly" },
 ]
+pos = [
+    { name = "odooly" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -812,8 +815,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mcp", extras = ["cli"], specifier = ">=1.28.1,<2.0.0" },
-    { name = "odoo-activity", extras = ["odooly"], marker = "extra == 'all'" },
+    { name = "odoo-activity", extras = ["odooly", "pos"], marker = "extra == 'all'" },
     { name = "odooly", marker = "extra == 'odooly'", specifier = ">=2.6" },
+    { name = "odooly", marker = "extra == 'pos'", specifier = ">=2.6" },
     { name = "pyperclip", specifier = ">=1.11.0" },
     { name = "requests", specifier = ">=2.32" },
     { name = "textual", specifier = ">=8" },
@@ -821,7 +825,7 @@ requires-dist = [
     { name = "typing-extensions", specifier = ">=4.16" },
     { name = "uv", marker = "extra == 'build'", specifier = "~=0.7.12" },
 ]
-provides-extras = ["build", "mcp", "odooly", "all"]
+provides-extras = ["build", "mcp", "odooly", "pos", "all"]
 
 [package.metadata.requires-dev]
 dev = [

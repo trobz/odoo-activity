@@ -15,6 +15,11 @@ offered to the agent directly. It needs the extra installed
 (`odoo-activity[odooly]`); the flag stays because a server exposing them to
 an agent is a decision worth making explicitly, which installing a package
 is not.
+
+`--enable-plugins=pos` (which pulls in odooly too, same as the TUI) adds
+pos_status: point-of-sale status for a database, the same data the TUI's
+opt-in POS tab shows. Read-only, but gated the same way -- it still needs a
+login.
 """
 
 import functools
@@ -91,6 +96,25 @@ def _odooly() -> ModuleType:
         raise ValueError(msg)
 
     return odooly
+
+
+def _pos() -> ModuleType:
+    """The pos plugin module, or a clear reason why it can't be used --
+    same two-way gate as `_odooly()`, and for the same reason: the extra
+    might be missing, or the server might simply not have been started with
+    --enable-plugins=pos.
+    """
+    try:
+        from odoo_activity.plugins import pos
+    except ImportError as exc:
+        msg = "pos support unavailable -- install the extra: pip install 'odoo-activity[pos]'"
+        raise ValueError(msg) from exc
+
+    if "pos" not in _enabled_plugins:
+        msg = "pos support disabled -- restart the server with --enable-plugins=pos"
+        raise ValueError(msg)
+
+    return pos
 
 
 def _resolve_host(host: str | None, ssh_port: int | None) -> Host:
@@ -629,6 +653,38 @@ def odooly_run_script(script: OdoolyScript, env: str, to: str | None = None) -> 
     return odooly.run_odooly_script(script, env)
 
 
+@mcp.tool()
+def pos_status(env: str) -> list[dict]:
+    """Point-of-sale status on odooly env `env`: each pos.config's session
+    status (closed, or open with its name and order count), when its latest
+    session opened and its latest order was actually rung up, its payment
+    methods and whether they wait for the terminal's own confirmation
+    before moving on, and IoT Box/proxy/device settings. Requires
+    --enable-plugins=pos (which pulls in odooly too).
+
+    A field this instance's version doesn't have (an OCA module not
+    installed, an older pos.config missing a newer field) is simply absent
+    from a row rather than raising.
+
+    Always local, even against a remote `host`: like odooly, pos reaches
+    the instance over the network from wherever this server runs, using
+    its own ~/odooly.ini -- never over ssh.
+
+    Args:
+        env: odooly env, e.g. from `instance_odooly_env` or
+            `list_odooly_envs`.
+
+    Raises:
+        ValueError: pos support isn't enabled/installed, or `env` couldn't
+            be reached (a missing section, a server that won't answer, ...).
+    """
+    rows, message = _pos().fetch_pos_status(env)
+    if rows is None:
+        raise ValueError(message)
+
+    return rows
+
+
 @app.command()
 def main(
     host: str | None = typer.Argument(
@@ -651,11 +707,12 @@ def main(
         list[str] | None,
         typer.Option(
             "--enable-plugins",
-            help="Plugins (comma-separated, or repeat the flag) whose non-read-only tools should be exposed, "
+            help="Plugins (comma-separated, or repeat the flag) whose gated tools should be exposed, "
             "e.g. --enable-plugins=odooly to expose list_odooly_envs/instance_odooly_env/odooly_run_script, "
-            "matching databases against ~/odooly.ini the same way `oa --enable-plugins=odooly` does. "
-            "Launch-time only -- no tool call can turn this on itself; set it only if the agent should be "
-            "able to log in and act on a matched database. Omit to expose none of them.",
+            "or --enable-plugins=pos (pulls in odooly too) to also expose pos_status -- matching databases "
+            "against ~/odooly.ini the same way `oa --enable-plugins=...` does. Launch-time only -- no tool "
+            "call can turn this on itself; set it only if the agent should be able to log in and reach a "
+            "matched database. Omit to expose none of them.",
         ),
     ] = None,
 ) -> None:
@@ -715,11 +772,12 @@ def main_multi(
         list[str] | None,
         typer.Option(
             "--enable-plugins",
-            help="Plugins (comma-separated, or repeat the flag) whose non-read-only tools should be exposed, "
+            help="Plugins (comma-separated, or repeat the flag) whose gated tools should be exposed, "
             "e.g. --enable-plugins=odooly to expose list_odooly_envs/instance_odooly_env/odooly_run_script, "
-            "matching databases against ~/odooly.ini the same way `oa --enable-plugins=odooly` does. "
-            "Launch-time only -- no tool call can turn this on itself; set it only if the agent should be "
-            "able to log in and act on a matched database. Omit to expose none of them.",
+            "or --enable-plugins=pos (pulls in odooly too) to also expose pos_status -- matching databases "
+            "against ~/odooly.ini the same way `oa --enable-plugins=...` does. Launch-time only -- no tool "
+            "call can turn this on itself; set it only if the agent should be able to log in and reach a "
+            "matched database. Omit to expose none of them.",
         ),
     ] = None,
 ) -> None:
