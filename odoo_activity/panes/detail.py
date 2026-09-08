@@ -28,6 +28,7 @@ from odoo_activity.host import Host, to_thread
 from odoo_activity.managers import db_host_for, host_for, instance_pid
 from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.mail import render_mail
+from odoo_activity.panes.neutralization import render_neutralization
 from odoo_activity.panes.processes import render_processes
 from odoo_activity.panes.stacks import filter_workers, render_stacks
 from odoo_activity.probes import (
@@ -93,6 +94,11 @@ def _inst_key(inst: Instance | None) -> str | None:
 # whatever the cursor happens to be on.
 _REQUEUE_ACTION = ("requeue-jobs", "⟳  Requeue jobs")
 _CHECK_PORT_25_ACTION = ("check-port-25", "🔌 Check port 25")
+
+# db tabs whose odoo-db command isn't the tab name lowercased -- the tab is
+# named for the question the reader has ("is this copy safe?"), the command
+# for the answer it gives.
+_TAB_COMMANDS = {"Neutralization": "check-sensitive-information"}
 
 
 def _first_line(text: str) -> str:
@@ -272,7 +278,18 @@ class ActivityPane(Vertical):
 
     TABS: ClassVar = {
         "instance": ["Top", "Processes", "Stacks", "Logs", "Config", "Toolbox"],
-        "database": ["Queries", "Users", "Locks", "Jobs", "Crons", "Mail", "Modules", "Params", "Toolbox"],
+        "database": [
+            "Queries",
+            "Users",
+            "Locks",
+            "Jobs",
+            "Crons",
+            "Mail",
+            "Neutralization",
+            "Modules",
+            "Params",
+            "Toolbox",
+        ],
     }
 
     # (label, signal) -- an int sends that signal to the instance's master
@@ -1397,6 +1414,10 @@ class ActivityPane(Vertical):
             await self._fetch_mail(db, port, ident, host)
             return
 
+        if category == "Neutralization":
+            await self._fetch_neutralization(db, port, ident, host)
+            return
+
         # fetch the flagged-off rows too, so `A` toggles client-side (see _visible_db_rows)
         include_inactive = category.lower() in ALL_ROW_FLAGS
         self._dbtab.no_all = False
@@ -1431,7 +1452,7 @@ class ActivityPane(Vertical):
         first two report themselves in the body)."""
         proc = await to_thread(
             start_odoo_db,
-            category.lower(),
+            _TAB_COMMANDS.get(category, category.lower()),
             db,
             port,
             host,
@@ -1515,6 +1536,32 @@ class ActivityPane(Vertical):
         self._dbtab.rows = []  # not table-backed -- stale rows from a prior tab shouldn't feed `/` search here
         self._use("log")
         render_mail(self.query_one("#acbody", RichLog), rows[0] if rows else {})
+        self._render_actions()
+
+    async def _fetch_neutralization(
+        self, db: str, port: PgTarget | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
+    ) -> None:
+        """The Neutralization tab: odoo-db's `check-sensitive-information`,
+        rendered as separate tables per section (see panes/neutralization.py)
+        for the same reason the Mail tab is -- it answers one nested object,
+        and its sections share no columns.
+
+        Only fetched when the tab is opened: it is a per-database read, while
+        the row tag it details is a cluster-wide one.
+        """
+        outcome = await self._run_odoo_db("Neutralization", db, port, host, ident, include_inactive=False)
+        if outcome is None:
+            return
+
+        rows, raw = outcome
+        if rows is None:
+            self._handle_rows(None, raw)
+            return
+
+        self._dbtab.actions = self._plugin_actions("Neutralization")
+        self._dbtab.rows = []  # not table-backed -- stale rows from a prior tab shouldn't feed `/` search here
+        self._use("log")
+        render_neutralization(self.query_one("#acbody", RichLog), rows[0] if rows else {})
         self._render_actions()
 
     def _handle_rows(self, rows: list[dict] | None, raw: str = "") -> None:

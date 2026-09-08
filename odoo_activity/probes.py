@@ -15,7 +15,6 @@ import os
 import platform
 import re
 import select
-import shlex
 import signal
 import socket
 import subprocess
@@ -1425,141 +1424,6 @@ def databases_by_role(role: str, port: str | PgTarget | None = None, host: Host 
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-# Hosts that accept mail and never relay it: Odoo's own neutralization
-# stub, plus the catchers a dev stack normally runs (doodba ships one).
-# Counting a catcher as a live relay would paint every neutralized dev
-# database yellow forever -- and `panes/mail.py` already treats them as
-# safe, via odoo-db's `is_test_catcher`, so counting them here would have
-# the two halves of the app contradicting each other.
-_DEAD_END_HOSTS = "'invalid', 'mailhog', 'mailpit', 'maildev'"
-
-# Neutralization, as evidence rather than the one flag: the flag is what the
-# database *claims* (`database.is_neutralized`, written by
-# base/data/neutralize.sql), the rest is what it can still *do*. A flag
-# inserted by hand -- or a cron switched back on afterwards -- makes a live
-# database read as safe, which is the one mistake this whole status exists
-# to prevent.
-#
-# `base` tables only, and deliberately so. The per-module credential
-# surfaces a neutralized database must also not still have live (payment
-# providers, IAP credits, bank feeds, ...) are Odoo domain knowledge, which
-# belongs in odoo-db where every tool can reuse it and one place tracks it
-# across versions -- not re-encoded here, where it would drift silently the
-# first time upstream adds a module. `panes/mail.py` already consumes
-# odoo-db's judgement that way. What is left here needs nothing but psql,
-# so the status still answers on a host that has no odoo-db installed.
-#
-# `version` is base's own `latest_version`, because the stub relay only
-# exists from Odoo 16 (`odoo/cli/neutralize.py` and the `neutralize.sql`
-# files arrive together there). On 14/15 the flag is set by whatever copied
-# the database -- odoo.sh's platform, an in-house script -- with no stub to
-# find, and `base/models/ir_cron.py` already reads the flag back then.
-# Demanding a stub there would paint every correctly neutralized old
-# staging yellow forever.
-_NEUTRALIZATION_SQL = f"""SELECT json_build_object(
-  'flag', (SELECT value FROM ir_config_parameter WHERE key = 'database.is_neutralized'),
-  'version', (SELECT latest_version FROM ir_module_module WHERE name = 'base'),
-  'stub', (SELECT count(*) FROM ir_mail_server WHERE smtp_host = 'invalid' AND name LIKE 'neutralization%'),
-  'live_relays', (SELECT count(*) FROM ir_mail_server
-                   WHERE active AND coalesce(smtp_host, '') NOT IN ({_DEAD_END_HOSTS})),
-  'live_crons', (SELECT count(*) FROM ir_cron c WHERE c.active AND c.id NOT IN (
-      SELECT res_id FROM ir_model_data WHERE model = 'ir.cron' AND name = 'autovacuum_job' AND module = 'base'))
-)"""  # noqa: S608 -- interpolates _DEAD_END_HOSTS, a literal above; nothing external reaches it
-
-_TRUE = {"true", "t", "1", "yes", "y", "on"}
-
-# The three answers a database gets. PARTIAL is the one that pays for the
-# extra signals: it means the two disagree -- treat the db as live until
-# someone looks.
-NEUTRALIZED = "neutralized"
-PARTIAL = "partial"
-NOT_NEUTRALIZED = "not_neutralized"
-
-
-def _major_version(version: str | None) -> int:
-    """Base's major version off `latest_version` (`16.0.1.3` -> 16), or 0
-    when the database didn't say.
-
-    Digits only out of the first part, because the major version is not
-    always numeric: `release.py` notes it "can become an arbitrary string
-    ('saas~xx')" during a release, and `adapt_version` prefixes every
-    module version with that serie -- so an Odoo Online database reports
-    base as `saas~16.4.1.3`. Reading that as 0 graded such a database as
-    pre-16, which skips the stub requirement and turns a hand-written flag
-    into a green tag. Core strips the same way (`adapt_version` keeps only
-    the digits of a non-numeric first part).
-    """
-    head = (version or "").split(".")[0]
-    digits = "".join(c for c in head if c.isdigit())
-    return int(digits) if digits else 0
-
-
-def _neutralization_state(row: Mapping) -> str:
-    """Classify one database's signals.
-
-    The flag alone is never enough in either direction: claimed-and-clean is
-    the only way to NEUTRALIZED, and evidence of the script having run (the
-    stub relay) keeps a database off NOT_NEUTRALIZED even with the flag
-    missing -- a neutralization that died halfway is not a production
-    database, but it is not a safe one either.
-
-    The stub is only *required* from Odoo 16, where it starts existing (see
-    `_NEUTRALIZATION_SQL`). An unreadable version is treated as modern:
-    that way the uncertainty costs a yellow, never a false green.
-    """
-    claimed = str(row.get("flag") or "").strip().lower() in _TRUE
-    live = row.get("live_relays") or row.get("live_crons")
-
-    stub = bool(row.get("stub"))
-    major = _major_version(row.get("version"))
-    stub_expected = major >= 16 or major == 0  # unknown reads as modern -- see the docstring
-
-    if claimed and not live and (stub or not stub_expected):
-        return NEUTRALIZED
-    if claimed or stub:
-        return PARTIAL
-    return NOT_NEUTRALIZED
-
-
-def neutralization_of(dbs: list[str], port: str | PgTarget | None = None, host: Host = LOCAL) -> dict[str, dict]:
-    """{db: report} -- one report per database that answered.
-
-    The report is the raw signals plus the `state` read off them
-    (NEUTRALIZED / PARTIAL / NOT_NEUTRALIZED). Callers that only paint a tag
-    take `state`; the counts are what makes a PARTIAL actionable -- which of
-    them is non-zero says whether a relay or a cron is the problem -- and
-    they are already in hand, so throwing them away would only mean
-    fetching them again later.
-
-    Neutralization is per-database state (rows in each db's own tables), so
-    it takes a connection per db -- but they go out as one shell loop, one
-    round trip for the whole list, since this runs on every instance
-    highlight and remotely each round trip is an ssh hop.
-
-    A db missing from the result is one psql could not read (postgres down,
-    no such table -- not an odoo database): unknown, which the callers show
-    as no status rather than as a guess in either direction.
-    """
-    if not dbs:
-        return {}
-
-    psql = shlex.join(PgTarget.of(port).psql("-tAc", _NEUTRALIZATION_SQL, "-d"))
-    # `&&` so a failed connection prints nothing at all and stays unknown
-    loop = f'for db in {shlex.join(dbs)}; do v=$({psql} "$db" 2>/dev/null) && printf \'%s\\t%s\\n\' "$db" "$v"; done'
-    out = host.run(["sh", "-c", loop]).stdout
-
-    reports = {}
-    for line in out.splitlines():
-        db, _, payload = line.partition("\t")
-        try:
-            row = json.loads(payload)
-            reports[db] = {**row, "state": _neutralization_state(row)}
-        except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
-            continue  # unparseable is unknown, same as unreachable
-
-    return reports
-
-
 _LONG_QUERIES_SQL = (
     "SELECT json_agg(t) FROM ("
     "SELECT pid, datname, query_start, age(now(), query_start) AS duration, query "
@@ -2529,7 +2393,7 @@ ALL_ROW_FLAGS: dict[str, str] = {"crons": "active", "modules": "installed", "use
 
 def start_odoo_db(
     command: str,
-    db: str,
+    db: str = "",
     port: str | PgTarget | None = None,
     host: Host = LOCAL,
     *,
@@ -2580,7 +2444,9 @@ def start_odoo_db(
         # the rows odoo-db filters out by default, plus the status column
         # (see ALL_ROW_FLAGS) to filter them on ourselves
         cmd += ["--all"]
-    cmd += [db]
+    if db:
+        # `list` is cluster-wide and takes no database argument
+        cmd += [db]
 
     try:
         return host.popen(cmd)
@@ -2606,6 +2472,39 @@ def parse_odoo_db_output(stdout: str, stderr: str) -> tuple[list[dict] | None, s
         data = [data]
 
     return data, raw
+
+
+def neutralized_databases(port: str | PgTarget | None = None, host: Host = LOCAL) -> dict[str, bool]:
+    """{db: is_neutralized} for every Odoo database on the cluster, from
+    `odoo-db list`.
+
+    odoo-db is the brain here: `database.is_neutralized` is the flag
+    `base/data/neutralize.sql` sets, and what a *claimed* neutralization
+    actually left live (a payment provider still enabled, an IAP token
+    still billable) is Odoo domain knowledge that one place should track
+    across versions -- `odoo-db check-sensitive-information` does, and the
+    Neutralization tab shows it. This is the row tag only: one binary,
+    cluster-wide, one process instead of a psql per database, because it
+    runs on every instance highlight -- sometimes against a host already
+    loaded enough for the user to be debugging it.
+
+    Empty when odoo-db isn't on PATH, timed out, or postgres is unreachable
+    -- the callers then show no tag at all rather than guessing in either
+    direction. A database missing from the answer is one odoo-db skipped
+    (not an Odoo database, or it would not open): unknown, same treatment.
+    """
+    proc = start_odoo_db("list", port=port, host=host)
+    if proc is None:
+        return {}
+
+    try:
+        stdout, stderr = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return {}
+
+    rows, _raw = parse_odoo_db_output(stdout, stderr)
+    return {row["db"]: bool(row.get("neutralized")) for row in rows or [] if row.get("db")}
 
 
 def table_columns(rows: list[dict]) -> list[str]:

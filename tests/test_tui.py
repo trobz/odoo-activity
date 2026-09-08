@@ -2063,23 +2063,14 @@ def test_an_empty_docker_db_list_is_retried_by_the_poll(monkeypatch):
 
 def test_db_rows_carry_their_neutralization_status(monkeypatch):
     """The whole point of the tag: a live database is called out in red, a
-    confirmed-neutralized one in green, one whose signals disagree (flag set
-    but a cron still live) in yellow, and a db postgres could not answer for
-    carries no tag at all rather than a guess."""
+    neutralized one in green, and a db odoo-db could not answer for carries
+    no tag at all rather than a guess."""
     instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
     monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
-    monkeypatch.setattr(tui, "databases_of", lambda *_: (["staging", "reheated", "prod", "unknown"], None))
+    monkeypatch.setattr(tui, "databases_of", lambda *_: (["staging", "prod", "unknown"], None))
     monkeypatch.setattr(tui, "pg_target_of", lambda *_: probes.PgTarget())
-    monkeypatch.setattr(
-        tui,
-        "neutralization_of",
-        lambda *_: {
-            "staging": {"state": probes.NEUTRALIZED},
-            "reheated": {"state": probes.PARTIAL, "extras": {"iap_account": 1}},
-            "prod": {"state": probes.NOT_NEUTRALIZED},
-        },
-    )
+    monkeypatch.setattr(tui, "neutralized_databases", lambda *_: {"staging": True, "prod": False})
 
     async def go():
         async with tui.OdooActivity().run_test(size=(120, 40)) as pilot:
@@ -2091,8 +2082,88 @@ def test_db_rows_carry_their_neutralization_status(monkeypatch):
                 for item in pilot.app.query_one("#instances", tui.ListView).children
             }
             assert "[green]NEUTRALIZED[/]" in str(labels["systemd:b.service::db::staging"])
-            assert "[yellow]PARTIALLY NEUTRALIZED[/]" in str(labels["systemd:b.service::db::reheated"])
             assert "[red]NOT NEUTRALIZED[/]" in str(labels["systemd:b.service::db::prod"])
             assert "NEUTRALIZED" not in str(labels["systemd:b.service::db::unknown"])
 
     asyncio.run(go())
+
+
+def _plain(renderable) -> str:
+    """A Rich Table doesn't stringify -- render it to see its cells."""
+    from rich.console import Console
+
+    console = Console(width=200, no_color=True)
+    with console.capture() as capture:
+        console.print(renderable)
+    return capture.get()
+
+
+def test_render_neutralization_leads_with_the_verdict_the_row_tag_cannot_carry():
+    """The row tag is binary (`database.is_neutralized`, off `odoo-db
+    list`). This tab is where the claim gets checked against what the
+    database can still do -- so the three verdicts, and above all the yellow
+    one, are the first thing on it."""
+    from rich.text import Text
+
+    from odoo_activity.panes.neutralization import render_neutralization
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    def verdict(report):
+        body = _FakeBody()
+        render_neutralization(body, report)  # ty: ignore[invalid-argument-type]
+        return list(body.written.renderables)
+
+    live = [{"table": "payment_provider", "rows": 2, "reach": "can charge a real card"}]
+
+    green = verdict({"is_neutralized": True, "live_surfaces": []})[0]
+    assert isinstance(green, Text)
+    assert green.style == "bold green"
+
+    # the case the whole tab exists for: claimed, but not actually clear
+    partial = verdict({"is_neutralized": True, "live_surfaces": live})
+    assert partial[0].style == "bold yellow"
+    assert "PARTIALLY NEUTRALIZED" in str(partial[0])
+    assert "payment_provider" in _plain(partial[1])  # and the table naming the gap
+
+    red = verdict({"is_neutralized": False, "live_surfaces": live})[0]
+    assert red.style == "bold red"
+    assert "NOT NEUTRALIZED" in str(red)
+
+
+def test_render_neutralization_says_what_a_green_database_still_holds():
+    """Neutralization clears what a database can *do*, never what it holds:
+    a client module's API keys survive it intact. A reader who sees only the
+    green verdict would ship the dump anyway, so the stored-secret sections
+    carry their own line."""
+    from rich.text import Text
+
+    from odoo_activity.panes.neutralization import render_neutralization
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_neutralization(
+        body,  # ty: ignore[invalid-argument-type]
+        {
+            "is_neutralized": True,
+            "live_surfaces": [],
+            "config_parameters": [{"key": "acme.api_key", "value": "********", "marker": "api_key"}],
+        },
+    )
+
+    renderables = list(body.written.renderables)
+    assert renderables[0].style == "bold green"
+    assert isinstance(renderables[1], Text)
+    assert "never what it holds" in str(renderables[1])
+    assert "acme.api_key" in _plain(renderables[2])

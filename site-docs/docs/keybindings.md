@@ -15,7 +15,7 @@ tags:
 | `[` / `]` | switch tab in the detail pane |
 | `f` | maximize/minimize the focused pane |
 | `p` / `l` / `c` / `t` | Top / Logs / Config / Toolbox |
-| `u` / `l` / `j` / `c` / `m` / `p` | Users / Locks / Jobs / Crons / Mail / Params |
+| `u` / `l` / `j` / `c` / `m` / `n` / `p` | Users / Locks / Jobs / Crons / Mail / Neutralization / Params |
 | `K` | kill -9 the selected process (Top and Processes tabs, confirm popup) |
 | `L` | kill -3 the selected process, then jump to Stacks (Top tab) |
 | `D` | dump stacks of all workers, then jump to Stacks |
@@ -196,6 +196,26 @@ that matters once `mail_servers` is empty and Odoo falls back to
 `localhost:25` for outgoing mail.
 
 ![Mail tab](images/tabs/database-mail.svg)
+
+## Neutralization (`n`)
+
+`odoo-db check-sensitive-information <db>`, rendered as its own set of
+tables like Mail. The db row's tag is the binary claim
+(`database.is_neutralized`, off `odoo-db list`); this tab checks it, and
+only when opened — it's a per-database read.
+
+The verdict leads: green where the claim holds and nothing below can reach
+the outside, yellow **PARTIALLY NEUTRALIZED** where the flag is set but a
+surface each module's `neutralize.sql` should have cleared is still live (a
+payment provider still enabled, an IAP token still billable, a live bank
+feed) — treat such a database as production until they're cleared — and red
+where it isn't neutralized at all.
+
+Below that come the secrets neutralization never touches: it clears what a
+database can *do*, not what it *holds*, and only for modules shipping a
+`neutralize.sql`, which a client's own module never does. Config
+parameters, mail relay credentials and candidate credential tables are in
+this copy — and in any dump of it — whatever the verdict says.
 
 ## Odooly
 

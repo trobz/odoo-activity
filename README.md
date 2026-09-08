@@ -353,31 +353,20 @@ in database mode).
   by that role. A container's config names its own role, address and
   password instead, and `ODOO_ACTIVITY_DB_ROLE` (a convention of *this*
   box's cluster) deliberately doesn't apply to it.
-  Each db row then carries its neutralization status, from four signals in
-  one query: the `database.is_neutralized` flag the db claims, plus whether
-  Odoo's stub mail relay is in place and whether any real mail server or
-  cron is still active. The stub is only expected from Odoo 16, where
-  `neutralize.sql` first ships — on 14/15 the flag is set by whatever
-  copied the database, with no stub to find. Green `NEUTRALIZED` is claimed
-  *and* confirmed — nothing on it reaches the outside. Red `NOT
-  NEUTRALIZED` is a live database, treat every action as production. Yellow
-  `PARTIALLY NEUTRALIZED` is the case the extra signals pay for: the flag
-  says safe but something can still fire (a flag written by hand, a
-  neutralization that died halfway, a cron switched back on afterwards) —
-  treat as live until someone looks. A mail catcher (mailhog, mailpit,
-  maildev) is not counted as a live relay: it accepts mail and never relays
-  it, which is what the Mail tab already says about it.
+  Each db row then carries its neutralization status, straight off
+  `odoo-db list`: green `NEUTRALIZED` where the database claims
+  `database.is_neutralized`, red `NOT NEUTRALIZED` where it does not —
+  treat every action on a red one as production. Binary on purpose, and one
+  odoo-db run for the whole cluster: this fires on every instance
+  highlight, often against a host loaded enough to be worth debugging. A
+  database odoo-db couldn't read carries no tag at all rather than a guess,
+  and a host with no odoo-db installed shows none.
 
-  Only `base` tables are read, so it answers the same on 14 as on 19 and
-  needs nothing but psql — no odoo-db on the target host. The per-module
-  credential surfaces a neutralized database must also not still have live
-  (payment providers, IAP credits, bank feeds, …) are Odoo domain knowledge
-  and belong in odoo-db, where one place tracks them across versions:
-  `odoo-db check-sensitive-information` answers that question. It costs one
-  extra round trip for the whole list (a psql connection per db, sent as one
-  shell loop), and a db postgres couldn't answer for carries no tag at all
-  rather than a guess. The MCP `instance_databases` tool returns the whole
-  report — state plus the raw signals — as a `neutralized` map.
+  The claim is not proof — a neutralization that died halfway, or a cron
+  switched back on afterwards, leaves the flag set on a database that can
+  still act. The **Neutralization** tab is where that gets checked, one
+  database at a time and only when opened. The MCP `instance_databases`
+  tool returns the same binary claim as a `neutralized` map.
 - **Top** — the manager gives the instance's master pid (`systemctl ...
   -p MainPID` / `supervisorctl pid`); `ps -eo pid,ppid,user,%mem,args` is then
   walked down the ppid tree from there to find every worker.
@@ -411,6 +400,18 @@ in database mode).
   common reason mail never leaves an Odoo database at all.
   With the odooly plugin installed, it grows a **Send test mail** button
   (see Odooly below).
+- **Neutralization** — `odoo-db check-sensitive-information <db>`, rendered
+  the same per-section way as Mail and for the same reason. It answers the
+  two questions the row tag's binary claim leaves open: what neutralize
+  should have cleared and did not (each module's own `neutralize.sql`
+  conditions — a payment provider still enabled, an IAP token still
+  billable, a live bank feed), and what neutralization never clears at all,
+  namely stored credentials — it disables what a database can *do*, not
+  what it *holds*, and only for modules that ship a `neutralize.sql`, which
+  a client's own module never does. The verdict leads: green claimed and
+  clear, yellow **PARTIALLY NEUTRALIZED** where the flag is set but
+  something below is still live (treat as production until someone clears
+  it), red not neutralized at all. Only fetched when the tab is opened.
 
 [odoo-config-cli]: https://github.com/trobz/odoo-config/blob/main/CLI.md
 [docs-getting-started]: ./site-docs/docs/getting-started.md

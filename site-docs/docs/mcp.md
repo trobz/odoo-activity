@@ -24,7 +24,8 @@ network server instead.
 
 ## Sensitive data
 
-`db_query`'s `params` output is masked by default, unlike the TUI's: a tool
+`db_query`'s `params` and `check-sensitive-information` output is masked by
+default, unlike the TUI's: a tool
 call has no human at the screen, and the plaintext would land in the
 agent's context. Unmasking is launch-time only, via
 `--include-sensitive-information` on the `oa-mcp`/`oa-mcp-multi` command

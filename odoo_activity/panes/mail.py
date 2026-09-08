@@ -44,7 +44,10 @@ def _mail_server_creds_cell(user: str | None, pwd: str | None) -> str:
 _FOLDED_COLUMNS = frozenset({"host:port", "creds"})
 
 
-def _section_table(title: str, columns: list[str], rows: list[list[str]]) -> Table:
+def section_table(title: str, columns: list[str], rows: list[list[str]]) -> Table:
+    """Public so panes/neutralization.py renders its sections the same way --
+    the two tabs are the only ones that answer a nested object instead of a
+    row list, and a second copy of this would drift."""
     table = Table(title=title, title_style="bold", title_justify="left", show_lines=False, expand=False)
     for col in columns:
         table.add_column(col, overflow="fold" if col in _FOLDED_COLUMNS else "ellipsis")
@@ -79,7 +82,7 @@ def _mail_servers_section(mail_servers: list[dict]) -> list[RenderableType]:
         for m in mail_servers
     ]
     renderables: list[RenderableType] = [
-        _section_table(
+        section_table(
             "Outgoing mail servers",
             ["seq", "name", "host:port", "creds", "encryption/auth", "from_filter", "active"],
             rows,
@@ -164,7 +167,7 @@ def render_mail(body: RichLog, audit: dict) -> None:
             ]
             for p in params
         ]
-        renderables.append(_section_table("Config parameters", ["key", "value"], rows))
+        renderables.append(section_table("Config parameters", ["key", "value"], rows))
 
     alias_domains = audit.get("alias_domains")
     if alias_domains:
@@ -189,7 +192,7 @@ def render_mail(body: RichLog, audit: dict) -> None:
             for a in alias_domains
         ]
         renderables.append(
-            _section_table(
+            section_table(
                 "Alias domains (Odoo 17+, authoritative)",
                 ["company", "alias_domain", "bounce_email", "catchall_email", "default_from_email"],
                 rows,
@@ -212,12 +215,12 @@ def render_mail(body: RichLog, audit: dict) -> None:
                     email += _DEFAULT_WARNING
             partner_id = "" if a["partner_id"] is None else str(a["partner_id"])
             rows.append([partner_id, a["label"], email])
-        renderables.append(_section_table("Relevant addresses", ["partner_id", "label", "email"], rows))
+        renderables.append(section_table("Relevant addresses", ["partner_id", "label", "email"], rows))
 
     modules = audit.get("modules") or []
     if modules:
         renderables.append(
-            _section_table("Relevant modules", ["module", "state"], [[m["name"], m["state"]] for m in modules])
+            section_table("Relevant modules", ["module", "state"], [[m["name"], m["state"]] for m in modules])
         )
 
     # renderables is never empty: the mail_servers branch above always

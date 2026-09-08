@@ -31,14 +31,11 @@ from odoo_activity.managers import (
 from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
-    NEUTRALIZED,
-    NOT_NEUTRALIZED,
-    PARTIAL,
     Instance,
     databases_of,
     dump_and_parse_stacks,
     format_duration,
-    neutralization_of,
+    neutralized_databases,
     pg_target_of,
     read_cpu_times,
     read_host_stats,
@@ -113,24 +110,21 @@ def _markers(plugins: list[Plugin], target: DbTarget) -> str:
     return " ".join(tag for plugin in plugins if (tag := plugin.marker(target)))
 
 
-# green: the database says it is neutralized and nothing on it can still
-# reach the outside. yellow: those two disagree — a hand-written flag, or a
-# cron switched back on after the fact. red: a live database.
-_NEUTRALIZATION_TAGS = {
-    NEUTRALIZED: "  [green]NEUTRALIZED[/]",
-    PARTIAL: "  [yellow]PARTIALLY NEUTRALIZED[/]",
-    NOT_NEUTRALIZED: "  [red]NOT NEUTRALIZED[/]",
-}
+# The quick view, and deliberately binary: `database.is_neutralized` as
+# `odoo-db list` reports it. What that claim left live is the Neutralization
+# tab's job (odoo-db's `check-sensitive-information`), one database at a
+# time and only when asked -- this runs on every instance highlight.
+_NEUTRALIZATION_TAGS = {True: "  [green]NEUTRALIZED[/]", False: "  [red]NOT NEUTRALIZED[/]"}
 
 
-def _neutralized_marker(state: str | None) -> str:
+def _neutralized_marker(state: bool | None) -> str:
     """The neutralization tag on a db row.
 
-    Empty while it is still unknown — the fetch hasn't landed, or psql
-    couldn't read that db — since guessing either way is the one thing this
-    tag exists to prevent.
+    Empty while it is still unknown — the fetch hasn't landed, odoo-db
+    isn't on the host, or it couldn't read that db — since guessing either
+    way is the one thing this tag exists to prevent.
     """
-    return _NEUTRALIZATION_TAGS.get(state or "", "")
+    return "" if state is None else _NEUTRALIZATION_TAGS[state]
 
 
 def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50) -> str:
@@ -212,6 +206,7 @@ class OdooActivity(App):
         ("c", "select_tab('Config')", "Config"),
         ("c", "select_tab('Crons')", "Crons"),
         ("m", "select_tab('Mail')", "Mail"),
+        ("n", "select_tab('Neutralization')", "Neutralization"),
         ("t", "select_tab('Toolbox')", "Toolbox"),
         ("u", "select_tab('Users')", "Users"),
         ("j", "select_tab('Jobs')", "Jobs"),
@@ -282,7 +277,7 @@ class OdooActivity(App):
         self._row_owner: dict[str, str] = {}  # row key -> owning instance key
         self._row_db: dict[str, str] = {}  # db row key -> db name
         self._db_cache: dict[str, tuple[list[str], str | None]] = {}  # instance key -> its (dbs, port)
-        self._neutralized: dict[str, dict[str, dict]] = {}  # instance key -> {db: neutralization report}
+        self._neutralized: dict[str, dict[str, bool]] = {}  # instance key -> {db: is_neutralized}
         self._shown_key: str | None = None  # highlighted row driving the activity pane
         self._instances_ready = False  # first _rebuild_instances has finished mounting rows
 
@@ -447,7 +442,7 @@ class OdooActivity(App):
             # same column rather than as a ragged suffix of the db name
             tags = _markers(self.plugins, (inst, db)) if inst is not None else ""
             marker = f"  {tags}" if tags else ""
-            neutral = _neutralized_marker(self._neutralized.get(key, {}).get(db, {}).get("state"))
+            neutral = _neutralized_marker(self._neutralized.get(key, {}).get(db))
             label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}{neutral}{marker}"
             items.append(ListItem(Label(label), name=db_key))
 
@@ -488,7 +483,7 @@ class OdooActivity(App):
         self._db_cache[key], self._neutralized[key] = await to_thread(self._fetch_databases, inst)
         await self._mount_databases(key)
 
-    def _fetch_databases(self, inst: Instance) -> tuple[tuple[list[str], str | None], dict[str, dict]]:
+    def _fetch_databases(self, inst: Instance) -> tuple[tuple[list[str], str | None], dict[str, bool]]:
         """The instance's dbs and their neutralization, in one thread hop.
 
         Both in a single `to_thread`, deliberately: each await in the worker
@@ -502,7 +497,7 @@ class OdooActivity(App):
         to be reachable.
         """
         dbs = databases_of(inst, self.host)
-        neutralized = neutralization_of(dbs[0], pg_target_of(inst, self.host), self.host) if dbs[0] else {}
+        neutralized = neutralized_databases(pg_target_of(inst, self.host), self.host) if dbs[0] else {}
         return dbs, neutralized
 
     async def _mount_databases(self, key: str) -> None:

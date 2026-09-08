@@ -151,7 +151,7 @@ class HostStats(TypedDict):
 class InstanceDatabases(TypedDict):
     databases: list[str]
     db_port: str | None
-    neutralized: dict[str, dict]
+    neutralized: dict[str, bool]
 
 
 class InstanceTop(TypedDict):
@@ -164,7 +164,7 @@ class StackDump(TypedDict):
     workers: list[Worker]
 
 
-DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks", "params"]
+DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks", "params", "check-sensitive-information"]
 OdoolyScript = Literal["create_test_job", "restore_app_icons", "send_test_mail"]
 
 
@@ -279,30 +279,20 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
     """The instance's databases and the postgres port they live on, or None
     if the instance isn't found.
 
-    `neutralized` maps each database to a report: the raw signals it was
-    read from, plus the `state` those signals add up to.
+    `neutralized` maps each database to `database.is_neutralized` — what
+    the database *claims*, as `odoo-db list` reports it. True means a copy
+    that was neutralized: mail relays disabled, crons off.
 
-    - `neutralized` — claimed and confirmed: nothing on it can reach the
-      outside (a staging/test copy, safe to act on).
-    - `partial` — the signals disagree: a flag written by hand, a
-      neutralization that died halfway, or a cron switched back on
-      afterwards. Treat as live until a human checks.
-    - `not_neutralized` — a live database, where every action is production.
+    The claim is not proof. It is a config parameter, and a neutralization
+    that died halfway — or a cron switched back on afterwards — leaves it
+    set on a database that can still act on the outside world. Run
+    `db_query(db, "check-sensitive-information")` before treating one as
+    safe: it lists the module surfaces neutralize should have cleared and
+    did not, plus the credentials neutralization never clears at all.
 
-    The signals behind it: `flag` is `database.is_neutralized` as the db
-    claims it, `version` is base's own, `stub` counts Odoo's dead-end relay
-    (only written from Odoo 16, so it is not required on older versions),
-    and `live_relays`/`live_crons` count what can still fire — which of the
-    two is non-zero is what makes a `partial` actionable.
-
-    Only `base` tables are read. The per-module credential surfaces a
-    neutralized database must also not have live (payment providers, IAP
-    credits, bank feeds, …) are Odoo domain knowledge and live in odoo-db,
-    where one place tracks them across versions — `odoo-db
-    check-sensitive-information` is the tool for that question.
-
-    A database missing from the map is one psql could not read (postgres
-    down, or not an odoo database) — unknown, never a guess either way.
+    A database missing from the map is one odoo-db could not read (postgres
+    down, or not an odoo database) — unknown, never a guess either way. The
+    map is empty when the host has no `odoo-db` installed.
 
     Args:
         name: instance name as `list_instances` reports it.
@@ -317,7 +307,8 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
     databases, db_port = probes.databases_of(inst, target)
     # pg_target_of, not db_port: a docker instance's postgres also needs its
     # container address and credentials to be reachable at all.
-    neutralized = probes.neutralization_of(databases, probes.pg_target_of(inst, target), target) if databases else {}
+    cluster = probes.neutralized_databases(probes.pg_target_of(inst, target), target) if databases else {}
+    neutralized = {db: cluster[db] for db in databases if db in cluster}
     return {"databases": databases, "db_port": db_port, "neutralized": neutralized}
 
 
@@ -504,16 +495,20 @@ def db_query(
     target: Host,
 ) -> list[dict] | str:
     """Run an `odoo-db` diagnostic command against `db` — a scoped subset:
-    modules, crons, jobs, users, locks, params. Stats/bloat/attachments/studio
-    and the audit-oriented commands (they write a `$db.json` file to disk) are
-    out of scope here. `params` returns `ir_config_parameter` rows, with
+    modules, crons, jobs, users, locks, params, check-sensitive-information.
+    Stats/bloat/attachments/studio and the audit-oriented commands (they
+    write a `$db.json` file to disk) are out of scope here.
+    `check-sensitive-information` answers what a neutralized copy did not
+    clear and what it still holds — the follow-up to `instance_databases`'
+    `neutralized` claim. `params` returns `ir_config_parameter` rows, with
     secret-looking values masked by odoo-db unless the server was started
     with `--include-sensitive-information` — a launch-time-only choice, not
     a per-call argument here: no tool call can enable it on its own.
 
     Args:
         db: database name.
-        command: modules, crons, jobs, users, locks, or params.
+        command: modules, crons, jobs, users, locks, params, or
+            check-sensitive-information.
         port: postgres port, if the instance's cluster isn't the default one.
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
