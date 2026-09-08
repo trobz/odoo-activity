@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v0.24.0 (2026-09-08)
+
+### Bug Fixes
+
+- **host**: Report a missing tool as exit 127 instead of raising
+  ([`0859d20`](https://github.com/trobz/odoo-activity/commit/0859d203cecb01a5f44fa2848ae63c405abaf91a))
+
+### Features
+
+- **db**: Show whether each database is neutralized
+  ([`7dc78f2`](https://github.com/trobz/odoo-activity/commit/7dc78f220a2a9cb1ebe66703ad329b459a0312cf))
+
+### Refactoring
+
+- **db**: Let odoo-db answer neutralization, and detail it in a tab
+  ([`22ab593`](https://github.com/trobz/odoo-activity/commit/22ab59310f6ce6b472b291e52c357d19fa6e6ebf))
+
+- **neutralization**: Take odoo-db's verdict instead of deriving one
+  ([`803c670`](https://github.com/trobz/odoo-activity/commit/803c67084b85c19eeb92ab98f03fea6de967f650))
+
+
 ## v0.23.0 (2026-09-04)
 
 ### Bug Fixes
