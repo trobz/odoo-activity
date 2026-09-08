@@ -2059,3 +2059,131 @@ def test_an_empty_docker_db_list_is_retried_by_the_poll(monkeypatch):
             assert keys == ["docker:acme", "docker:acme::db::devel", "docker:idle"]
 
     asyncio.run(go())
+
+
+def test_db_rows_carry_their_neutralization_status(monkeypatch):
+    """The whole point of the tag: a live database is called out in red, a
+    neutralized one in green, and a db odoo-db could not answer for carries
+    no tag at all rather than a guess."""
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda *_: (["staging", "prod", "unknown"], None))
+    monkeypatch.setattr(tui, "pg_target_of", lambda *_: probes.PgTarget())
+    monkeypatch.setattr(tui, "neutralized_databases", lambda *_: {"staging": True, "prod": False})
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(120, 40)) as pilot:
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            labels = {
+                item.name: str(next(iter(item.query(tui.Label))).content)
+                for item in pilot.app.query_one("#instances", tui.ListView).children
+            }
+            assert "[green]NEUTRALIZED[/]" in str(labels["systemd:b.service::db::staging"])
+            assert "[red]NOT NEUTRALIZED[/]" in str(labels["systemd:b.service::db::prod"])
+            assert "NEUTRALIZED" not in str(labels["systemd:b.service::db::unknown"])
+
+    asyncio.run(go())
+
+
+def _plain(renderable) -> str:
+    """A Rich Table doesn't stringify -- render it to see its cells."""
+    from rich.console import Console
+
+    console = Console(width=200, no_color=True)
+    with console.capture() as capture:
+        console.print(renderable)
+    return capture.get()
+
+
+def test_render_neutralization_leads_with_the_verdict_the_row_tag_cannot_carry():
+    """The row tag is binary (`database.is_neutralized`, off `odoo-db
+    list`). This tab is where the claim gets checked against what the
+    database can still do -- so the three verdicts, and above all the yellow
+    one, are the first thing on it."""
+    from rich.text import Text
+
+    from odoo_activity.panes.neutralization import render_neutralization
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    def verdict(report):
+        body = _FakeBody()
+        render_neutralization(body, report)  # ty: ignore[invalid-argument-type]
+        return list(body.written.renderables)
+
+    live = [{"table": "payment_provider", "rows": 2, "reach": "can charge a real card"}]
+
+    green = verdict({"is_neutralized": True, "live_surfaces": []})[0]
+    assert isinstance(green, Text)
+    assert green.style == "bold green"
+
+    # the case the whole tab exists for: claimed, but not actually clear
+    partial = verdict({"is_neutralized": True, "live_surfaces": live})
+    assert partial[0].style == "bold yellow"
+    assert "PARTIALLY NEUTRALIZED" in str(partial[0])
+    assert "payment_provider" in _plain(partial[1])  # and the table naming the gap
+
+    red = verdict({"is_neutralized": False, "live_surfaces": live})[0]
+    assert red.style == "bold red"
+    assert "NOT NEUTRALIZED" in str(red)
+
+
+def test_render_neutralization_takes_odoo_dbs_verdict_over_its_own():
+    """odoo-db decides (`neutralization_state`) -- it can see a surface the
+    connecting role couldn't count, which never reaches the tab. A host
+    whose odoo-db predates the key falls back to deriving it, the same
+    graceful degradation `panes/mail.py` does for `is_test_catcher`."""
+    from odoo_activity.panes.neutralization import _state
+
+    # a claim with nothing live here, but odoo-db saw a surface it could not
+    # read: its partial has to win, or the uncertainty turns into a green
+    assert _state({"state": "partial", "is_neutralized": True, "live_surfaces": []}) == "partial"
+
+    # an older odoo-db sends no `state` at all
+    assert _state({"is_neutralized": True, "live_surfaces": []}) == "neutralized"
+    assert _state({"is_neutralized": True, "live_surfaces": [{"table": "iap_account"}]}) == "partial"
+    assert _state({"is_neutralized": False, "live_surfaces": []}) == "not_neutralized"
+
+    # ... and an unrecognized one is treated as absent rather than crashing
+    assert _state({"state": "rubbish", "is_neutralized": False, "live_surfaces": []}) == "not_neutralized"
+
+
+def test_render_neutralization_says_what_a_green_database_still_holds():
+    """Neutralization clears what a database can *do*, never what it holds:
+    a client module's API keys survive it intact. A reader who sees only the
+    green verdict would ship the dump anyway, so the stored-secret sections
+    carry their own line."""
+    from rich.text import Text
+
+    from odoo_activity.panes.neutralization import render_neutralization
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    body = _FakeBody()
+    render_neutralization(
+        body,  # ty: ignore[invalid-argument-type]
+        {
+            "is_neutralized": True,
+            "live_surfaces": [],
+            "config_parameters": [{"key": "acme.api_key", "value": "********", "marker": "api_key"}],
+        },
+    )
+
+    renderables = list(body.written.renderables)
+    assert renderables[0].style == "bold green"
+    assert isinstance(renderables[1], Text)
+    assert "never what it holds" in str(renderables[1])
+    assert "acme.api_key" in _plain(renderables[2])

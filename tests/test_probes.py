@@ -570,3 +570,48 @@ def test_a_containers_workdir_comes_off_the_image_not_a_running_process(monkeypa
 
     assert probes.instance_workdir(_DOCKER_INSTANCE, Host()) == Path("/opt/odoo")
     assert calls == [["docker", "inspect", "-f", "{{.Config.WorkingDir}}", "acme-odoo-1"]]
+
+
+def test_neutralized_databases_reads_the_cluster_in_one_odoo_db_run(monkeypatch):
+    """The row tag is a binary claim off `odoo-db list`, one process for the
+    whole cluster -- it runs on every instance highlight, sometimes against
+    a host already loaded enough to be worth debugging.
+
+    A db odoo-db skipped (not an Odoo database, or it would not open) is
+    absent from the map: unknown, which the UI shows as no tag rather than
+    as a guess in either direction."""
+    seen: list[list[str]] = []
+
+    def popen(_self, argv, **_kw):
+        seen.append(argv)
+        payload = json.dumps([
+            {"db": "staging", "version": "19.0", "neutralized": True},
+            {"db": "prod", "version": "17.0", "neutralized": False},
+        ])
+        return SimpleNamespace(communicate=lambda timeout=None: (payload, ""), kill=lambda: None)
+
+    monkeypatch.setattr(Host, "popen", popen)
+
+    assert probes.neutralized_databases("5433", Host()) == {"staging": True, "prod": False}
+    # `list` is cluster-wide: no database argument, one run
+    assert seen == [["env", "PGPORT=5433", "odoo-db", "--output-format", "json", "list"]]
+
+
+def test_neutralized_databases_answers_nothing_when_odoo_db_cannot(monkeypatch):
+    """No odoo-db on the host, or a run that hangs, leaves every row
+    untagged rather than tagging them all as live -- a wrong green and a
+    wrong red are both worse than no tag."""
+    monkeypatch.setattr(Host, "popen", lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError))
+    assert probes.neutralized_databases(None, Host()) == {}
+
+    killed: list[bool] = []
+
+    def hanging(_self, _argv, **_kw):
+        def communicate(timeout=60.0):
+            raise subprocess.TimeoutExpired("odoo-db", timeout)
+
+        return SimpleNamespace(communicate=communicate, kill=lambda: killed.append(True))
+
+    monkeypatch.setattr(Host, "popen", hanging)
+    assert probes.neutralized_databases(None, Host()) == {}
+    assert killed == [True]  # not left running behind us

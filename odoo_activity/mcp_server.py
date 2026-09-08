@@ -151,6 +151,7 @@ class HostStats(TypedDict):
 class InstanceDatabases(TypedDict):
     databases: list[str]
     db_port: str | None
+    neutralized: dict[str, bool]
 
 
 class InstanceTop(TypedDict):
@@ -163,7 +164,7 @@ class StackDump(TypedDict):
     workers: list[Worker]
 
 
-DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks", "params"]
+DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks", "params", "check-sensitive-information"]
 OdoolyScript = Literal["create_test_job", "restore_app_icons", "send_test_mail"]
 
 
@@ -278,6 +279,21 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
     """The instance's databases and the postgres port they live on, or None
     if the instance isn't found.
 
+    `neutralized` maps each database to `database.is_neutralized` — what
+    the database *claims*, as `odoo-db list` reports it. True means a copy
+    that was neutralized: mail relays disabled, crons off.
+
+    The claim is not proof. It is a config parameter, and a neutralization
+    that died halfway — or a cron switched back on afterwards — leaves it
+    set on a database that can still act on the outside world. Run
+    `db_query(db, "check-sensitive-information")` before treating one as
+    safe: it lists the module surfaces neutralize should have cleared and
+    did not, plus the credentials neutralization never clears at all.
+
+    A database missing from the map is one odoo-db could not read (postgres
+    down, or not an odoo database) — unknown, never a guess either way. The
+    map is empty when the host has no `odoo-db` installed.
+
     Args:
         name: instance name as `list_instances` reports it.
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
@@ -289,7 +305,11 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
         return None
 
     databases, db_port = probes.databases_of(inst, target)
-    return {"databases": databases, "db_port": db_port}
+    # pg_target_of, not db_port: a docker instance's postgres also needs its
+    # container address and credentials to be reachable at all.
+    cluster = probes.neutralized_databases(probes.pg_target_of(inst, target), target) if databases else {}
+    neutralized = {db: cluster[db] for db in databases if db in cluster}
+    return {"databases": databases, "db_port": db_port, "neutralized": neutralized}
 
 
 @mcp.tool()
@@ -475,16 +495,20 @@ def db_query(
     target: Host,
 ) -> list[dict] | str:
     """Run an `odoo-db` diagnostic command against `db` — a scoped subset:
-    modules, crons, jobs, users, locks, params. Stats/bloat/attachments/studio
-    and the audit-oriented commands (they write a `$db.json` file to disk) are
-    out of scope here. `params` returns `ir_config_parameter` rows, with
+    modules, crons, jobs, users, locks, params, check-sensitive-information.
+    Stats/bloat/attachments/studio and the audit-oriented commands (they
+    write a `$db.json` file to disk) are out of scope here.
+    `check-sensitive-information` answers what a neutralized copy did not
+    clear and what it still holds — the follow-up to `instance_databases`'
+    `neutralized` claim. `params` returns `ir_config_parameter` rows, with
     secret-looking values masked by odoo-db unless the server was started
     with `--include-sensitive-information` — a launch-time-only choice, not
     a per-call argument here: no tool call can enable it on its own.
 
     Args:
         db: database name.
-        command: modules, crons, jobs, users, locks, or params.
+        command: modules, crons, jobs, users, locks, params, or
+            check-sensitive-information.
         port: postgres port, if the instance's cluster isn't the default one.
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.

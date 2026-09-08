@@ -74,3 +74,22 @@ def test_remote_popen_wraps_in_ssh(monkeypatch):
 
     assert captured["cmd"] == ["ssh", *_SSH_OPTS, "x", "tail -f /var/log/odoo.log"]
     assert child == "the-child"
+
+
+def test_a_missing_tool_is_exit_127_not_an_exception():
+    """A box without `psql` (or `systemctl`, or `docker`) must degrade the
+    one probe that needed it, not raise: an exception propagates out of
+    whichever worker made the call and takes the whole fetch down with it --
+    on the instances list, that means losing every database row rather than
+    one status. 127 is what a shell reports for the same thing, and it is
+    already what the remote branch produces, where ssh runs and the missing
+    tool is the far box's problem.
+    """
+    result = Host().run(["__no_such_tool__", "--version"])
+
+    assert result.returncode == 127
+    assert result.stdout == ""
+    assert "command not found" in result.stderr
+
+    # and with stdin, the other branch of the same call
+    assert Host().run(["__no_such_tool__"], input_text="x").returncode == 127

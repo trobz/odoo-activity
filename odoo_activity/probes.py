@@ -2393,7 +2393,7 @@ ALL_ROW_FLAGS: dict[str, str] = {"crons": "active", "modules": "installed", "use
 
 def start_odoo_db(
     command: str,
-    db: str,
+    db: str = "",
     port: str | PgTarget | None = None,
     host: Host = LOCAL,
     *,
@@ -2444,7 +2444,9 @@ def start_odoo_db(
         # the rows odoo-db filters out by default, plus the status column
         # (see ALL_ROW_FLAGS) to filter them on ourselves
         cmd += ["--all"]
-    cmd += [db]
+    if db:
+        # `list` is cluster-wide and takes no database argument
+        cmd += [db]
 
     try:
         return host.popen(cmd)
@@ -2470,6 +2472,39 @@ def parse_odoo_db_output(stdout: str, stderr: str) -> tuple[list[dict] | None, s
         data = [data]
 
     return data, raw
+
+
+def neutralized_databases(port: str | PgTarget | None = None, host: Host = LOCAL) -> dict[str, bool]:
+    """{db: is_neutralized} for every Odoo database on the cluster, from
+    `odoo-db list`.
+
+    odoo-db is the brain here: `database.is_neutralized` is the flag
+    `base/data/neutralize.sql` sets, and what a *claimed* neutralization
+    actually left live (a payment provider still enabled, an IAP token
+    still billable) is Odoo domain knowledge that one place should track
+    across versions -- `odoo-db check-sensitive-information` does, and the
+    Neutralization tab shows it. This is the row tag only: one binary,
+    cluster-wide, one process instead of a psql per database, because it
+    runs on every instance highlight -- sometimes against a host already
+    loaded enough for the user to be debugging it.
+
+    Empty when odoo-db isn't on PATH, timed out, or postgres is unreachable
+    -- the callers then show no tag at all rather than guessing in either
+    direction. A database missing from the answer is one odoo-db skipped
+    (not an Odoo database, or it would not open): unknown, same treatment.
+    """
+    proc = start_odoo_db("list", port=port, host=host)
+    if proc is None:
+        return {}
+
+    try:
+        stdout, stderr = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return {}
+
+    rows, _raw = parse_odoo_db_output(stdout, stderr)
+    return {row["db"]: bool(row.get("neutralized")) for row in rows or [] if row.get("db")}
 
 
 def table_columns(rows: list[dict]) -> list[str]:

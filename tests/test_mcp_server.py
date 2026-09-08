@@ -170,3 +170,24 @@ def test_mcp_tools_do_not_crash():
     # not exercised against a real instance: SIGQUIT is a live signal, not a
     # read — only the not-found path is safe to smoke-test unconditionally.
     assert mcp_server.instance_dump_stacks("__no_such_instance__") == {"error": "(no such instance)", "workers": []}
+
+
+def test_instance_databases_reports_neutralization_per_database(monkeypatch):
+    """The agent gets the same binary claim the TUI shows a human — and a db
+    odoo-db couldn't answer for is simply absent from the map (unknown),
+    never reported as a live database."""
+    inst = {"name": "b.service", "status": "running", "uptime": "-", "manager": "systemd"}
+    mcp_server._discovered.clear()  # the discovery cache outlives a single test
+    monkeypatch.setattr(mcp_server.managers, "list_instances", lambda *_a, **_k: [inst])
+    monkeypatch.setattr(mcp_server.probes, "databases_of", lambda *_a, **_k: (["staging", "prod"], "5432"))
+    monkeypatch.setattr(mcp_server.probes, "pg_target_of", lambda *_a, **_k: mcp_server.probes.PgTarget())
+    # `odoo-db list` answers for the whole cluster; only this instance's own
+    # databases are reported back
+    cluster = {"staging": True, "someone_elses": True}
+    monkeypatch.setattr(mcp_server.probes, "neutralized_databases", lambda *_a, **_k: cluster)
+
+    assert mcp_server.instance_databases("b.service") == {
+        "databases": ["staging", "prod"],
+        "db_port": "5432",
+        "neutralized": {"staging": True},
+    }

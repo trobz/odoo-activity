@@ -145,10 +145,22 @@ class Host:
         """Like subprocess.run(capture_output=True, text=True), local or over ssh.
 
         Never inherits our stdin — see _NO_STDIN.
+
+        A tool that isn't installed comes back as exit 127 (the shell's own
+        "command not found"), not as a raised FileNotFoundError: every probe
+        above this layer already reads a failed call as "no answer" and
+        degrades, while an exception propagates out of whichever worker
+        happened to call it and takes the rest of that fetch down with it.
+        The remote branch behaves this way on its own -- there it is ssh
+        that runs, and the missing tool is the *remote* box's problem -- so
+        this is what makes local and remote answer alike.
         """
-        if input_text is None:
-            return subprocess.run(self._argv(argv), stdin=_NO_STDIN, capture_output=True, text=True)
-        return subprocess.run(self._argv(argv), input=input_text, capture_output=True, text=True)
+        try:
+            if input_text is None:
+                return subprocess.run(self._argv(argv), stdin=_NO_STDIN, capture_output=True, text=True)
+            return subprocess.run(self._argv(argv), input=input_text, capture_output=True, text=True)
+        except FileNotFoundError as missing:
+            return subprocess.CompletedProcess(argv, 127, "", f"{missing.filename}: command not found")
 
     def popen(
         self,
