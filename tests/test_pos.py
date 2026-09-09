@@ -27,25 +27,33 @@ class _FakeConfigs:
 
 
 class _FakeSessions:
-    """Stands in for `client.env["pos.session"]` -- `by_config` already
-    holds each config's sessions ordered newest-first, same as the real
-    `order="start_at desc"` would return them."""
+    """Stands in for `client.env["pos.session"]` -- `by_config` holds each
+    config's sessions (each already carrying its own `id`/`name`/`state`/
+    `start_at`), newest-first, the way `order="start_at desc"` would return
+    them once merged across every config in one `search_read`, the way
+    `_latest_sessions` issues it."""
 
     def __init__(self, by_config):
         self._by_config = by_config
 
-    def search_read(self, domain, _fields, order=None, limit=None):
+    def search_read(self, domain, _fields, order=None):
         assert order == "start_at desc"
-        config_id = domain[0][2]
-        return self._by_config.get(config_id, [])[:limit]
+        config_ids = domain[0][2]
+        rows = [
+            {**session, "config_id": (config_id, "")}
+            for config_id in config_ids
+            for session in self._by_config.get(config_id, [])
+        ]
+        return sorted(rows, key=lambda r: r["start_at"], reverse=True)
 
 
 class _FakeOrders:
     """Stands in for `client.env["pos.order"]`. `counts` maps session id to
-    what `search_count` reports for it; `by_config` maps config id to its
-    orders (newest `date_order` first) for `_latest_order_date`'s
-    `search_read`. `has_config_id` simulates a version whose `pos.order`
-    lacks the (related) `config_id` field."""
+    how many orders it should report for `_order_counts_by_session`'s
+    `search_read` (grouped in Python, one order dict per unit of count);
+    `by_config` maps config id to its orders (newest `date_order` first) for
+    `_latest_order_dates`'s `search_read`. `has_config_id` simulates a
+    version whose `pos.order` lacks the (related) `config_id` field."""
 
     def __init__(self, counts=None, by_config=None, has_config_id=True):
         self._counts = counts or {}
@@ -58,14 +66,22 @@ class _FakeOrders:
             fields["config_id"] = {}
         return fields
 
-    def search_count(self, domain):
-        session_id = domain[0][2]
-        return self._counts.get(session_id, 0)
+    def search_read(self, domain, fields, order=None):
+        key, operator, value = domain[0]
+        if key == "session_id":
+            assert operator == "in"
+            return [
+                {"session_id": (session_id, "")} for session_id in value for _ in range(self._counts.get(session_id, 0))
+            ]
 
-    def search_read(self, domain, _fields, order=None, limit=None):
+        assert key == "config_id" and operator == "in"
         assert order == "date_order desc"
-        config_id = domain[0][2]
-        return self._by_config.get(config_id, [])[:limit]
+        rows = [
+            {"config_id": (config_id, ""), **order_row}
+            for config_id in value
+            for order_row in self._by_config.get(config_id, [])
+        ]
+        return sorted(rows, key=lambda r: r["date_order"], reverse=True)
 
 
 class _FakePaymentMethods:

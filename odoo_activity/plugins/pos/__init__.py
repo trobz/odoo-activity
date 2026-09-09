@@ -13,6 +13,7 @@ rather than it loading half-broken.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import odooly
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 # pos.session states other than these count as "open" -- 'opening_control'
 # and 'closing_control' are still a till in someone's hands, not a config
 # sitting idle
-_CLOSED_STATES = ("closed", "closing_control")
+_CLOSED_STATES = ("closed",)
 
 # the hardware-proxy fields worth a glance alongside session status. Not
 # every version of pos.config carries all of these -- `other_devices` is
@@ -84,20 +85,17 @@ def pos_status(client: odooly.Client) -> list[dict]:
     ]
     configs = config_model.search_read([], fields)
     methods_by_config = _payment_methods(client, configs) if has_payment_methods else {}
+    latest_session_by_config = _latest_sessions(client, configs)
+    order_counts_by_session = _order_counts_by_session(client, latest_session_by_config.values())
+    latest_order_by_config = _latest_order_dates(client, configs) if has_order_config_id else {}
 
     rows = []
     for config in sorted(configs, key=lambda c: c["name"]):
-        sessions = client.env["pos.session"].search_read(
-            [["config_id", "=", config["id"]]],
-            ["name", "state", "start_at"],
-            order="start_at desc",
-            limit=1,
-        )
-        session = sessions[0] if sessions else None
+        session = latest_session_by_config.get(config["id"])
         is_open = session is not None and session["state"] not in _CLOSED_STATES
-        orders = client.env["pos.order"].search_count([["session_id", "=", session["id"]]]) if session else None
+        orders = order_counts_by_session.get(session["id"]) if session else None
         methods = methods_by_config.get(config["id"], [])
-        latest_order = _latest_order_date(client, config["id"]) if has_order_config_id else None
+        latest_order = latest_order_by_config.get(config["id"])
 
         if has_payment_methods:
             # per-method granularity, v14+
@@ -127,14 +125,60 @@ def pos_status(client: odooly.Client) -> list[dict]:
     return rows
 
 
-def _latest_order_date(client: odooly.Client, config_id: int) -> str | None:
-    """The `date_order` of this config's most recent `pos.order`, across
-    every session -- a session can open and close with nothing rung up on
-    it, which `open_time` alone wouldn't say."""
-    orders = client.env["pos.order"].search_read(
-        [["config_id", "=", config_id]], ["date_order"], order="date_order desc", limit=1
+def _latest_sessions(client: odooly.Client, configs: list[dict]) -> dict[int, dict]:
+    """config id -> its most recent `pos.session` row (`id`, `name`, `state`,
+    `start_at`) -- one query across every config rather than one per row,
+    relying on `start_at desc` so the first row seen per config is its
+    latest."""
+    config_ids = [config["id"] for config in configs]
+    if not config_ids:
+        return {}
+
+    sessions = client.env["pos.session"].search_read(
+        [["config_id", "in", config_ids]],
+        ["config_id", "name", "state", "start_at"],
+        order="start_at desc",
     )
-    return orders[0]["date_order"] if orders else None
+    latest: dict[int, dict] = {}
+    for session in sessions:
+        config_id = session["config_id"][0]
+        latest.setdefault(config_id, session)
+    return latest
+
+
+def _order_counts_by_session(client: odooly.Client, sessions: Iterable[dict]) -> dict[int, int]:
+    """session id -> its `pos.order` count, for the given sessions -- one
+    query across every session rather than one `search_count` per row."""
+    session_ids = [session["id"] for session in sessions]
+    if not session_ids:
+        return {}
+
+    orders = client.env["pos.order"].search_read([["session_id", "in", session_ids]], ["session_id"])
+    counts: dict[int, int] = {}
+    for order in orders:
+        session_id = order["session_id"][0]
+        counts[session_id] = counts.get(session_id, 0) + 1
+    return counts
+
+
+def _latest_order_dates(client: odooly.Client, configs: list[dict]) -> dict[int, str]:
+    """config id -> the `date_order` of its most recent `pos.order`, across
+    every session -- a session can open and close with nothing rung up on
+    it, which `open_time` alone wouldn't say. One query across every config
+    rather than one per row, relying on `date_order desc` so the first row
+    seen per config is its latest."""
+    config_ids = [config["id"] for config in configs]
+    if not config_ids:
+        return {}
+
+    orders = client.env["pos.order"].search_read(
+        [["config_id", "in", config_ids]], ["config_id", "date_order"], order="date_order desc"
+    )
+    latest: dict[int, str] = {}
+    for order in orders:
+        config_id = order["config_id"][0]
+        latest.setdefault(config_id, order["date_order"])
+    return latest
 
 
 def _payment_methods(client: odooly.Client, configs: list[dict]) -> dict[int, list[dict]]:
@@ -168,9 +212,10 @@ def fetch_pos_status(env: str) -> tuple[list[dict] | None, str]:
     try:
         password = odooly.read_config(env)[3] or ""
         client = odooly.Client.from_config(env)
-        return pos_status(client), ""
     except Exception as exc:  # a missing section, a server that won't answer, ...
         return None, f"cannot connect to '{env}': {redact(str(exc), password)}"
+
+    return pos_status(client), ""
 
 
 class PosPlugin(Plugin):
