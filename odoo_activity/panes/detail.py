@@ -70,7 +70,7 @@ from odoo_activity.probes import (
 )
 
 if TYPE_CHECKING:
-    from odoo_activity.plugins import Handler, Tool
+    from odoo_activity.plugins import Handler, Plugin, Tool
     from odoo_activity.tui import OdooActivity
 
 _log = logging.getLogger("odoo_activity")
@@ -352,6 +352,18 @@ class ActivityPane(Vertical):
         self._db_tools: list[Tool] = []  # Toolbox rows currently listed, index-addressed by the table
         self._showing_raw = False  # viewing one row's raw json in #acbody
         self._stacks_cache: dict[str, tuple[list[Worker], Path]] = {}  # instance key -> its last dump
+        self._tab_plugins: dict[str, Plugin] = {  # tab name -> the plugin that fetches it (see fetch_tab)
+            tab: plugin for plugin in self.app.plugins if (tab := plugin.db_tab()) is not None
+        }
+        # TABS plus whatever the active plugins add: a plugin tab is appended
+        # after Toolbox, the built-in set's last tab -- what an added tab is,
+        # rather than one more of the default ones. Kept as its own attribute
+        # rather than reassigning the ClassVar `TABS` -- this depends on
+        # which plugins are active, so it can only be known once mounted.
+        self._tabs: dict[str, list[str]] = {
+            **self.TABS,
+            "database": [*self.TABS["database"], *self._tab_plugins],
+        }
         self.query_one("#acstacks", Tree).show_root = False
         self.query_one("#acprocesses", Tree).show_root = False
         self._render_mode()
@@ -414,7 +426,7 @@ class ActivityPane(Vertical):
         tabs than instance mode, so an index valid in one can be out of range
         in the other until `_render_active` normalises it the same way.
         """
-        tabs = self.TABS[self._mode]
+        tabs = self._tabs[self._mode]
         return tabs[self._tab % len(tabs)]
 
     def is_instance_mode(self) -> bool:
@@ -856,13 +868,13 @@ class ActivityPane(Vertical):
         self._render_active()
 
     def select_tab_by_name(self, name: str) -> None:
-        tabs = self.TABS[self._mode]
+        tabs = self._tabs[self._mode]
         if name in tabs:
             self.select_tab(tabs.index(name))
 
     def has_tab(self, name: str) -> bool:
         """True if `name` is one of the current mode's tabs."""
-        return name in self.TABS[self._mode]
+        return name in self._tabs[self._mode]
 
     def focus_active(self) -> None:
         """Move keyboard focus onto whichever body widget the active tab is
@@ -958,7 +970,7 @@ class ActivityPane(Vertical):
         self._append_log(data)
 
     def _render_mode(self) -> None:
-        tabs = self.TABS[self._mode]
+        tabs = self._tabs[self._mode]
         if self._mode != self._tabs_mode:
             self._tabs_mode = self._mode
             self._tab = 0
@@ -990,7 +1002,7 @@ class ActivityPane(Vertical):
         strip.mount_all(ActivityTab(name, i, active=(i == self._tab)) for i, name in enumerate(names))
 
     def _render_active(self, keep_group: bool = False) -> None:
-        tabs = self.TABS[self._mode]
+        tabs = self._tabs[self._mode]
 
         self._tab %= len(tabs)
         for tab in self.query(ActivityTab):
@@ -1418,6 +1430,10 @@ class ActivityPane(Vertical):
             await self._fetch_neutralization(db, port, ident, host)
             return
 
+        if category in self._tab_plugins:
+            await self._fetch_plugin_tab(category, ident)
+            return
+
         # fetch the flagged-off rows too, so `A` toggles client-side (see _visible_db_rows)
         include_inactive = category.lower() in ALL_ROW_FLAGS
         self._dbtab.no_all = False
@@ -1563,6 +1579,19 @@ class ActivityPane(Vertical):
         self._use("log")
         render_neutralization(self.query_one("#acbody", RichLog), rows[0] if rows else {})
         self._render_actions()
+
+    async def _fetch_plugin_tab(self, category: str, ident: tuple[str, str, tuple[str, str] | None]) -> None:
+        """A plugin-contributed tab (see `Plugin.db_tab`/`fetch_tab`) --
+        reuses the generic row-list DataTable path, not a network read over
+        `host`, so it needs the (instance, db) target rather than a port."""
+        if self._db is None:
+            return
+
+        rows, raw = await to_thread(self._tab_plugins[category].fetch_tab, category, self._db)
+        if ident != self._dbtab.ident:
+            return
+
+        self._handle_rows(rows, raw)
 
     def _handle_rows(self, rows: list[dict] | None, raw: str = "") -> None:
         if rows is None:

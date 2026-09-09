@@ -30,7 +30,8 @@ tags:
 
 Two tabs on each side have no letter shortcut — cycle to them with
 `[`/`]` or click: **Processes** and **Stacks** (instance mode), **Queries**
-and **Modules** (database mode).
+and **Modules** (database mode). A plugin-contributed tab (e.g. **POS**,
+see below) has none either.
 
 `A` asks `odoo-db` for the rows it filters out by default (its `--all`
 flag). Against a host whose `odoo-db` predates that flag, the tab falls
@@ -69,7 +70,8 @@ list:
 - **Instance mode** — an instance row is highlighted. Tabs: Top,
   Processes, Stacks, Logs, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
-  Queries, Users, Locks, Jobs, Crons, Mail, Modules, Params, Toolbox.
+  Queries, Users, Locks, Jobs, Crons, Mail, Modules, Params, Toolbox, plus
+  **POS** when the opt-in `pos` plugin is enabled (see below).
 
 Both modes share the same tab strip, and several letter-key shortcuts are
 reused across them for whichever tab they map to in each (e.g. `l` is Logs
@@ -157,6 +159,19 @@ default — you already have a shell on this host. Pass
 `--no-include-sensitive-information` to keep odoo-db's own masking instead.
 
 ![Params tab](images/tabs/database-params.svg)
+
+#### POS
+
+Opt-in — only present with `--enable-plugins=pos` (see
+[Plugins](plugins.md)). Each `pos.config`'s session (closed, or open with a
+name and order count), when its latest session opened (**Open Time**) and
+when its latest order was actually rung up (**Latest Order**) — a session
+can open and close with nothing sold on it — the IoT Box on/off switch and
+its proxy/device settings, its payment methods named explicitly (v14+ only),
+and whether it waits for the terminal's own confirmation (per method on
+v14+, one flag for the whole till on older versions). No letter shortcut,
+no action strip — cycle to it with `[`/`]` or click, same
+as Queries/Modules.
 
 ## Jobs (`j`)
 

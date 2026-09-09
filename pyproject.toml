@@ -21,6 +21,7 @@ dependencies = [
 Repository = "https://github.com/trobz/odoo-activity"
 [project.entry-points."odoo_activity.plugins"]
 odooly = "odoo_activity.plugins.odooly:OdoolyPlugin"
+pos = "odoo_activity.plugins.pos:PosPlugin"
 
 # the bundled managers come through the same door a third-party one would
 [project.entry-points."odoo_activity.managers"]
@@ -71,9 +72,10 @@ module-root = ""
 build = ["uv ~= 0.7.12"]
 mcp = []
 odooly = ["odooly>=2.6"]
+pos = ["odooly>=2.6"]  # connects the same way odooly's own plugin does
 # hand-maintained: a new bundled plugin needs its own extra above and a
 # mention here, and this can only reach plugins shipped with odoo-activity
-all = ["odoo-activity[odooly]"]
+all = ["odoo-activity[odooly,pos]"]
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
