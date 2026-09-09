@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.25.0 (2026-09-09)
+
+### Bug Fixes
+
+- **pos**: Address PR #34 review comments
+  ([`0261697`](https://github.com/trobz/odoo-activity/commit/0261697a5a05599a0d97a8fa0ad7c7c2de31a7c3))
+
+### Features
+
+- **plugins**: Add opt-in pos plugin with a database-mode POS tab and MCP tool
+  ([`3eded97`](https://github.com/trobz/odoo-activity/commit/3eded9765fa30fc7c71f473808cab89b9ef3de22))
+
+
 ## v0.24.0 (2026-09-08)
 
 ### Bug Fixes
