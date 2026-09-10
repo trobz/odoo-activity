@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.26.0 (2026-09-10)
+
+### Features
+
+- **odooly**: Support instance-name shortcuts via an [aliases] section
+  ([`af43116`](https://github.com/trobz/odoo-activity/commit/af43116376cf0c140a2f9bcf0ba14c1b79e2d473))
+
+
 ## v0.25.2 (2026-09-10)
 
 ### Bug Fixes
