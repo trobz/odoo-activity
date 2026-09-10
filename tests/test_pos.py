@@ -51,9 +51,16 @@ class _FakeOrders:
     """Stands in for `client.env["pos.order"]`. `counts` maps session id to
     how many orders it should report for `_order_counts_by_session`'s
     `search_read` (grouped in Python, one order dict per unit of count);
-    `by_config` maps config id to its orders (newest `date_order` first) for
-    `_latest_order_dates`'s `search_read`. `has_config_id` simulates a
-    version whose `pos.order` lacks the (related) `config_id` field."""
+    `by_config` maps config id to its orders (any order -- `read_group`
+    aggregates the max itself) for `_latest_order_dates`'s `read_group`.
+    `has_config_id` simulates a version whose `pos.order` lacks the
+    (related) `config_id` field.
+
+    `read_group` rather than `search_read` for the config/date_order side
+    is the whole point of the fix this stands in for: a real `pos.order`
+    can hold millions of rows, and only the aggregate -- one row per config
+    -- may ever cross the wire.
+    """
 
     def __init__(self, counts=None, by_config=None, has_config_id=True):
         self._counts = counts or {}
@@ -68,20 +75,22 @@ class _FakeOrders:
 
     def search_read(self, domain, fields, order=None):
         key, operator, value = domain[0]
-        if key == "session_id":
-            assert operator == "in"
-            return [
-                {"session_id": (session_id, "")} for session_id in value for _ in range(self._counts.get(session_id, 0))
-            ]
-
-        assert key == "config_id" and operator == "in"
-        assert order == "date_order desc"
-        rows = [
-            {"config_id": (config_id, ""), **order_row}
-            for config_id in value
-            for order_row in self._by_config.get(config_id, [])
+        assert key == "session_id" and operator == "in"
+        return [
+            {"session_id": (session_id, "")} for session_id in value for _ in range(self._counts.get(session_id, 0))
         ]
-        return sorted(rows, key=lambda r: r["date_order"], reverse=True)
+
+    def read_group(self, domain, fields, groupby):
+        key, operator, value = domain[0]
+        assert key == "config_id" and operator == "in"
+        assert fields == ["config_id", "date_order:max"]
+        assert groupby == ["config_id"]
+
+        return [
+            {"config_id": (config_id, ""), "date_order": max(o["date_order"] for o in orders)}
+            for config_id in value
+            if (orders := self._by_config.get(config_id))
+        ]
 
 
 class _FakePaymentMethods:

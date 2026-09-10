@@ -164,21 +164,22 @@ def _order_counts_by_session(client: odooly.Client, sessions: Iterable[dict]) ->
 def _latest_order_dates(client: odooly.Client, configs: list[dict]) -> dict[int, str]:
     """config id -> the `date_order` of its most recent `pos.order`, across
     every session -- a session can open and close with nothing rung up on
-    it, which `open_time` alone wouldn't say. One query across every config
-    rather than one per row, relying on `date_order desc` so the first row
-    seen per config is its latest."""
+    it, which `open_time` alone wouldn't say.
+
+    A `read_group` aggregate (`date_order:max`), not `search_read` -- `pos.order`
+    can hold years of history (a real one seen with 1.28M rows), and
+    `search_read` would fetch one row per order just to keep the first
+    per config; `read_group` computes the max in the database and returns
+    one row per config regardless of how many orders it has.
+    """
     config_ids = [config["id"] for config in configs]
     if not config_ids:
         return {}
 
-    orders = client.env["pos.order"].search_read(
-        [["config_id", "in", config_ids]], ["config_id", "date_order"], order="date_order desc"
+    groups = client.env["pos.order"].read_group(
+        [["config_id", "in", config_ids]], ["config_id", "date_order:max"], ["config_id"]
     )
-    latest: dict[int, str] = {}
-    for order in orders:
-        config_id = order["config_id"][0]
-        latest.setdefault(config_id, order["date_order"])
-    return latest
+    return {group["config_id"][0]: group["date_order"] for group in groups if group["config_id"]}
 
 
 def _payment_methods(client: odooly.Client, configs: list[dict]) -> dict[int, list[dict]]:
