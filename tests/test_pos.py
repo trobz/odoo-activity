@@ -52,26 +52,23 @@ class _FakeOrders:
     how many orders it should report for `_order_counts_by_session`'s
     `search_read` (grouped in Python, one order dict per unit of count);
     `by_config` maps config id to its orders (any order -- `read_group`
-    aggregates the max itself) for `_latest_order_dates`'s `read_group`.
-    `has_config_id` simulates a version whose `pos.order` lacks the
-    (related) `config_id` field.
+    aggregates the max itself) for `_latest_order_dates`'s `read_group`,
+    one ungrouped call per config.
 
-    `read_group` rather than `search_read` for the config/date_order side
-    is the whole point of the fix this stands in for: a real `pos.order`
-    can hold millions of rows, and only the aggregate -- one row per config
-    -- may ever cross the wire.
+    Never a merged `read_group` grouped by `config_id`: that field is
+    related on `pos.order` on every version checked live (12.0 through
+    18.0), and older `read_group` implementations refuse to group by a
+    related field even when it's stored -- filtering *by* it in the domain
+    has no such restriction, so that's the only way this fake (and the real
+    RPC) ever sees it. `read_group` rather than `search_read` for the
+    date_order side is the other half of the fix this stands in for: a real
+    `pos.order` can hold millions of rows, and only the aggregate -- one row
+    per config -- may ever cross the wire.
     """
 
-    def __init__(self, counts=None, by_config=None, has_config_id=True):
+    def __init__(self, counts=None, by_config=None):
         self._counts = counts or {}
         self._by_config = by_config or {}
-        self._has_config_id = has_config_id
-
-    def fields_get(self):
-        fields = {"date_order": {}}
-        if self._has_config_id:
-            fields["config_id"] = {}
-        return fields
 
     def search_read(self, domain, fields, order=None):
         key, operator, value = domain[0]
@@ -81,16 +78,14 @@ class _FakeOrders:
         ]
 
     def read_group(self, domain, fields, groupby):
-        key, operator, value = domain[0]
-        assert key == "config_id" and operator == "in"
-        assert fields == ["config_id", "date_order:max"]
-        assert groupby == ["config_id"]
+        key, operator, config_id = domain[0]
+        assert key == "config_id" and operator == "="
+        assert fields == ["date_order:max"]
+        assert groupby == []
 
-        return [
-            {"config_id": (config_id, ""), "date_order": max(o["date_order"] for o in orders)}
-            for config_id in value
-            if (orders := self._by_config.get(config_id))
-        ]
+        orders = self._by_config.get(config_id, [])
+        date_order = max((o["date_order"] for o in orders), default=False)
+        return [{"date_order": date_order, "__count": len(orders)}]
 
 
 class _FakePaymentMethods:
@@ -119,7 +114,6 @@ def _client(
     sessions=None,
     order_counts=None,
     orders_by_config=None,
-    order_has_config_id=True,
     payment_methods=(),
     payment_methods_installed=True,
     payment_method_model=None,
@@ -128,7 +122,7 @@ def _client(
         env={
             "pos.config": _FakeConfigs(configs, available_fields),
             "pos.session": _FakeSessions(sessions or {}),
-            "pos.order": _FakeOrders(order_counts, orders_by_config, order_has_config_id),
+            "pos.order": _FakeOrders(order_counts, orders_by_config),
             "pos.payment.method": payment_method_model
             or _FakePaymentMethods(payment_methods, payment_methods_installed),
         }
@@ -178,7 +172,10 @@ def test_an_open_latest_session_reports_its_order_count():
 
 def test_latest_order_is_independent_of_session_state():
     """A session can open and close with nothing rung up on it -- the latest
-    order's own date is what says a till was actually used, not just opened."""
+    order's own date is what says a till was actually used, not just opened.
+    `_latest_order_dates` doesn't even look at sessions -- it filters
+    `pos.order` by `config_id` directly -- so this holds regardless of which
+    session (if any) the order happened to belong to."""
     client = _client(
         [_config()],
         sessions={1: [{"id": 501, "name": "POS/0001", "state": "closed", "start_at": "2026-01-01 08:00:00"}]},
@@ -191,17 +188,6 @@ def test_latest_order_is_independent_of_session_state():
 
 def test_latest_order_is_none_without_any_orders():
     client = _client([_config()])
-    (row,) = pos_plugin.pos_status(client)
-
-    assert row["latest_order"] is None
-
-
-def test_latest_order_is_none_when_pos_order_has_no_config_id_on_this_version():
-    client = _client(
-        [_config()],
-        orders_by_config={1: [{"date_order": "2026-01-01 08:15:00"}]},
-        order_has_config_id=False,
-    )
     (row,) = pos_plugin.pos_status(client)
 
     assert row["latest_order"] is None
@@ -227,7 +213,13 @@ def test_works_against_an_odoo_12_shaped_instance():
     plain `journal_ids` there instead (see pos_config.py in a real v12
     checkout). This mirrors that shape end to end and confirms
     `pos.payment.method` is never even reached, and that the wait flag still
-    comes through despite there being no payment method to name it on."""
+    comes through despite there being no payment method to name it on.
+
+    v12 is also where `pos.order.config_id` is a related field, which is
+    why `_latest_order_dates` never groups `read_group` by it, only filters
+    by it in the domain (and groups by nothing at all) -- `_FakeOrders.read_group`
+    asserts exactly that shape, so this test would fail the same way a real
+    v12 does if that regressed."""
     config = {
         "id": 1,
         "name": "Caisse 01",
