@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.25.1 (2026-09-10)
+
+### Bug Fixes
+
+- **pos**: Stop scanning the whole pos.order table for the latest order date
+  ([`e3701d6`](https://github.com/trobz/odoo-activity/commit/e3701d692cefbb02b5199fa8eb35d0b775d6cc95))
+
+
 ## v0.25.0 (2026-09-09)
 
 ### Bug Fixes
