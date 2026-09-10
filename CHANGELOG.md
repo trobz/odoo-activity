@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v0.25.2 (2026-09-10)
+
+### Bug Fixes
+
+- **pos**: Filter by config_id in the domain, not read_group's groupby
+  ([`4db16f7`](https://github.com/trobz/odoo-activity/commit/4db16f7076de8e043f5650415ed18aaa132d0a47))
+
+- **pos**: Group latest-order lookup by session_id, not config_id
+  ([`c841625`](https://github.com/trobz/odoo-activity/commit/c8416252ce56cee74f1de4e5d1634cf87949179e))
+
+
 ## v0.25.1 (2026-09-10)
 
 ### Bug Fixes
