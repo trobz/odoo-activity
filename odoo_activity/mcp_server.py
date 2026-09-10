@@ -617,7 +617,7 @@ def instance_odooly_env(name: str, db: str) -> str | None:
     """
     odooly = _odooly()
 
-    return odooly.match_odooly_env(name, db, odooly.read_odooly_envs())
+    return odooly.match_odooly_env(name, db, odooly.read_odooly_envs(), odooly.read_odooly_aliases())
 
 
 @mcp.tool()

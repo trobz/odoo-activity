@@ -39,6 +39,9 @@ ODOOLY_CONFIG = Path("~/odooly.ini").expanduser()
 _ENV_ABBREVIATIONS = {"integration": "int", "staging": "stag", "production": "prod"}
 # what a manager prefixes an instance name with, which no odooly env repeats
 _INSTANCE_PREFIXES = ("openerp-", "odoo-")
+# reserved odooly.ini section for project-specific shortcuts (see
+# `read_odooly_aliases`) -- never treated as an env to match against
+_ALIASES_SECTION = "aliases"
 
 # where `run_odooly_script` looks for a bare script name
 _SCRIPTS = "odoo_activity.plugins.odooly.scripts"
@@ -52,33 +55,70 @@ class OdoolyEnv(TypedDict):
     db: str
 
 
-def read_odooly_envs(path: Path = ODOOLY_CONFIG) -> list[OdoolyEnv]:
-    """Every environment in `path`, as (name, database).
+def _read_odooly_config(path: Path) -> configparser.RawConfigParser | None:
+    """`path` parsed, or None when it's missing or unparseable -- odooly
+    support is opt-in and best-effort, and a broken ini shouldn't take the
+    app down. Shared by `read_odooly_envs` and `read_odooly_aliases`, which
+    read different sections of the same file.
 
     Read with configparser rather than `odooly.read_config`, which returns
     the password too: matching only needs the name and the database, and
     what isn't read can't be leaked into a log or a screen.
-
-    Empty when the file is missing or unparseable -- odooly support is
-    opt-in and best-effort, and a broken ini shouldn't take the app down.
     """
     parser = configparser.RawConfigParser()
     try:
         parser.read_string(path.read_text())
     except (OSError, configparser.Error):
+        return None
+
+    return parser
+
+
+def read_odooly_envs(path: Path = ODOOLY_CONFIG) -> list[OdoolyEnv]:
+    """Every environment in `path`, as (name, database).
+
+    The `[aliases]` section (see `read_odooly_aliases`) is never one of
+    these -- it configures matching, it isn't itself something to match.
+    """
+    parser = _read_odooly_config(path)
+    if parser is None:
         return []
 
-    return [{"name": name, "db": parser.get(name, "database", fallback="")} for name in parser.sections()]
+    return [
+        {"name": name, "db": parser.get(name, "database", fallback="")}
+        for name in parser.sections()
+        if name != _ALIASES_SECTION
+    ]
 
 
-def _name_variants(name: str) -> set[str]:
-    """`name` as it may appear on either side of the match: as written, and
-    with each environment word abbreviated or spelled out."""
+def read_odooly_aliases(path: Path = ODOOLY_CONFIG) -> dict[str, str]:
+    """Project-specific shortcuts from `path`'s `[aliases]` section, e.g.
+    `fc12 = foodcoop12` -- short name first, then what it stands for, the
+    same direction as a bash `alias` -- so an instance/env named after the
+    short form still matches one named after the long one (or the reverse).
+
+    Empty when the file is missing, unparseable, or has no such section --
+    aliases are an opt-in convenience on top of matching that already works
+    without them.
+    """
+    parser = _read_odooly_config(path)
+    if parser is None or not parser.has_section(_ALIASES_SECTION):
+        return {}
+
+    return dict(parser.items(_ALIASES_SECTION))
+
+
+def _name_variants(name: str, aliases: dict[str, str] | None = None) -> set[str]:
+    """`name` as it may appear on either side of the match: as written, with
+    each environment word abbreviated or spelled out, and with any
+    configured alias substituted for what it stands for (or the reverse)."""
     variants = {name}
 
-    for long, short in _ENV_ABBREVIATIONS.items():
-        variants |= {variant.replace(long, short) for variant in variants if long in variant}
-        variants |= {variant.replace(short, long) for variant in variants if short in variant}
+    # each pair is expanded both ways regardless of which side is the "long"
+    # one -- `_ENV_ABBREVIATIONS` pairs long -> short, an alias short -> long
+    for one, other in {**_ENV_ABBREVIATIONS, **(aliases or {})}.items():
+        variants |= {variant.replace(one, other) for variant in variants if one in variant}
+        variants |= {variant.replace(other, one) for variant in variants if other in variant}
 
     return variants
 
@@ -95,12 +135,15 @@ def instance_env_name(instance_name: str) -> str:
     return name
 
 
-def match_odooly_env(instance_name: str, db: str, envs: list[OdoolyEnv]) -> str | None:
+def match_odooly_env(
+    instance_name: str, db: str, envs: list[OdoolyEnv], aliases: dict[str, str] | None = None
+) -> str | None:
     """The odooly env serving `db` on `instance_name`, or None.
 
     An env qualifies when its name matches the instance's -- exactly, in
-    either spelling (`-integration` / `-int`), or as that name plus a suffix,
-    since a multi-db instance is usually configured one env per database
+    either spelling (`-integration` / `-int`), through a configured `alias`
+    (see `read_odooly_aliases`), or as that name plus a suffix, since a
+    multi-db instance is usually configured one env per database
     (`acme18-int-db1`). The database has to match exactly whenever the env
     names one, which is what keeps those per-db envs apart.
 
@@ -108,14 +151,14 @@ def match_odooly_env(instance_name: str, db: str, envs: list[OdoolyEnv]) -> str 
     none, and among equals the closest name wins. Ties are broken by name so
     the answer doesn't depend on the ini's ordering.
     """
-    wanted = _name_variants(instance_env_name(instance_name))
+    wanted = _name_variants(instance_env_name(instance_name), aliases)
     matches = []
 
     for env in envs:
         if env["db"] and env["db"] != db:
             continue
 
-        names = _name_variants(env["name"])
+        names = _name_variants(env["name"], aliases)
         exact = bool(names & wanted)
         prefixed = any(name.startswith(f"{want}-") for name in names for want in wanted)
         if not (exact or prefixed):
@@ -199,6 +242,7 @@ class OdoolyPlugin(Plugin):
         # read once, at startup: the file is the user's own and small, and a
         # row's marker must not depend on when it happened to be rendered
         self.envs = read_odooly_envs()
+        self.aliases = read_odooly_aliases()
 
     def _db(self, mode: str, target: Target) -> DbTarget | None:
         """`target` as an (instance, database) pair, or None outside database
@@ -211,7 +255,7 @@ class OdoolyPlugin(Plugin):
         """The env serving this database, or None when none matches."""
         inst, db = target
 
-        return match_odooly_env(inst["name"], db, self.envs) if self.envs else None
+        return match_odooly_env(inst["name"], db, self.envs, self.aliases) if self.envs else None
 
     def marker(self, target: DbTarget) -> str:
         """Green when a section can reach this database, red when none can.
