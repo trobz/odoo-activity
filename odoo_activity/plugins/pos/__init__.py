@@ -84,10 +84,9 @@ def pos_status(client: odooly.Client) -> list[dict]:
     ]
     configs = config_model.search_read([], fields)
     methods_by_config = _payment_methods(client, configs) if has_payment_methods else {}
-    sessions = _sessions_by_config(client, [config["id"] for config in configs])
-    latest_session_by_config = _latest_sessions(sessions)
+    latest_session_by_config = _latest_sessions(client, configs)
     order_counts_by_session = _order_counts_by_session(client, latest_session_by_config.values())
-    latest_order_by_config = _latest_order_dates(client, sessions)
+    latest_order_by_config = _latest_order_dates(client, configs)
 
     rows = []
     for config in sorted(configs, key=lambda c: c["name"]):
@@ -125,24 +124,20 @@ def pos_status(client: odooly.Client) -> list[dict]:
     return rows
 
 
-def _sessions_by_config(client: odooly.Client, config_ids: list[int]) -> list[dict]:
-    """Every `pos.session` (`id`, `config_id`, `name`, `state`, `start_at`)
-    for `config_ids`, newest first -- one query, shared by `_latest_sessions`
-    and `_latest_order_dates` rather than each fetching its own."""
+def _latest_sessions(client: odooly.Client, configs: list[dict]) -> dict[int, dict]:
+    """config id -> its most recent `pos.session` row (`id`, `name`, `state`,
+    `start_at`) -- one query across every config rather than one per row,
+    relying on `start_at desc` so the first row seen per config is its
+    latest."""
+    config_ids = [config["id"] for config in configs]
     if not config_ids:
-        return []
+        return {}
 
-    return client.env["pos.session"].search_read(
+    sessions = client.env["pos.session"].search_read(
         [["config_id", "in", config_ids]],
         ["config_id", "name", "state", "start_at"],
         order="start_at desc",
     )
-
-
-def _latest_sessions(sessions: list[dict]) -> dict[int, dict]:
-    """config id -> its most recent `pos.session` row, out of `sessions`
-    (see `_sessions_by_config`) -- relying on `start_at desc` so the first
-    row seen per config is its latest."""
     latest: dict[int, dict] = {}
     for session in sessions:
         config_id = session["config_id"][0]
@@ -165,40 +160,35 @@ def _order_counts_by_session(client: odooly.Client, sessions: Iterable[dict]) ->
     return counts
 
 
-def _latest_order_dates(client: odooly.Client, sessions: list[dict]) -> dict[int, str]:
+def _latest_order_dates(client: odooly.Client, configs: list[dict]) -> dict[int, str]:
     """config id -> the `date_order` of its most recent `pos.order`, across
-    every session in `sessions` (see `_sessions_by_config`) -- a session can
-    open and close with nothing rung up on it, which `open_time` alone
-    wouldn't say.
+    every session -- a session can open and close with nothing rung up on
+    it, which `open_time` alone wouldn't say.
 
-    Grouped by `session_id`, not `config_id` -- on some versions (Odoo 12's
-    schema, seen live) `pos.order.config_id` is a related field, and
-    `read_group` refuses to group by one ("Fields in 'groupby' must be
-    regular database-persisted fields (no function or related fields)"),
-    even though it's stored. `session_id` is always a plain column, so the
-    per-session maximum is aggregated in the database (still a `read_group`
-    -- `pos.order` can hold years of history, a real one seen with 1.28M
-    rows, and only the aggregate should ever cross the wire) and rolled up
-    to each session's config afterwards, in Python, over the far smaller
-    session list.
+    One ungrouped `read_group` aggregate per config -- never `search_read`
+    (`pos.order` can hold years of history, a real one seen with 1.28M
+    rows, and only the aggregate, not one row per order, should ever cross
+    the wire) and never a single `read_group` merging every config via
+    `groupby=["config_id"]` either: `pos.order.config_id` is a related
+    field (`related='session_id.config_id'`) on every version checked live,
+    from 12.0 (unstored there) through 18.0 (stored, `groupable: True`
+    there) -- and older `read_group` implementations refuse to group by a
+    related field even when it *is* stored ("Fields in 'groupby' must be
+    regular database-persisted fields (no function or related fields)").
+    Filtering *by* `config_id` in the domain has no such restriction -- a
+    related field is fine there, it's only ever invalid as a groupby key --
+    and an empty `groupby` has no key to reject in the first place, so this
+    works the same on every version regardless of whether that version's
+    `read_group` would have allowed grouping by it directly. One round trip
+    per config rather than one merged call, but a real instance's `pos.order`
+    is what needs bounding here, not its (usually tiny) `pos.config` count.
     """
-    session_ids = [session["id"] for session in sessions]
-    if not session_ids:
-        return {}
-
-    groups = client.env["pos.order"].read_group(
-        [["session_id", "in", session_ids]], ["session_id", "date_order:max"], ["session_id"]
-    )
-    latest_by_session = {group["session_id"][0]: group["date_order"] for group in groups if group["session_id"]}
-
-    latest_by_config: dict[int, str] = {}
-    for session in sessions:
-        date = latest_by_session.get(session["id"])
-        if date is not None:
-            config_id = session["config_id"][0]
-            latest_by_config[config_id] = max(date, latest_by_config.get(config_id, date))
-
-    return latest_by_config
+    latest: dict[int, str] = {}
+    for config in configs:
+        [group] = client.env["pos.order"].read_group([["config_id", "=", config["id"]]], ["date_order:max"], [])
+        if group["date_order"]:
+            latest[config["id"]] = group["date_order"]
+    return latest
 
 
 def _payment_methods(client: odooly.Client, configs: list[dict]) -> dict[int, list[dict]]:
