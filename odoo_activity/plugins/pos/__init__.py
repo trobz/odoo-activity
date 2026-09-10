@@ -75,7 +75,6 @@ def pos_status(client: odooly.Client) -> list[dict]:
     # (see `_CONFIG_WAIT_FIELD` above) so it isn't lost on those versions.
     has_payment_methods = "payment_method_ids" in available
     has_config_wait_field = _CONFIG_WAIT_FIELD in available
-    has_order_config_id = "config_id" in client.env["pos.order"].fields_get()
 
     fields = [
         "name",
@@ -85,9 +84,10 @@ def pos_status(client: odooly.Client) -> list[dict]:
     ]
     configs = config_model.search_read([], fields)
     methods_by_config = _payment_methods(client, configs) if has_payment_methods else {}
-    latest_session_by_config = _latest_sessions(client, configs)
+    sessions = _sessions_by_config(client, [config["id"] for config in configs])
+    latest_session_by_config = _latest_sessions(sessions)
     order_counts_by_session = _order_counts_by_session(client, latest_session_by_config.values())
-    latest_order_by_config = _latest_order_dates(client, configs) if has_order_config_id else {}
+    latest_order_by_config = _latest_order_dates(client, sessions)
 
     rows = []
     for config in sorted(configs, key=lambda c: c["name"]):
@@ -125,20 +125,24 @@ def pos_status(client: odooly.Client) -> list[dict]:
     return rows
 
 
-def _latest_sessions(client: odooly.Client, configs: list[dict]) -> dict[int, dict]:
-    """config id -> its most recent `pos.session` row (`id`, `name`, `state`,
-    `start_at`) -- one query across every config rather than one per row,
-    relying on `start_at desc` so the first row seen per config is its
-    latest."""
-    config_ids = [config["id"] for config in configs]
+def _sessions_by_config(client: odooly.Client, config_ids: list[int]) -> list[dict]:
+    """Every `pos.session` (`id`, `config_id`, `name`, `state`, `start_at`)
+    for `config_ids`, newest first -- one query, shared by `_latest_sessions`
+    and `_latest_order_dates` rather than each fetching its own."""
     if not config_ids:
-        return {}
+        return []
 
-    sessions = client.env["pos.session"].search_read(
+    return client.env["pos.session"].search_read(
         [["config_id", "in", config_ids]],
         ["config_id", "name", "state", "start_at"],
         order="start_at desc",
     )
+
+
+def _latest_sessions(sessions: list[dict]) -> dict[int, dict]:
+    """config id -> its most recent `pos.session` row, out of `sessions`
+    (see `_sessions_by_config`) -- relying on `start_at desc` so the first
+    row seen per config is its latest."""
     latest: dict[int, dict] = {}
     for session in sessions:
         config_id = session["config_id"][0]
@@ -161,25 +165,40 @@ def _order_counts_by_session(client: odooly.Client, sessions: Iterable[dict]) ->
     return counts
 
 
-def _latest_order_dates(client: odooly.Client, configs: list[dict]) -> dict[int, str]:
+def _latest_order_dates(client: odooly.Client, sessions: list[dict]) -> dict[int, str]:
     """config id -> the `date_order` of its most recent `pos.order`, across
-    every session -- a session can open and close with nothing rung up on
-    it, which `open_time` alone wouldn't say.
+    every session in `sessions` (see `_sessions_by_config`) -- a session can
+    open and close with nothing rung up on it, which `open_time` alone
+    wouldn't say.
 
-    A `read_group` aggregate (`date_order:max`), not `search_read` -- `pos.order`
-    can hold years of history (a real one seen with 1.28M rows), and
-    `search_read` would fetch one row per order just to keep the first
-    per config; `read_group` computes the max in the database and returns
-    one row per config regardless of how many orders it has.
+    Grouped by `session_id`, not `config_id` -- on some versions (Odoo 12's
+    schema, seen live) `pos.order.config_id` is a related field, and
+    `read_group` refuses to group by one ("Fields in 'groupby' must be
+    regular database-persisted fields (no function or related fields)"),
+    even though it's stored. `session_id` is always a plain column, so the
+    per-session maximum is aggregated in the database (still a `read_group`
+    -- `pos.order` can hold years of history, a real one seen with 1.28M
+    rows, and only the aggregate should ever cross the wire) and rolled up
+    to each session's config afterwards, in Python, over the far smaller
+    session list.
     """
-    config_ids = [config["id"] for config in configs]
-    if not config_ids:
+    session_ids = [session["id"] for session in sessions]
+    if not session_ids:
         return {}
 
     groups = client.env["pos.order"].read_group(
-        [["config_id", "in", config_ids]], ["config_id", "date_order:max"], ["config_id"]
+        [["session_id", "in", session_ids]], ["session_id", "date_order:max"], ["session_id"]
     )
-    return {group["config_id"][0]: group["date_order"] for group in groups if group["config_id"]}
+    latest_by_session = {group["session_id"][0]: group["date_order"] for group in groups if group["session_id"]}
+
+    latest_by_config: dict[int, str] = {}
+    for session in sessions:
+        date = latest_by_session.get(session["id"])
+        if date is not None:
+            config_id = session["config_id"][0]
+            latest_by_config[config_id] = max(date, latest_by_config.get(config_id, date))
+
+    return latest_by_config
 
 
 def _payment_methods(client: odooly.Client, configs: list[dict]) -> dict[int, list[dict]]:
