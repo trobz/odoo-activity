@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 import odooly
 
 from odoo_activity.plugins import DbTarget, Plugin
-from odoo_activity.plugins.odooly import match_odooly_env, read_odooly_envs
+from odoo_activity.plugins.odooly import match_odooly_env, read_odooly_aliases, read_odooly_envs
 from odoo_activity.plugins.odooly.scripts import redact, use_user_config
 
 if TYPE_CHECKING:
@@ -238,12 +238,13 @@ class PosPlugin(Plugin):
 
     def __init__(self) -> None:
         self.envs: list[OdoolyEnv] = read_odooly_envs()
+        self.aliases = read_odooly_aliases()
 
     def env_for(self, target: DbTarget) -> str | None:
         """The env serving this database, or None when none matches --
         same matching odooly's own plugin uses (see `OdoolyPlugin.env_for`)."""
         inst, db = target
-        return match_odooly_env(inst["name"], db, self.envs) if self.envs else None
+        return match_odooly_env(inst["name"], db, self.envs, self.aliases) if self.envs else None
 
     def db_tab(self) -> str:
         return "POS"

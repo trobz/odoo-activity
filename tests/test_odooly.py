@@ -82,6 +82,65 @@ def test_a_db_pinned_env_wins_over_a_looser_one(tmp_path):
     assert odooly_plugin.match_odooly_env("openerp-demo-integration", "db9", envs) == "demo-int"
 
 
+_ALIASED_INI = """\
+[aliases]
+fc12 = foodcoop12
+fc18 = foodcoop18
+
+[fc12-stag]
+database = foodcoop12_prod
+
+[fc18-stag]
+database = foodcoop18_prod
+"""
+
+
+def test_aliases_section_is_read_but_never_treated_as_an_env(tmp_path):
+    path = tmp_path / "odooly.ini"
+    path.write_text(_ALIASED_INI)
+
+    assert odooly_plugin.read_odooly_aliases(path) == {"fc12": "foodcoop12", "fc18": "foodcoop18"}
+    assert sorted(env["name"] for env in odooly_plugin.read_odooly_envs(path)) == ["fc12-stag", "fc18-stag"]
+
+
+def test_missing_aliases_section_is_not_an_error(tmp_path):
+    assert odooly_plugin.read_odooly_aliases(tmp_path / "absent.ini") == {}
+
+    _envs(tmp_path)  # writes _INI, which has no [aliases] section
+    assert odooly_plugin.read_odooly_aliases(tmp_path / "odooly.ini") == {}
+
+
+def test_an_alias_shortens_a_long_instance_name_to_match_a_short_env(tmp_path):
+    """Instances are named after the project in full (`odoo-foodcoop12-staging`)
+    while the odooly sections abbreviate both the project (`fc12`, via a
+    configured alias, `fc12 = foodcoop12`, the same direction as a bash
+    `alias`) and the environment word (`stag`, via the existing abbreviation
+    table) -- the two expansions combine."""
+    envs = _envs(tmp_path, _ALIASED_INI)
+    aliases = odooly_plugin.read_odooly_aliases(tmp_path / "odooly.ini")
+    match = odooly_plugin.match_odooly_env
+
+    assert match("odoo-foodcoop12-staging", "foodcoop12_prod", envs, aliases) == "fc12-stag"
+    assert match("odoo-foodcoop18-staging", "foodcoop18_prod", envs, aliases) == "fc18-stag"
+    # a different project's alias must not also match this one
+    assert match("odoo-foodcoop12-staging", "foodcoop18_prod", envs, aliases) is None
+    # without the alias, the long-form instance name alone doesn't match
+    assert match("odoo-foodcoop12-staging", "foodcoop12_prod", envs) is None
+
+
+def test_an_alias_combines_with_a_suffixed_env_name(tmp_path):
+    """A section named after the aliased instance plus a suffix (the same
+    per-db-instance shape as `acme18-int-db1`) still matches -- here the
+    suffix is a project-chosen name for the database rather than a database
+    itself, but the matching rule (prefix + "-") does not care which."""
+    envs = _envs(tmp_path, "[aliases]\nfc18 = foodcoop18\n\n[fc18-staging-coop]\ndatabase = coop_staging\n")
+    aliases = odooly_plugin.read_odooly_aliases(tmp_path / "odooly.ini")
+
+    assert (
+        odooly_plugin.match_odooly_env("odoo-foodcoop18-staging", "coop_staging", envs, aliases) == "fc18-staging-coop"
+    )
+
+
 def test_scripts_run_in_this_interpreter_and_report_what_they_printed(monkeypatch):
     """The scripts ship inside the package and need odooly, so they run under
     the interpreter already running odoo-activity — never over `Host`, since
