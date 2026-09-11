@@ -113,14 +113,14 @@ chunks so a multi-GB file costs a few reads, not a full scan.
 
 #### Logs Analysis
 
-Lists [odoo-logs][odoo-logs]'s 9 analyses (errors, cron history, logins,
-timing, ...), each with its own one-line description; nothing runs until one
-is picked — same list-then-select shape as Toolbox. The picked analysis runs
-as a memory/CPU-limited subprocess against the instance's logfile and its
-rotated `.gz` siblings; `R` re-runs it in place instead of backing out to
-the list. Once results are showing, `/` filters them and `enter` opens a
-row's raw json, same as a database tab. `escape` backs out: once from a
-row's raw json, again from the result to the list of analyses.
+Lists [odoo-logs][odoo-logs]'s 10 analyses (errors, cron history, logins,
+outgoing mail, timing, ...), each with its own one-line description; nothing
+runs until one is picked — same list-then-select shape as Toolbox. The picked
+analysis runs as a memory/CPU-limited subprocess against the instance's
+logfile and its rotated `.gz` siblings; `R` re-runs it in place instead of
+backing out to the list. Once results are showing, `/` filters them and
+`enter` opens a row's raw json, same as a database tab. `escape` backs out:
+once from a row's raw json, again from the result to the list of analyses.
 
 On `errors`, its grouped row only carries a count and first/last seen — `T`
 runs a second, `--verbose`-backed odoo-logs call scoped to that exact group

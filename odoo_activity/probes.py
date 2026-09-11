@@ -2536,13 +2536,14 @@ def neutralized_databases(port: str | PgTarget | None = None, host: Host = LOCAL
     return {row["db"]: bool(row.get("neutralized")) for row in rows or [] if row.get("db")}
 
 
-# odoo-logs's 9 commands, in the order the Logs Analysis tab lists them --
+# odoo-logs's 10 commands, in the order the Logs Analysis tab lists them --
 # see https://github.com/trobz/odoo-logs. `errors` first: it's the one
 # reason most likely to be why someone opened the tab.
 LOG_ANALYSIS_COMMANDS: tuple[str, ...] = (
     "errors",
     "crons",
     "logins",
+    "mails",
     "users",
     "usage",
     "passwords",
@@ -2558,6 +2559,7 @@ LOG_ANALYSIS_HELP: dict[str, str] = {
     "errors": "ERROR and CRITICAL entries, grouped by exception type and message.",
     "crons": "Cron timings, aggregated per cron job (ir_cron).",
     "logins": "Successful logins: who, which database, from where.",
+    "mails": "Outgoing emails, read off the SMTP debug log.",
     "users": "Login activity per user: how often, over how many days.",
     "usage": "What the instance's traffic was for: logins, rpc, polling, static.",
     "passwords": "Password changes: whose password, changed by whom, from where.",

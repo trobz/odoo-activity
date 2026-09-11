@@ -189,7 +189,9 @@ class StackDump(TypedDict):
 
 
 DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks", "params", "check-sensitive-information"]
-LogAnalysisCommand = Literal["errors", "crons", "logins", "users", "usage", "passwords", "jobs", "workers", "calls"]
+LogAnalysisCommand = Literal[
+    "errors", "crons", "logins", "mails", "users", "usage", "passwords", "jobs", "workers", "calls"
+]
 OdoolyScript = Literal["create_test_job", "restore_app_icons", "send_test_mail"]
 
 
@@ -556,15 +558,15 @@ def db_query(
 @mcp.tool()
 @_pinned_host
 def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Host) -> list[dict] | str:
-    """Run one of odoo-logs's 9 analyses against the instance's logfile and
-    its rotated `.gz` siblings: errors, cron history, logins, per-user
-    activity, traffic usage, password changes, queue_job lifecycle, worker
-    births/deaths, or request timing.
+    """Run one of odoo-logs's 10 analyses against the instance's logfile and
+    its rotated `.gz` siblings: errors, cron history, logins, outgoing mail,
+    per-user activity, traffic usage, password changes, queue_job lifecycle,
+    worker births/deaths, or request timing.
 
     Args:
         name: instance name as `list_instances` reports it.
-        command: errors, crons, logins, users, usage, passwords, jobs,
-            workers, or calls.
+        command: errors, crons, logins, mails, users, usage, passwords,
+            jobs, workers, or calls.
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
