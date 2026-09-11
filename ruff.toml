@@ -42,9 +42,11 @@ ignore = [
 extend-safe-fixes = ["UP008"]
 
 [lint.per-file-ignores]
-"tests/*" = ["S101"]
-# fixed-argv calls to systemctl/supervisorctl/ps/psql/odoo-db, not untrusted input
-"odoo_activity/probes.py" = ["S603", "S607"]
+"tests/*" = ["S101", "S108"]
+# fixed-argv calls to systemctl/supervisorctl/ps/psql/odoo-db, not untrusted
+# input (S603/S607); error_traceback's /tmp path is uuid4-suffixed, so it's
+# unpredictable rather than a shared/guessable name (S108)
+"odoo_activity/probes.py" = ["S603", "S607", "S108"]
 # dispatches argv built by probes.py's own fixed-argv calls (see above), plus `ssh`
 "odoo_activity/host.py" = ["S603", "S607"]
 # runs its own scripts as `sys.executable -m <module>` -- an absolute

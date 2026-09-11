@@ -15,10 +15,12 @@ import os
 import platform
 import re
 import select
+import shlex
 import signal
 import socket
 import subprocess
 import time
+import uuid
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -1342,6 +1344,33 @@ def logfile_of(inst: Instance, host: Host = LOCAL) -> Path | None:
     return _manager_of(inst).logfile(inst, host)
 
 
+_LOG_ROTATION_RE = re.compile(r"\.(\d+)(?:\.gz)?$")
+
+
+def instance_log_files(inst: Instance, host: Host = LOCAL) -> list[Path]:
+    """This instance's logfile plus its rotated siblings (`server.log.1`,
+    `server.log.2.gz`, ...), oldest rotation last.
+
+    odoo-logs's `LOGS` argument is typed `list[Path]` with Typer's
+    `exists=True` validation — it *validates* paths, it doesn't *find* them,
+    so something has to hand it every rotation already resolved. `logfile_of`
+    only ever resolves the one current file; this globs its directory for
+    the rest and orders them by rotation number, not by name (`.9` has to
+    sort before `.10`). Empty when there's no current logfile, or it doesn't
+    actually exist on disk — handing odoo-logs a missing path would refuse
+    the whole command, not just that one file.
+    """
+    base = logfile_of(inst, host)
+    if base is None or not host.is_file(base):
+        return []
+
+    rotated = sorted(
+        (p for p in host.glob(f"{base}.*") if p != str(base)),
+        key=lambda p: int(m.group(1)) if (m := _LOG_ROTATION_RE.search(p)) else 0,
+    )
+    return [base, *(Path(p) for p in rotated)]
+
+
 def _redirected_stdout(inst: Instance, host: Host = LOCAL) -> Path | None:
     """A directly-run instance's stdout when it was redirected to a file
     (`odoo-bin > server.log`) — the closest thing to a `logfile` for a runner
@@ -2505,6 +2534,179 @@ def neutralized_databases(port: str | PgTarget | None = None, host: Host = LOCAL
 
     rows, _raw = parse_odoo_db_output(stdout, stderr)
     return {row["db"]: bool(row.get("neutralized")) for row in rows or [] if row.get("db")}
+
+
+# odoo-logs's 10 commands, in the order the Logs Analysis tab lists them --
+# see https://github.com/trobz/odoo-logs. `errors` first: it's the one
+# reason most likely to be why someone opened the tab.
+LOG_ANALYSIS_COMMANDS: tuple[str, ...] = (
+    "errors",
+    "crons",
+    "logins",
+    "mails",
+    "users",
+    "usage",
+    "passwords",
+    "jobs",
+    "workers",
+    "calls",
+)
+
+# Each command's own first docstring line in odoo-logs's main.py (Typer's
+# own short-help convention) -- kept verbatim rather than paraphrased, so
+# this doesn't drift from what `odoo-logs <command> --help` actually says.
+LOG_ANALYSIS_HELP: dict[str, str] = {
+    "errors": "ERROR and CRITICAL entries, grouped by exception type and message.",
+    "crons": "Cron timings, aggregated per cron job (ir_cron).",
+    "logins": "Successful logins: who, which database, from where.",
+    "mails": "Outgoing emails, read off the SMTP debug log.",
+    "users": "Login activity per user: how often, over how many days.",
+    "usage": "What the instance's traffic was for: logins, rpc, polling, static.",
+    "passwords": "Password changes: whose password, changed by whom, from where.",
+    "jobs": "queue_job runner lifecycle and per-job events.",
+    "workers": "Worker births, deaths, timeouts and resource limits.",
+    "calls": "Request timings from werkzeug's access line, grouped by endpoint.",
+}
+
+# Same ballpark as Odoo's own worker limits (limit_memory_hard/limit_time_cpu)
+# -- odoo-logs gets no special treatment, just the same kind of ceiling a
+# runaway Odoo worker already gets.
+_LOG_ANALYSIS_MEMORY_MB = 1024
+_LOG_ANALYSIS_CPU_SECONDS = 60
+
+
+def start_odoo_logs(
+    command: str,
+    files: list[Path],
+    host: Host = LOCAL,
+    *,
+    verbose_file: str | None = None,
+    extra: tuple[str, ...] = (),
+) -> subprocess.Popen[str] | None:
+    """Start `odoo-logs --output-format json <command> <files...>`, memory-
+    and CPU-limited the way Odoo's own workers are.
+
+    odoo-logs runs as a real subprocess specifically so this is possible:
+    `resource.setrlimit(RLIMIT_AS/RLIMIT_CPU, ...)` is a per-*process* limit,
+    not a per-thread one, so there is no way to cap just this call if it ran
+    in-process the way `logfile_of`/`tail` do -- capping the call would cap
+    all of odoo-activity with it. `ulimit` in a wrapping shell applies the
+    same way local or over ssh, unlike `resource.setrlimit`, which only
+    reaches a process already running on this box.
+
+    `verbose_file`, when given, is odoo-logs's own `--verbose FILE` global
+    option (must precede the subcommand) -- the only way to get raw log text
+    back out of it, since the normal JSON output never carries more than a
+    command's own columns (see error_traceback). `extra` are command-specific
+    flags (e.g. `errors`'s `--traceback-only`), inserted after the command
+    name and before the file list.
+
+    Returns the live process rather than waiting on it, so a caller can
+    `.kill()` it if abandoned (e.g. the user picked a different analysis
+    before this one finished) — same shape as `start_odoo_db`.
+
+    Unlike `start_odoo_db`, a missing `odoo-logs` binary can't be caught
+    here as a `FileNotFoundError`: it's `sh` being exec'd, not `odoo-logs`
+    itself, so a missing binary only surfaces once the caller reads back
+    the shell's own "command not found" on stderr after the process exits
+    — the same degradation `start_odoo_db` already has for a missing
+    `odoo-db` over ssh. None only if `sh` itself can't be started.
+    """
+    argv = ["odoo-logs"]
+    if verbose_file:
+        argv += ["--verbose", verbose_file]
+    argv += ["--output-format", "json", command, *extra, *(str(f) for f in files)]
+    wrapped = (
+        f"ulimit -t {_LOG_ANALYSIS_CPU_SECONDS}; ulimit -v {_LOG_ANALYSIS_MEMORY_MB * 1024}; exec {shlex.join(argv)}"
+    )
+
+    try:
+        return host.popen(["sh", "-c", wrapped])
+    except FileNotFoundError:
+        return None
+
+
+# A log entry's own head line -- just enough to find where one entry ends
+# and the next begins in a `--verbose`-dumped file, not a full re-parse
+# (that stays odoo-logs's job). Matches patterns.py's own TIME group.
+_LOG_LINE_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} ", re.MULTILINE)
+# odoo-logs's own `_squash()` replaces a parenthesised pid/record-id with
+# this literal before grouping -- reversed below so the search pattern
+# matches the real number instead.
+_SQUASHED_ID = re.escape("(N)")
+
+
+def error_traceback(files: list[Path], error_type: str, error: str, host: Host = LOCAL) -> str:
+    """The full traceback text behind one `errors` group.
+
+    odoo-logs's grouped `errors` row keeps only a count and first/last
+    timestamps (see LOG_ANALYSIS_HELP) -- the traceback itself never reaches
+    the command's normal JSON output: `errors()` always ends by calling
+    `_emit_grouped()` regardless of `--traceback-only` (that flag only
+    narrows which entries get counted, it doesn't change the output shape).
+    The only way to get the raw text back out is odoo-logs's own `--verbose
+    FILE` global option, which writes the entries behind the output to a
+    file instead of returning them on stdout.
+
+    `error_type`/`error` come straight off the grouped row, so `error` is
+    already squashed by odoo-logs's `_squash()` (a real pid/record-id in
+    parentheses replaced with the literal "(N)") -- the search pattern
+    reverses that back into `\\d+`, or a real id in the raw text would never
+    match the literal "(N)".
+
+    Empty if odoo-logs found nothing (wrong types/errors, no traceback
+    survived `--traceback-only`, or odoo-logs isn't on PATH -- all
+    indistinguishable here, same degradation as start_odoo_logs's own
+    missing-binary case).
+    """
+    verbose_path = f"/tmp/oa-errors-{os.getpid()}-{uuid.uuid4().hex}.log"
+
+    proc = start_odoo_logs("errors", files, host, verbose_file=verbose_path, extra=("--traceback-only",))
+    if proc is None:
+        return ""
+
+    try:
+        try:
+            proc.communicate(timeout=90)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return ""
+
+        try:
+            text = host.read_text(verbose_path)
+        except OSError:
+            return ""
+
+        return _matching_traceback_blocks(text, error_type, error)
+    finally:
+        # unconditional: odoo-logs may have written it even on a path above
+        # that returns early, and `-f` makes this a no-op otherwise
+        host.run(["rm", "-f", verbose_path])
+
+
+def _matching_traceback_blocks(text: str, error_type: str, error: str) -> str:
+    """The entries in `text` (a `--verbose`-dumped file) whose own exception
+    line matches `error_type`/`error` -- the exact line odoo-logs's
+    `EXCEPTION_RE` produced them from in the first place, so this is a
+    lookup, not a guess."""
+    starts = [m.start() for m in _LOG_LINE_START_RE.finditer(text)]
+    if not starts:
+        # empty (or head-line-less) dump -- e.g. --traceback-only kept
+        # nothing at all, every entry in scope was a single-line ERROR with
+        # no Traceback. `zip(starts, [*starts[1:], len(text)], strict=True)`
+        # below would otherwise raise: starts[1:] is also [] here, so the
+        # second list still gets one element (len(text)) against zero.
+        return ""
+
+    fingerprint = re.escape(error_type)
+    if error:
+        fingerprint += ": " + re.escape(error).replace(_SQUASHED_ID, r"\(\d+\)")
+    needle = re.compile(fingerprint, re.MULTILINE)
+
+    bounds = zip(starts, [*starts[1:], len(text)], strict=True)
+    blocks = [text[start:end] for start, end in bounds]
+
+    return "".join(block for block in blocks if needle.search(block))
 
 
 def table_columns(rows: list[dict]) -> list[str]:

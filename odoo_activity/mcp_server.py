@@ -189,6 +189,9 @@ class StackDump(TypedDict):
 
 
 DbQueryCommand = Literal["modules", "crons", "jobs", "users", "locks", "params", "check-sensitive-information"]
+LogAnalysisCommand = Literal[
+    "errors", "crons", "logins", "mails", "users", "usage", "passwords", "jobs", "workers", "calls"
+]
 OdoolyScript = Literal["create_test_job", "restore_app_icons", "send_test_mail"]
 
 
@@ -550,6 +553,73 @@ def db_query(
 
     rows, raw = probes.parse_odoo_db_output(*result)
     return rows if rows is not None else raw
+
+
+@mcp.tool()
+@_pinned_host
+def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Host) -> list[dict] | str:
+    """Run one of odoo-logs's 10 analyses against the instance's logfile and
+    its rotated `.gz` siblings: errors, cron history, logins, outgoing mail,
+    per-user activity, traffic usage, password changes, queue_job lifecycle,
+    worker births/deaths, or request timing.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        command: errors, crons, logins, mails, users, usage, passwords,
+            jobs, workers, or calls.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return "(no such instance)"
+
+    files = probes.instance_log_files(inst, target)
+    if not files:
+        return "(no log file found)"
+
+    proc = probes.start_odoo_logs(command, files, target)
+    if proc is None:
+        return "(couldn't start odoo-logs)"
+
+    try:
+        result = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "(odoo-logs timed out after 90s)"
+
+    rows, raw = probes.parse_odoo_db_output(*result)
+    return rows if rows is not None else raw
+
+
+@mcp.tool()
+@_pinned_host
+def instance_error_traceback(name: str, error_type: str, error: str, *, target: Host) -> str:
+    """The full traceback text behind one row of
+    `instance_log_analysis(name, "errors")` -- that row only carries a count
+    and first/last seen timestamps, never the traceback itself, since
+    odoo-logs's `errors` command has no flag that puts one in its normal
+    output; this runs a second, `--verbose`-backed call scoped to the exact
+    entry the row came from.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        error_type: the row's own `type` field, verbatim.
+        error: the row's own `error` field, verbatim.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return "(no such instance)"
+
+    files = probes.instance_log_files(inst, target)
+    if not files:
+        return "(no log file found)"
+
+    return probes.error_traceback(files, error_type, error, target) or "(no matching traceback found)"
 
 
 @mcp.tool()
