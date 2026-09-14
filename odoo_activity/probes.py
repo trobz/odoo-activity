@@ -1753,7 +1753,7 @@ def proc_cpu_ticks_many(pids: list[str], host: Host = LOCAL) -> dict[str, int | 
 def _ps_snapshot(host: Host) -> tuple[dict[str, ProcRow], dict[str, list[str]]]:
     """One `ps -eo` call, indexed by pid and by ppid -> children -- shared by
     every walker below that needs the descendant tree of a known root pid."""
-    lines = host.run(["ps", "-eo", "pid,ppid,user,%mem,nice,args"]).stdout.splitlines()[1:]  # drop header
+    lines = host.run(["ps", "-ww", "-eo", "pid,ppid,user,%mem,nice,args"]).stdout.splitlines()[1:]  # drop header
 
     by_pid: dict[str, ProcRow] = {}
     children: dict[str, list[str]] = {}

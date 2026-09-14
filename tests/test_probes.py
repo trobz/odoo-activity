@@ -615,3 +615,13 @@ def test_neutralized_databases_answers_nothing_when_odoo_db_cannot(monkeypatch):
     monkeypatch.setattr(Host, "popen", hanging)
     assert probes.neutralized_databases(None, Host()) == {}
     assert killed == [True]  # not left running behind us
+
+
+def test_ps_snapshot_requests_unlimited_width(monkeypatch):
+    """`-ww` -- otherwise procps truncates `args` to $COLUMNS, silently
+    cutting a long instance's -c/--logfile off the end."""
+    calls = _recorder(monkeypatch, stdout="PID PPID USER %MEM NICE ARGS\n")
+
+    probes._ps_snapshot(Host())
+
+    assert calls == [["ps", "-ww", "-eo", "pid,ppid,user,%mem,nice,args"]]
