@@ -505,8 +505,16 @@ def long_queries(db: str, port: str | None = None, *, target: Host) -> list[dict
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
+
+    Raises:
+        ValueError: the query didn't run (postgres unreachable, ...) --
+            an idle database answers an empty list instead.
     """
-    return probes.long_queries(db, port, target)
+    rows, error = probes.long_queries(db, port, target)
+    if rows is None:
+        raise ValueError(error)
+
+    return rows
 
 
 @mcp.tool()

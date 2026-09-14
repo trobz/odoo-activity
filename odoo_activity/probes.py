@@ -1434,19 +1434,13 @@ _LONG_QUERIES_SQL = (
 )
 
 
-def long_queries(db: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> list[dict]:
+def long_queries(db: str, port: str | PgTarget | None = None, host: Host = LOCAL) -> tuple[list[dict] | None, str]:
     """Non-idle queries on `db`, longest-running first, via psql on `port`.
 
     odoo-db has no equivalent command; this queries pg_stat_activity
     directly instead, the same way databases_by_role reads pg_database.
     """
-    cmd = PgTarget.of(port).psql("-d", "postgres", "-v", f"db={db}", "-tA", "-f", "-")
-    out = host.run(cmd, input_text=_LONG_QUERIES_SQL).stdout
-
-    try:
-        return json.loads(out.strip()) or []
-    except (json.JSONDecodeError, ValueError):
-        return []
+    return _psql_json(_LONG_QUERIES_SQL, "postgres", {"db": db}, port, host)
 
 
 def _psql_json(

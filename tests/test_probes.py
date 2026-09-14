@@ -625,3 +625,23 @@ def test_ps_snapshot_requests_unlimited_width(monkeypatch):
     probes._ps_snapshot(Host())
 
     assert calls == [["ps", "-ww", "-eo", "pid,ppid,user,%mem,nice,args"]]
+
+
+def test_an_unreachable_postgres_is_not_an_idle_database(monkeypatch):
+    """Both answer nothing on stdout -- `json_agg` over no rows is SQL NULL,
+    which psql prints as nothing, and a connection that never opened prints
+    nothing either. Only the exit code tells them apart, and Queries is the
+    first tab a database row shows."""
+    monkeypatch.setattr(
+        Host,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(
+            returncode=2, stdout="", stderr='psql: error: connection to server on socket "..." failed\n'
+        ),
+    )
+    rows, error = probes.long_queries("demo", None, Host())
+    assert rows is None
+    assert "connection to server" in error
+
+    monkeypatch.setattr(Host, "run", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    assert probes.long_queries("demo", None, Host()) == ([], "")
