@@ -1024,11 +1024,9 @@ DB_ROLE = os.environ.get("ODOO_ACTIVITY_DB_ROLE", "")
 class PgTarget:
     """Where an instance's postgres is, for every psql/odoo-db call below.
 
-    A bare `port` is all the other managers ever need: their postgres runs
-    on the same box as the odoo process, reachable over the default socket
-    or localhost. A container's does not — it sits on the compose network
-    with its own address, role and password — so those three ride along
-    here rather than being re-derived at each call site.
+    A bare `port` is the socket on the box's own cluster. Reaching postgres
+    over TCP — a config naming `db_host`, a container on the compose
+    network — needs its address, role and password to ride along too.
 
     Values go out as an `env K=V` prefix rather than subprocess's `env=`
     kwarg, so one argv works local or over ssh (`start_odoo_db` already
@@ -1138,12 +1136,11 @@ def _container_env(container: str | None, host: Host = LOCAL) -> dict[str, str]:
 def pg_target_of(inst: Instance, host: Host = LOCAL, parser: configparser.RawConfigParser | None = None) -> PgTarget:
     """The instance's postgres, as the db-tab probes need it.
 
-    Every manager but docker resolves to a port on the local cluster (see
-    `db_port_of`). Docker's postgres is a container: the address comes from
-    the compose network, the role and password from the odoo config that
-    the odoo container is itself connecting with (falling back to its
-    environment, which is where the official image keeps them) — so the TUI
-    reaches the database exactly the way the instance does.
+    Read off the odoo config the instance is itself connecting with, so the
+    TUI reaches the database exactly the way the instance does. Docker's
+    postgres is a container: the address comes from the compose network
+    instead, and the role and password fall back to its environment, which
+    is where the official image keeps them.
     """
     return _manager_of(inst).pg_target(inst, host, parser)
 
@@ -1398,17 +1395,12 @@ def databases_of(inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | N
     """(databases, db_port) for the instance — its authoritative members and
     the postgres port they live on (instances may run on different clusters).
 
-    The odoo config gives both the role (db_user — locally `openerp`, in prod
-    the instance's own role) and the db_port, so we query the right role on the
-    right postgres cluster.
+    The odoo config gives the role (db_user — locally `openerp`, in prod the
+    instance's own role) and, through `pg_target_of`, where to ask it: the
+    right role on the right postgres cluster.
 
     odoo.sh is a single env-provided db (`PGDATABASE`), not role-queried —
     there's no `databases_by_role` dance since there's exactly one db.
-
-    Reads `db_port` off the same parser as `db_user` rather than calling
-    `db_port_of` (which would re-fetch and re-parse the config from
-    scratch) — cheap to duplicate locally, but each fetch is its own ssh
-    round trip remotely.
     """
     return _manager_of(inst).databases(inst, host)
 

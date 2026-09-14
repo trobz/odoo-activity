@@ -645,3 +645,45 @@ def test_an_unreachable_postgres_is_not_an_idle_database(monkeypatch):
 
     monkeypatch.setattr(Host, "run", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="", stderr=""))
     assert probes.long_queries("demo", None, Host()) == ([], "")
+
+
+def test_db_host_decides_whether_the_configs_credentials_are_used(monkeypatch):
+    """`db_host` set means odoo is on TCP, so the probes need its credentials
+    too; unset means the socket, which authenticates by peer -- forcing
+    `db_user` there would connect as the instance's role instead."""
+    config = {"db_host": "localhost", "db_user": "openerp", "db_password": "openerp"}
+    monkeypatch.setattr(probes, "instance_config", lambda *_: (Path("/opt/odoo"), _parser(config)))
+    assert probes.pg_target_of(_INSTANCE, Host()) == probes.PgTarget(
+        host="localhost",
+        user="openerp",
+        password="openerp",  # noqa: S106 -- fixture, not a real credential
+    )
+
+    del config["db_host"]
+    assert probes.pg_target_of(_INSTANCE, Host()) == probes.PgTarget()
+
+
+def test_the_database_list_is_asked_over_the_same_target_as_the_db_tabs(monkeypatch):
+    """A pinned `db_name` answers without a query, so only an unpinned
+    instance reaches postgres here -- and it has to arrive the way every
+    other db probe does, or the list comes back empty from the wrong
+    cluster while the tabs read the right one."""
+    monkeypatch.setattr(
+        probes,
+        "instance_config",
+        lambda *_: (
+            Path("/opt/odoo"),
+            _parser({"db_host": "localhost", "db_user": "openerp", "db_password": "openerp"}),
+        ),
+    )
+    asked: list[object] = []
+    monkeypatch.setattr(probes, "databases_by_role", lambda role, target, *_a: asked.append(target) or ["demo"])
+
+    assert probes.databases_of(_INSTANCE, Host()) == (["demo"], None)
+    assert asked == [
+        probes.PgTarget(
+            host="localhost",
+            user="openerp",
+            password="openerp",  # noqa: S106 -- fixture, not a real credential
+        )
+    ]
