@@ -66,6 +66,14 @@ _SSH_OPTS = [
     "ServerAliveCountMax=2",
 ]
 
+# sshd runs our command through the box's login shell -- dash, on odoo.sh --
+# which, unlike bash, won't expand a literal `~` in PATH at lookup time. That
+# hides tools odoo.sh installs under `~/.local/bin`. Mirrors probes.py's own
+# expansion, applied here since this PATH is the remote shell's, not ours.
+# `||` matters: a failed sed would blank PATH instead of leaving it alone,
+# turning "one tool missing" into "every remote command dies".
+_REMOTE_PATH_FIX = 'PATH="$(printf %s "$PATH" | sed "s#^~#$HOME#; s#:~#:$HOME#g" || printf %s "$PATH")"'
+
 
 # subprocess inherits our stdin, which is the terminal Textual reads keys
 # from, and ssh forwards stdin to the remote command (BatchMode only stops
@@ -120,7 +128,7 @@ class Host:
         if self.alias is None:
             return argv
         port_opts = ["-p", str(self.port)] if self.port else []
-        return ["ssh", *_SSH_OPTS, *port_opts, self.alias, shlex.join(argv)]
+        return ["ssh", *_SSH_OPTS, *port_opts, self.alias, f"{_REMOTE_PATH_FIX} {shlex.join(argv)}"]
 
     def shell_invocation(self, cmd: str) -> str:
         """`cmd` as the user should paste it into their own terminal to

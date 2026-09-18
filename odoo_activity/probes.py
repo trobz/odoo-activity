@@ -440,8 +440,12 @@ _OUR_TOOLS = ("odoo-activity", "odoo-config", "odoo-db", "odoo-addons-path")
 # 1234`. It replaces argv wholesale, so none of the entry-point/flag tests
 # below match it -- the prefix is the whole evidence, and it is odoo's own.
 _ODOO_TITLE_PREFIX = "odoo: "
+# odoo.sh's pid-1 init, its own proctitle: `ODOO.SH: [<build> / dev / 18.0]`.
+# Runs the build's odoo directly; `odoosh_instances` already lists that build
+# (one host = one build), so this root shouldn't also show up here.
+_ODOOSH_INIT = "ODOO.SH:"
 # a root owned by one of these is already listed by that manager
-_MANAGER_PARENTS = ("systemd --user", "supervisord")
+_MANAGER_PARENTS = ("systemd --user", "supervisord", _ODOOSH_INIT)
 # a containerized odoo is `docker_instances`' to list, not this manager's:
 # it needs the container's own pid namespace and filesystem, and a compose
 # project to act on (see docker_instances). Excluded here so it isn't
@@ -624,11 +628,17 @@ def _owned_by_manager(parent: ProcRow, cgroup: str | None) -> bool:
     (it has no unit), losing the instance entirely. The cgroup is what
     doesn't move on reparenting, so that's what decides. supervisord reaps
     nothing, so being its child is ownership enough.
+
+    odoo.sh's init also reaps orphans, with no cgroup test to tell one from
+    the build's own odoo -- dropped the same way. One host is one build, and
+    double-listing it is worse than the rare true orphan getting hidden.
     """
     if not any(mgr in parent["cmd"] for mgr in _MANAGER_PARENTS):
         return False
 
-    return "supervisord" in parent["cmd"] or _runs_under_unit(cgroup or "")
+    # only systemd gets the cgroup test: supervisord reaps nothing, and
+    # odoo.sh's init has no such test to give it (see above)
+    return _runs_under_unit(cgroup or "") if "systemd --user" in parent["cmd"] else True
 
 
 def local_instances(host: Host = LOCAL) -> list[Instance]:
@@ -638,8 +648,9 @@ def local_instances(host: Host = LOCAL) -> list[Instance]:
     The other three managers each have a registry to ask (unit properties,
     conf.d + supervisorctl, build env vars); here the process *is* the
     identity, and its argv stands in for the config a registry would name.
-    Roots owned by systemd or supervisord are dropped, since those already
-    list themselves; so are containerized ones, unless `ODOO_ACTIVITY_DOCKER=1`.
+    Roots owned by systemd, supervisord or odoo.sh's init are dropped, since
+    those already list themselves; so are containerized ones, unless
+    `ODOO_ACTIVITY_DOCKER=1`.
 
     A wrapper that execs odoo in a venv (`pew in <venv> odoo ...`) matches
     too and becomes the root instead of the odoo process it spawned, so

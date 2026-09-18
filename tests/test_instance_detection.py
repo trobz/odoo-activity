@@ -16,6 +16,13 @@ _EGG = "/home/x/venvs/venv-odoo18/bin/python /home/x/venvs/venv-odoo18/bin/odoo 
 _BIN = "python3 /home/x/demo/18.0/odoo/odoo-bin --config config/local.conf -d demo"
 _SUPERVISED = "/home/x/venvs/demo/bin/python odoo/odoo-bin --config config/supervisor.conf -d prod"
 _WRAPPER = "/usr/bin/python3 /home/x/.local/bin/pew in venv-odoo18 /home/x/venvs/venv-odoo18/bin/odoo -d v18c_queue"
+# odoo.sh: the platform runs odoo straight off pid 1, and puts the subcommand
+# *after* the flags, unlike every argv above
+_ODOOSH = (
+    "python3 /home/odoo/src/odoo/odoo-bin --addons-path=/home/odoo/src/odoo/addons"
+    " server --database=acme-odoo-main-123 --config /home/odoo/.config/odoo/odoo.conf"
+)
+_ODOOSH_INIT = "ODOO.SH: [acme-odoo-main-123 / dev / 18.0]"
 
 _SCOPE_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vte-spawn-ab-cd.scope\n"
 _UNIT_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/odoo-demo.service\n"
@@ -158,6 +165,17 @@ def test_unreadable_cgroup_keeps_the_parent_based_answer(monkeypatch):
     by_pid = {"100": _row("100", "20", _EGG), "20": _row("20", "1", "/lib/systemd/systemd --user")}
     monkeypatch.setattr(probes, "_ps_snapshot", lambda *_: (by_pid, {}))
     monkeypatch.setattr(Host, "read_text", lambda *_: "")  # what a remote `cat` failure looks like
+
+    assert probes.local_instances(Host()) == []
+
+
+def test_odoosh_build_is_not_also_a_directly_run_instance(monkeypatch):
+    """odoo.sh runs the build's odoo straight off pid 1, whose proctitle is the
+    only thing naming the platform. Without that in `_MANAGER_PARENTS` the box
+    listed its one build twice — once as `odoosh`, once here — and only while
+    the build was awake, since a sleeping build has no process to scan."""
+    by_pid = {"100": _row("100", "1", _ODOOSH), "1": _row("1", "0", _ODOOSH_INIT)}
+    monkeypatch.setattr(probes, "_ps_snapshot", lambda *_: (by_pid, {}))
 
     assert probes.local_instances(Host()) == []
 

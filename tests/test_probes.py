@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pyperclip
 
 from odoo_activity import managers, probes
-from odoo_activity.host import Host
+from odoo_activity.host import _REMOTE_PATH_FIX, Host
 from odoo_activity.probes import Instance
 
 _INSTANCE: Instance = {"name": "demo", "status": "running", "uptime": "0:01:00", "manager": "systemd"}
@@ -219,7 +219,7 @@ def test_container_host_wraps_argv_and_stops_being_local():
 
     remote = Host(alias="server").in_container("acme-odoo-1")
     assert remote._argv(["kill", "-3", "1"])[:3] == ["ssh", "-o", "BatchMode=yes"]
-    assert remote._argv(["kill", "-3", "1"])[-1] == "docker exec acme-odoo-1 kill -3 1"
+    assert remote._argv(["kill", "-3", "1"])[-1] == f"{_REMOTE_PATH_FIX} docker exec acme-odoo-1 kill -3 1"
 
     assert local.on_box.container is None
     assert Host().in_container(None) == Host()  # nothing to narrow, nothing changes
