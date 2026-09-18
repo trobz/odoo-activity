@@ -167,26 +167,37 @@ class Manager:
     def databases(self, inst: Instance, host: Host = LOCAL) -> tuple[list[str], str | None]:
         """(databases, postgres port) for this instance.
 
-        Read off one parser rather than calling `db_port_of`, which would
-        re-fetch and re-parse the config: cheap to duplicate locally, but
-        each fetch is its own ssh round trip remotely.
+        Asked over the same target the db tabs use, off one parser: each
+        config fetch is its own ssh round trip remotely.
         """
         _, parser = probes.instance_config(inst, host)
-        port = probes._opt(parser, "db_port")
+        target = self.pg_target(inst, host, parser)
         # ODOO_ACTIVITY_DB_ROLE describes *this box's* cluster convention
         # (locally every db is owned by `openerp`), so it wins where set;
         # else the config names the role odoo connects as, and the
         # instance's own name is the last resort.
         role = probes.DB_ROLE or probes._opt(parser, "db_user") or inst["name"].removesuffix(".service")
 
-        return probes.databases_by_role(role, port, host), port
+        return probes.databases_by_role(role, target, host), target.port
 
     def pg_target(
         self, inst: Instance, host: Host = LOCAL, parser: configparser.RawConfigParser | None = None
     ) -> probes.PgTarget:
         """Where this instance's postgres is, as the db-tab probes need it.
 
-        A port on the box's own cluster, for every manager whose instance
-        shares that cluster.
+        A bare port for a socket on the box's own cluster, or the full TCP
+        target -- host, user, password -- when the config names `db_host`.
         """
-        return probes.PgTarget(port=probes.db_port_of(inst, host))
+        if parser is None:
+            _, parser = probes.instance_config(inst, host)
+
+        db_host, port = probes._opt(parser, "db_host"), probes._opt(parser, "db_port")
+        if not db_host:
+            return probes.PgTarget(port=port)
+
+        return probes.PgTarget(
+            host=db_host,
+            port=port,
+            user=probes._opt(parser, "db_user"),
+            password=probes._opt(parser, "db_password"),
+        )
