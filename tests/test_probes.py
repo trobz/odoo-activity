@@ -924,3 +924,231 @@ def test_the_database_list_is_asked_over_the_same_target_as_the_db_tabs(monkeypa
             password="openerp",  # noqa: S106 -- fixture, not a real credential
         )
     ]
+
+
+def test_wkhtmltopdf_version_strips_and_returns_stdout(monkeypatch):
+    _recorder(monkeypatch, stdout="wkhtmltopdf 0.12.6.1\n", returncode=0)
+    assert probes.wkhtmltopdf_version(Host()) == "wkhtmltopdf 0.12.6.1"
+
+
+def test_wkhtmltopdf_version_none_when_not_on_path(monkeypatch):
+    _recorder(monkeypatch, stdout="", returncode=127)
+    assert probes.wkhtmltopdf_version(Host()) is None
+
+
+def test_pdf_pip_packages_none_when_instance_not_running(monkeypatch):
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    assert probes.pdf_pip_packages(_INSTANCE, Host()) is None
+
+
+def test_pdf_pip_packages_none_when_no_venv_resolves(monkeypatch):
+    monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {})
+    assert probes.pdf_pip_packages(_INSTANCE, Host()) is None
+
+
+def test_pdf_pip_packages_greps_pip_freeze_in_the_instance_venv(monkeypatch):
+    monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/pip")
+    calls = _recorder(monkeypatch, stdout="pypdf==4.0.0\nreportlab==4.1.0\n", returncode=0)
+
+    result = probes.pdf_pip_packages(_INSTANCE, Host())
+
+    assert result == ["pypdf==4.0.0", "reportlab==4.1.0"]
+    assert calls == [["sh", "-c", "/venv/bin/pip freeze | grep -i pdf"]]
+
+
+def test_pdf_pip_packages_none_when_grep_finds_nothing(monkeypatch):
+    monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/pip")
+    # grep with no match exits 1 -- pdf_pip_packages must not treat that as
+    # an error and must still return None, not raise or propagate the
+    # nonzero code.
+    _recorder(monkeypatch, stdout="", returncode=1)
+
+    assert probes.pdf_pip_packages(_INSTANCE, Host()) is None
+
+
+# ---------------------------------------------------------------------------
+# Reports tab: Capture
+# ---------------------------------------------------------------------------
+
+# The literal "/tmp/..." paths throughout this section are fixture strings
+# standing in for a *remote* process's argv (ps output) or a fully-mocked
+# Host.read_text -- never a real local temp-file write -- hence the S108
+# ("insecure /tmp usage") suppressions below.
+_WKHTMLTOPDF_CMD = (
+    "/usr/local/bin/wkhtmltopdf --disable-local-file-access --quiet --page-size A4 "
+    "--margin-top 10.0 --dpi 90 --header-spacing 35 --orientation Landscape "
+    "--javascript-delay 1000 "
+    "--cookie-jar /tmp/report.cookie_jar.tmp.n3k4x7ps.txt "
+    "--header-html /tmp/report.header.tmp.gvo5wrmp.html "
+    "--footer-html /tmp/report.footer.tmp.oi56g8_k.html "
+    "/tmp/report.body.tmp.0.bg1_8j7e.html /tmp/report.test04.pdf"
+)
+
+
+def test_parse_wkhtmltopdf_argv_extracts_temp_files_and_positionals():
+    result = probes.parse_wkhtmltopdf_argv(_WKHTMLTOPDF_CMD)
+
+    assert result == {
+        "cookie_jar": "/tmp/report.cookie_jar.tmp.n3k4x7ps.txt",
+        "header_html": "/tmp/report.header.tmp.gvo5wrmp.html",
+        "footer_html": "/tmp/report.footer.tmp.oi56g8_k.html",
+        "body_html": "/tmp/report.body.tmp.0.bg1_8j7e.html",
+        "output_pdf": "/tmp/report.test04.pdf",
+    }
+
+
+def test_parse_wkhtmltopdf_argv_missing_flags_are_absent_not_crashing():
+    # a minimal command with no header/footer (a report can be defined
+    # without either) -- absent keys, not empty strings or a KeyError
+    cmd = "/usr/local/bin/wkhtmltopdf --quiet /tmp/body.html /tmp/out.pdf"
+    result = probes.parse_wkhtmltopdf_argv(cmd)
+
+    assert result == {
+        "body_html": "/tmp/body.html",
+        "output_pdf": "/tmp/out.pdf",
+    }
+    assert "cookie_jar" not in result
+    assert "header_html" not in result
+
+
+def test_parse_report_html_finds_base_href_and_known_css_links():
+    html = (
+        "<html><head>"
+        '<base href="http://odoo-foodcoop18-staging:8069/">'
+        '<link rel="stylesheet" href="/web/assets/1/web.report_assets_pdf.min.css">'
+        '<link rel="stylesheet" href="/web/assets/2/web.report_assets_common.min.css">'
+        '<link rel="stylesheet" href="/web/assets/3/unrelated.css">'
+        "</head><body>hi</body></html>"
+    )
+    result = probes.parse_report_html(html)
+
+    assert result["base_href"] == "http://odoo-foodcoop18-staging:8069/"
+    assert result["css_links"] == [
+        "/web/assets/1/web.report_assets_pdf.min.css",
+        "/web/assets/2/web.report_assets_common.min.css",
+    ]
+
+
+def test_parse_report_html_empty_results_on_a_body_with_neither():
+    result = probes.parse_report_html("<html><body>no base, no css</body></html>")
+    assert result == {"base_href": None, "css_links": []}
+
+
+def test_backup_wkhtmltopdf_capture_saves_temp_files_and_parses_body(monkeypatch, tmp_path):
+    files = {
+        "/tmp/report.cookie_jar.tmp.n3k4x7ps.txt": "cookie-jar-contents",
+        "/tmp/report.header.tmp.gvo5wrmp.html": "<html>header</html>",
+        "/tmp/report.footer.tmp.oi56g8_k.html": "<html>footer</html>",
+        "/tmp/report.body.tmp.0.bg1_8j7e.html": (
+            '<html><head><base href="http://stale.example.com/">'
+            '<link href="/web/assets/1/web.report_assets_pdf.min.css"></head><body/></html>'
+        ),
+    }
+    monkeypatch.setattr(Host, "read_text", lambda _self, path: files[path])
+
+    proc: probes.ProcRow = {
+        "pid": "4242",
+        "ppid": "1",
+        "user": "odoo",
+        "mem": "0.5",
+        "nice": "0",
+        "cmd": _WKHTMLTOPDF_CMD,
+    }
+    backup_dir = tmp_path / "capture"
+    report = probes.backup_wkhtmltopdf_capture(proc, Host(), backup_dir)
+
+    assert report["pid"] == "4242"
+    assert report["cmd"] == _WKHTMLTOPDF_CMD
+    assert report["backup_dir"] == str(backup_dir)
+    assert report["base_href"] == "http://stale.example.com/"
+    assert report["css_links"] == ["/web/assets/1/web.report_assets_pdf.min.css"]
+
+    # the actual files landed on disk, under their original basenames
+    assert (backup_dir / "report.cookie_jar.tmp.n3k4x7ps.txt").read_text() == "cookie-jar-contents"
+    assert (backup_dir / "report.header.tmp.gvo5wrmp.html").read_text() == "<html>header</html>"
+
+
+def test_backup_wkhtmltopdf_capture_skips_unreadable_files_without_raising(tmp_path, monkeypatch):
+    # the cookie jar is already gone (Odoo deleted it before we got there);
+    # a partial backup is still useful, not a hard failure
+    def flaky_read_text(_self, path):
+        if "cookie_jar" in path:
+            raise OSError("gone")
+        return "<html><body/></html>"
+
+    monkeypatch.setattr(Host, "read_text", flaky_read_text)
+
+    proc: probes.ProcRow = {"pid": "1", "ppid": "1", "user": "odoo", "mem": "0", "nice": "0", "cmd": _WKHTMLTOPDF_CMD}
+    report = probes.backup_wkhtmltopdf_capture(proc, Host(), tmp_path / "capture")
+
+    assert not (tmp_path / "capture" / "report.cookie_jar.tmp.n3k4x7ps.txt").exists()
+    assert (tmp_path / "capture" / "report.header.tmp.gvo5wrmp.html").exists()
+    assert report["base_href"] is None  # body parsed fine, just has no <base>
+
+
+def _fake_wkhtmltopdf(tmp_path: Path) -> Path:
+    """Stands in for wkhtmltopdf: reports the argv it got and what the
+    header/body files it was pointed at contain, then writes the output PDF
+    -- enough to see what a replay actually ran against."""
+    script = tmp_path / "wkhtmltopdf"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "argv = sys.argv[1:]\n"
+        "header = argv[argv.index('--header-html') + 1]\n"
+        "open(argv[-1], 'w').close()\n"
+        "print(json.dumps({'argv': argv, 'header': open(header).read(), 'body': open(argv[-2]).read()}))\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _backed_up(tmp_path: Path) -> Path:
+    backup_dir = tmp_path / "capture"
+    backup_dir.mkdir()
+    (backup_dir / "report.cookie_jar.tmp.n3k4x7ps.txt").write_text("session_id=gone")
+    (backup_dir / "report.header.tmp.gvo5wrmp.html").write_text("<html>header</html>")
+    (backup_dir / "report.footer.tmp.oi56g8_k.html").write_text("<html>footer</html>")
+    (backup_dir / "report.body.tmp.0.bg1_8j7e.html").write_text("<html>body</html>")
+    return backup_dir
+
+
+def test_reproduce_wkhtmltopdf_replays_against_the_backup_on_the_host(tmp_path):
+    """Odoo deletes the temp files as soon as wkhtmltopdf exits, so a replay
+    of the command as caught would read files that are gone. It runs against
+    the backed-up copies instead, from a temp dir it removes afterwards --
+    and leaves nothing at the original /tmp paths (no stray cookie jar)."""
+    script = _fake_wkhtmltopdf(tmp_path)
+    cmd = _WKHTMLTOPDF_CMD.replace("/usr/local/bin/wkhtmltopdf", str(script))
+
+    result = probes.reproduce_wkhtmltopdf(cmd, _backed_up(tmp_path), Host())
+
+    assert result.returncode == 0, result.stderr
+    ran = json.loads(result.stdout)
+    assert (ran["header"], ran["body"]) == ("<html>header</html>", "<html>body</html>")
+    # every temp path moved into one workdir, the non-path flags untouched
+    workdir = Path(ran["argv"][-1]).parent
+    assert [Path(arg).parent for arg in ran["argv"] if "/report." in arg] == [workdir] * 5
+    assert ran["argv"][:2] == ["--disable-local-file-access", "--quiet"]
+    assert not workdir.exists()
+    assert not Path("/tmp/report.cookie_jar.tmp.n3k4x7ps.txt").exists()
+
+
+def test_reproduce_wkhtmltopdf_refuses_a_backup_missing_the_body(tmp_path):
+    """Without the body there is nothing faithful to replay -- running
+    anyway is what gave the misleading `HostNotFoundError`."""
+    script = _fake_wkhtmltopdf(tmp_path)
+    cmd = _WKHTMLTOPDF_CMD.replace("/usr/local/bin/wkhtmltopdf", str(script))
+    backup_dir = _backed_up(tmp_path)
+    (backup_dir / "report.body.tmp.0.bg1_8j7e.html").unlink()
+
+    result = probes.reproduce_wkhtmltopdf(cmd, backup_dir, Host())
+
+    assert result.returncode == 1
+    assert "body_html" in result.stderr
+    assert result.stdout == ""  # never ran

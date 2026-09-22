@@ -30,6 +30,7 @@ from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.mail import render_mail
 from odoo_activity.panes.neutralization import render_neutralization
 from odoo_activity.panes.processes import render_processes
+from odoo_activity.panes.reports import render_reports_diagnostics
 from odoo_activity.panes.stacks import filter_workers, render_stacks
 from odoo_activity.probes import (
     ALL_ROW_FLAGS,
@@ -57,6 +58,7 @@ from odoo_activity.probes import (
     long_queries,
     odoo_pid_for_port,
     parse_odoo_db_output,
+    pdf_pip_packages,
     pg_client_port,
     pg_target_of,
     proc_cpu_ticks_many,
@@ -72,6 +74,7 @@ from odoo_activity.probes import (
     stringify,
     table_columns,
     try_local_clipboard,
+    wkhtmltopdf_version,
 )
 
 if TYPE_CHECKING:
@@ -99,10 +102,13 @@ def _inst_key(inst: Instance | None) -> str | None:
 # whatever the cursor happens to be on.
 _REQUEUE_ACTION = ("requeue-jobs", "⟳  Requeue jobs")
 _CHECK_PORT_25_ACTION = ("check-port-25", "🔌 Check port 25")
+_ENABLE_CAPTURE_ACTION = ("enable-capture", "▶ Enable Capture")
+_DISABLE_CAPTURE_ACTION = ("disable-capture", "⏸ Disable Capture")
 
 # db tabs whose odoo-db command isn't the tab name lowercased -- the tab is
 # named for the question the reader has ("is this copy safe?"), the command
-# for the answer it gives.
+# for the answer it gives. Reports needs no entry here: its own odoo-db
+# command is named `reports` too (see odoo-db#34).
 _TAB_COMMANDS = {"Neutralization": "check-sensitive-information"}
 
 
@@ -293,6 +299,7 @@ class ActivityPane(Vertical):
             "Neutralization",
             "Modules",
             "Params",
+            "Reports",
             "Toolbox",
         ],
     }
@@ -715,6 +722,10 @@ class ActivityPane(Vertical):
             self.run_worker(self._confirm_requeue())
         elif event.button.id == _CHECK_PORT_25_ACTION[0]:
             self.run_worker(self._run_check_port_25())
+        elif event.button.id == _ENABLE_CAPTURE_ACTION[0]:
+            self.run_worker(self._set_capture_armed(True))
+        elif event.button.id == _DISABLE_CAPTURE_ACTION[0]:
+            self.run_worker(self._set_capture_armed(False))
 
     async def _confirm_requeue(self) -> None:
         """Put every started/enqueued job back to pending, on confirmation.
@@ -1518,6 +1529,18 @@ class ActivityPane(Vertical):
         self._dbtab.ident = ident
         self.run_worker(self._fetch_db_tab(category, db, ident), group="dbtab")
 
+    # Tabs with their own fetch/render method, same (db, port, ident, host)
+    # signature -- dispatched by name rather than one `if` per tab, which
+    # otherwise pushes _fetch_db_tab's branch count past the complexity limit
+    # every time a new custom-rendered tab (nested object, not a row list)
+    # is added.
+    _CUSTOM_FETCH_METHODS: ClassVar = {
+        "Jobs": "_fetch_jobs",
+        "Mail": "_fetch_mail",
+        "Neutralization": "_fetch_neutralization",
+        "Reports": "_fetch_reports",
+    }
+
     async def _fetch_db_tab(self, category: str, db: str, ident: tuple[str, str, tuple[str, str] | None]) -> None:
         host = self.app.host
         port = await to_thread(pg_target_of, self._db[0], host) if self._db else None
@@ -1531,16 +1554,9 @@ class ActivityPane(Vertical):
             self._handle_rows(rows, _first_line(error))
             return
 
-        if category == "Jobs":
-            await self._fetch_jobs(db, port, ident, host)
-            return
-
-        if category == "Mail":
-            await self._fetch_mail(db, port, ident, host)
-            return
-
-        if category == "Neutralization":
-            await self._fetch_neutralization(db, port, ident, host)
+        custom = self._CUSTOM_FETCH_METHODS.get(category)
+        if custom is not None:
+            await getattr(self, custom)(db, port, ident, host)
             return
 
         if category in self._tab_plugins:
@@ -1692,6 +1708,153 @@ class ActivityPane(Vertical):
         self._use("log")
         render_neutralization(self.query_one("#acbody", RichLog), rows[0] if rows else {})
         self._render_actions()
+
+    async def _fetch_reports(
+        self, db: str, port: PgTarget | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
+    ) -> None:
+        """Reports tab dispatch: once Capture has been armed for this
+        instance, or has anything captured (captures outlive Disable, see
+        `_set_capture_armed`), its list takes over the tab -- otherwise it's
+        the one-shot Diagnostics fetch below. Capture is scoped per
+        *instance*, not per database (see OdooActivity._do_poll_capture for
+        why), so the check reads the highlighted db's owning instance.
+        """
+        inst = self._db[0] if self._db else None
+        key = _inst_key(inst)
+        if key and (self.app.is_capture_armed(key) or self.app.captured_reports_for(key)):
+            self._render_captured_reports()
+            return
+
+        await self._fetch_reports_diagnostics(db, port, ident, host)
+
+    async def _fetch_reports_diagnostics(
+        self, db: str, port: PgTarget | None, ident: tuple[str, str, tuple[str, str] | None], host: Host
+    ) -> None:
+        """The Reports tab's Diagnostics half: odoo-db's `reports` audit
+        (report.url/report.delay, report_wkhtmltopdf_param install state +
+        its per-paperformat overrides), plus two host-level facts odoo-db
+        can't see (the actual wkhtmltopdf binary version, PDF-related pip
+        packages in the instance's venv) -- rendered as separate tables per
+        section (see panes/reports.py), same reason Mail/Neutralization are.
+
+        Only reached from `_fetch_reports` when Capture has nothing to show
+        yet -- once armed or once a report lands, `_render_captured_reports`
+        takes over instead.
+
+        Enable Capture is offered up front, before the odoo-db round trip --
+        Capture is pure `ps` + host filesystem, no odoo-db involved, so it
+        must stay available even when odoo-db itself is missing/unreachable
+        (the "(odoo-db not found on PATH)" case below), not only once a
+        successful Diagnostics fetch reaches its last line.
+        """
+        self._dbtab.actions = [_ENABLE_CAPTURE_ACTION, *self._plugin_actions("Reports")]
+        self._render_actions()
+
+        outcome = await self._run_odoo_db("Reports", db, port, host, ident, include_inactive=False)
+        if outcome is None:
+            return
+
+        rows, raw = outcome
+        if rows is None:
+            self._handle_rows(None, raw)
+            return
+
+        inst = self._db[0] if self._db else None
+        wk_version = await to_thread(wkhtmltopdf_version, host) if inst else None
+        pip_pdf_packages = await to_thread(pdf_pip_packages, inst, host) if inst else None
+
+        if ident != self._dbtab.ident:
+            return  # superseded by a newer tab selection; this result is stale
+
+        self._dbtab.rows = []  # not table-backed -- stale rows from a prior tab shouldn't feed `/` search here
+        self._use("log")
+        render_reports_diagnostics(
+            self.query_one("#acbody", RichLog), rows[0] if rows else {}, wk_version, pip_pdf_packages
+        )
+
+    def is_reports_active(self) -> bool:
+        return self._mode == "database" and self._active_tab() == "Reports"
+
+    def selected_db_row(self) -> dict | None:
+        """The row under the cursor of a database-mode DataTable tab (e.g.
+        Reports' captured list) -- same `coordinate_to_cell_key` lookup
+        `on_data_table_row_selected` uses for Enter, so it still names the
+        right row under an active search filter. None outside database
+        mode, off the raw-json view, or with nothing loaded."""
+        if self._mode != "database" or self._showing_raw:
+            return None
+
+        table = self.query_one("#actable", DataTable)
+        if not table.row_count:
+            return None
+
+        key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        idx = int(key) if key is not None else -1
+        return self._dbtab.rows[idx] if 0 <= idx < len(self._dbtab.rows) else None
+
+    def refresh_captured_reports(self) -> None:
+        """Called by the app's capture poller the instant a new report is
+        backed up, so a report caught while this tab is the one on screen
+        appears immediately rather than waiting for a manual `R`. A no-op
+        when Reports isn't the active tab -- the next time it's opened,
+        `_fetch_reports` reads the app's already-updated list itself."""
+        if self.is_reports_active():
+            self._render_captured_reports()
+
+    def _render_captured_reports(self) -> None:
+        """Capture's own list for the highlighted instance, through the
+        generic row-list DataTable rather than a RichLog like Diagnostics --
+        free `/` search and Enter->raw-json ("Inspect", spec section 3.3,
+        since each row already carries `base_href`/`css_links`/the full
+        `cmd`), unlike a bespoke renderer would need building from scratch.
+        """
+        inst = self._db[0] if self._db else None
+        key = _inst_key(inst)
+        reports = self.app.captured_reports_for(key) if key else []
+        armed = bool(key and self.app.is_capture_armed(key))
+
+        self._dbtab.actions = [_DISABLE_CAPTURE_ACTION if armed else _ENABLE_CAPTURE_ACTION]
+        self._dbtab.numbered = True
+        self._render_actions()
+
+        if not reports:
+            self._dbtab.rows = []
+            self._log_body(
+                "Capture armed -- watching every wkhtmltopdf run on this instance, none caught yet."
+                if armed
+                else "(no captured reports)"
+            )
+            return
+
+        self._dbtab.rows = [dict(r) for r in reports]
+        self._show_datatable()
+
+    async def _set_capture_armed(self, armed: bool) -> None:
+        """Enable/Disable Capture button handler. Arming/disarming is app-level
+        state (see OdooActivity.arm_capture/disarm_capture) so it survives a
+        tab switch or navigating to a different instance -- disarming does
+        not clear what's already been captured, matching the spec's flow
+        ("the ones already captured stay listed, their backup untouched").
+        """
+        if self._db is None:
+            return
+
+        inst, _db = self._db
+        key = _inst_key(inst)
+        if key is None:
+            return
+
+        if armed:
+            self.app.arm_capture(key)
+            self.app.notify(
+                f"Capture armed for {inst['name']} — watching every wkhtmltopdf run on this instance.", timeout=4
+            )
+        else:
+            self.app.disarm_capture(key)
+            self.app.notify(f"Capture disarmed for {inst['name']}.", timeout=3)
+
+        if self.is_reports_active():
+            self._load_db_tab("Reports")
 
     async def _fetch_plugin_tab(self, category: str, ident: tuple[str, str, tuple[str, str] | None]) -> None:
         """A plugin-contributed tab (see `Plugin.db_tab`/`fetch_tab`) --

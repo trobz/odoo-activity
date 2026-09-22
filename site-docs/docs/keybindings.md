@@ -21,6 +21,8 @@ tags:
 | `D` | dump stacks of all workers, then jump to Stacks |
 | `S` | copy the instance's `odoo shell` launch command to the clipboard |
 | `T` | show the full traceback behind an `errors` row (Logs Analysis tab) |
+| `C` | copy the selected captured report's reproduce command (Reports tab, once something is captured) |
+| `X` | replay the selected captured report against its backup, result shown inline (Reports tab) |
 | `e` | cycle compact/explain/expand/clean (Config tab) |
 | `A` | show all rows, inactive ones included |
 | enter | run the selected tool (Toolbox tab, confirm popup) / run the selected analysis (Logs Analysis tab) / open a Jobs group / open a row's raw json (db tabs, Logs Analysis results) |
@@ -30,8 +32,8 @@ tags:
 | `q` | quit |
 
 Some tabs on each side have no letter shortcut — cycle to them with
-`[`/`]` or click: **Processes**, **Stacks** and **Logs Analysis** (instance mode), **Queries**
-and **Modules** (database mode). A plugin-contributed tab (e.g. **POS**,
+`[`/`]` or click: **Processes**, **Stacks** and **Logs Analysis** (instance mode), **Queries**,
+**Modules** and **Reports** (database mode). A plugin-contributed tab (e.g. **POS**,
 see below) has none either.
 
 `A` asks `odoo-db` for the rows it filters out by default (its `--all`
@@ -71,8 +73,9 @@ list:
 - **Instance mode** — an instance row is highlighted. Tabs: Top,
   Processes, Stacks, Logs, Logs Analysis, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
-  Queries, Users, Locks, Jobs, Crons, Mail, Modules, Params, Toolbox, plus
-  **POS** when the opt-in `pos` plugin is enabled (see below).
+  Queries, Users, Locks, Jobs, Crons, Mail, Neutralization, Modules, Params,
+  Reports, Toolbox, plus **POS** when the opt-in `pos` plugin is enabled
+  (see below).
 
 Both modes share the same tab strip, and several letter-key shortcuts are
 reused across them for whichever tab they map to in each (e.g. `l` is Logs
@@ -249,6 +252,53 @@ database can *do*, not what it *holds*, and only for modules shipping a
 `neutralize.sql`, which a client's own module never does. Config
 parameters, mail relay credentials and candidate credential tables are in
 this copy — and in any dump of it — whatever the verdict says.
+
+## Reports
+
+`odoo-db reports <db>`, rendered as its own set of tables like Mail —
+diagnostics for PDF report generation. Shows `report.url`/`report.delay`
+(a stale `report.url` is the classic cause of a PDF that renders with no
+CSS at all), whether OCA's `report_wkhtmltopdf_param`
+(reporting-engine) is installed and its per-paperformat wkhtmltopdf CLI
+argument overrides if so — those take precedence over
+`report.url`/`report.delay` when present — plus two facts odoo-db has no
+access to and odoo-activity reads directly from the host: the actual
+`wkhtmltopdf --version` running, and PDF-related pip packages installed in
+the instance's own venv.
+
+No letter shortcut yet — cycle to it with `[`/`]` or click, same as
+Queries/Modules.
+
+**Capture**, the tab's other half: an **Enable Capture** button (offered
+even when odoo-db itself is unreachable — Capture is pure `ps` + host
+filesystem, no odoo-db involved) arms a watcher for every `wkhtmltopdf`
+process Odoo runs *on that instance* — not just the highlighted database,
+since a `ps` row has no way to name which database on a multi-tenant
+instance triggered it. Each one caught gets its temp files (cookie jar,
+header/footer/body HTML) backed up under `~/.oa-reports/` before Odoo
+deletes them, usually within a second or two of the process exiting.
+
+Once anything is armed or caught, the tab switches from Diagnostics to the
+captured-report list — a normal row table, so it gets `/` search and enter
+to open a row's raw json (its full command, parsed `<base href>`/CSS
+links) for free, same as any other db tab. `C` (see the table above)
+copies the selected row's exact command. `X` replays it against the backup
+— the point of Capture: get the real wkhtmltopdf error instead of guessing
+from Odoo's generic failure message. Odoo deletes the temp files as soon as
+wkhtmltopdf exits, so `X` uploads the backed-up copies to a temp directory on
+the same host, rewrites the command's paths to them, runs it there (where
+`report.url` has to resolve) and removes the directory afterwards. The
+cookie jar's session is gone too by then, so the replay fetches assets
+anonymously. `C` copies the original command as it ran; its temp files no
+longer exist. **Disable Capture** stops the watcher without
+clearing what's already listed, or its backups on disk.
+
+Capture state (armed instances, the captured list) lives at the app level,
+not the tab's — it survives switching tabs or instances, and there's
+currently no separate indicator that a *different* instance than the one
+on screen is still armed. Backups under `~/.oa-reports/` are never
+auto-deleted, and the captured-report list itself doesn't persist across
+an `oa` restart (the backup files on disk do).
 
 ## Odooly
 
