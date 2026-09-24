@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v0.27.1 (2026-09-24)
+
+### Bug Fixes
+
+- **managers**: Connect to the db the config names
+  ([`aa36d2a`](https://github.com/trobz/odoo-activity/commit/aa36d2af393afeb328fae8c931c0eed375381745))
+
+- **probes**: Don't read a failed long_queries as an idle db
+  ([`6f5a402`](https://github.com/trobz/odoo-activity/commit/6f5a402006c4aed6bc045b789f5f359ef6dc90f0))
+
+- **probes**: Stop ps truncating a long argv
+  ([`66b50e4`](https://github.com/trobz/odoo-activity/commit/66b50e4144f9aa53be059d4e1b24d7e03b7f51c9))
+
+
 ## v0.27.0 (2026-09-24)
 
 ### Features
