@@ -1,12 +1,15 @@
 import asyncio
+import contextlib
 import json
 import signal
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 from textual.widgets import DataTable
+from textual.worker import WorkerCancelled
 
 from odoo_activity import managers, probes, tui
 from odoo_activity.host import Host
@@ -2567,3 +2570,244 @@ def test_render_neutralization_says_what_a_green_database_still_holds():
     assert isinstance(renderables[1], Text)
     assert "never what it holds" in str(renderables[1])
     assert "acme.api_key" in _plain(renderables[2])
+
+
+# ---------------------------------------------------------------------------
+# Reports tab: Capture
+# ---------------------------------------------------------------------------
+
+_WK_PROC = {
+    "pid": "999",
+    "ppid": "1",
+    "user": "odoo",
+    "mem": "0.1",
+    "nice": "0",
+    "cmd": "/usr/local/bin/wkhtmltopdf --quiet /tmp/body.html /tmp/out.pdf",
+}
+
+_FAKE_CAPTURED_REPORT: probes.CapturedReport = {
+    "pid": "999",
+    "captured_at": "12:00:00",
+    "cmd": _WK_PROC["cmd"],
+    "backup_dir": "/fake/backup",
+    "base_href": "http://stale.example.com/",
+    "css_links": [],
+}
+
+
+def _procs_of_baseline_then_wk_proc():
+    """Nothing on the first call, `_WK_PROC` on every call after -- a plain
+    2-item pop(0) list breaks if the app's own real capture timer sneaks in
+    an extra poll during a test's `pilot.pause()`/`_settle()` calls (real
+    wall-clock time, not virtual); staying stable past the 2nd call avoids
+    that flakiness, and a pid `_do_poll_capture` has already seen is a
+    no-op on a repeat anyway."""
+    calls = {"n": 0}
+
+    def stub(*_):
+        calls["n"] += 1
+        return [_WK_PROC] if calls["n"] > 1 else []
+
+    return stub
+
+
+def test_reports_tab_capture_flow_arms_polls_and_lists_a_caught_report(monkeypatch):
+    """End to end: arming doesn't back up whatever's already running (the
+    first poll only baselines), a later poll that sees a genuinely new pid
+    backs it up, and the row appears live in the tab that's on screen with
+    no manual refresh -- then Disable Capture stops the watcher without
+    clearing what's already listed (spec: "the ones already captured stay
+    listed, their backup untouched")."""
+    _db_pilot(monkeypatch)
+
+    monkeypatch.setattr(tui, "procs_of", _procs_of_baseline_then_wk_proc())
+    monkeypatch.setattr(tui, "backup_wkhtmltopdf_capture", lambda *_: _FAKE_CAPTURED_REPORT)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("down")  # onto the nested db row -> database mode
+            await pilot.pause()
+
+            app = cast("tui.OdooActivity", pilot.app)
+            pane = app.query_one(tui.ActivityPane)
+            key = "systemd:b.service"
+
+            assert app.is_capture_armed(key) is False
+            app.arm_capture(key)
+            assert app.is_capture_armed(key) is True
+
+            # first poll: baseline only -- nothing pre-existing gets backed up
+            app._do_poll_capture()
+            await app.workers.wait_for_complete()
+            assert app.captured_reports_for(key) == []
+
+            # Reports is the tab on screen when the 2nd poll lands
+            pane.select_tab_by_name("Reports")
+            await _settle(pilot)
+
+            app._do_poll_capture()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.captured_reports_for(key) == [_FAKE_CAPTURED_REPORT]
+
+            table = pane.query_one("#actable", detail_mod.DataTable)
+            assert table.row_count == 1
+            assert pane._dbtab.actions == [detail_mod._DISABLE_CAPTURE_ACTION]
+            assert pane.selected_db_row() == dict(_FAKE_CAPTURED_REPORT)
+            assert app.check_action("copy_reproduce_command", ()) is True
+            assert app.check_action("run_reproduce_command", ()) is True
+
+            # Disable: stops the watcher, keeps what was already caught
+            await pane._set_capture_armed(False)
+            await pilot.pause()
+
+            assert app.is_capture_armed(key) is False
+            assert app.captured_reports_for(key) == [_FAKE_CAPTURED_REPORT]
+            assert pane._dbtab.rows == [dict(_FAKE_CAPTURED_REPORT)]
+
+    asyncio.run(go())
+
+
+def test_reports_tab_shows_diagnostics_before_anything_is_armed_or_captured(monkeypatch):
+    """The Diagnostics one-shot fetch, not the Capture list, is what a fresh
+    Reports tab shows -- Capture only takes over once armed or once
+    something has actually been caught (see _fetch_reports)."""
+    _db_pilot(monkeypatch)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("down")
+            await pilot.pause()
+
+            pane = pilot.app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Reports")
+            await _settle(pilot)
+            await pilot.pause()
+
+            # the Diagnostics path renders into the log body, not the table,
+            # and offers Enable (not Disable) -- nothing is armed yet
+            assert pane._dbtab.actions == [detail_mod._ENABLE_CAPTURE_ACTION]
+            assert pane._dbtab.rows == []
+
+    asyncio.run(go())
+
+
+def test_copy_and_run_reproduce_command_act_on_the_selected_capture(monkeypatch):
+    """C/X read the row under the cursor (same coordinate_to_cell_key lookup
+    Enter's raw-json path uses), not "the database" -- unlike the tab-wide
+    action strip, these are row-scoped."""
+    _db_pilot(monkeypatch)
+    monkeypatch.setattr(tui, "procs_of", _procs_of_baseline_then_wk_proc())
+    monkeypatch.setattr(tui, "backup_wkhtmltopdf_capture", lambda *_: _FAKE_CAPTURED_REPORT)
+
+    copied = {}
+    monkeypatch.setattr(tui, "try_local_clipboard", lambda text: copied.setdefault("text", text) or True)
+    replayed = []
+
+    def fake_reproduce(cmd, backup_dir, _host):
+        replayed.append((cmd, backup_dir))
+        return SimpleNamespace(returncode=0, stdout="real wkhtmltopdf error here", stderr="")
+
+    monkeypatch.setattr(tui, "reproduce_wkhtmltopdf", fake_reproduce)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("down")
+            await pilot.pause()
+
+            app = cast("tui.OdooActivity", pilot.app)
+            key = "systemd:b.service"
+            app.arm_capture(key)
+            app._do_poll_capture()
+            await app.workers.wait_for_complete()
+
+            pane = app.query_one(tui.ActivityPane)
+            pane.select_tab_by_name("Reports")
+            await _settle(pilot)
+            app._do_poll_capture()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert pane.selected_db_row() is not None
+
+            app.action_copy_reproduce_command()
+            await app.workers.wait_for_complete()
+            assert copied["text"] == _WK_PROC["cmd"]
+
+            # X replays against the row's backup, not the temp files Odoo deleted
+            app.action_run_reproduce_command()
+            await app.workers.wait_for_complete()
+            assert replayed == [(_WK_PROC["cmd"], _FAKE_CAPTURED_REPORT["backup_dir"])]
+
+    asyncio.run(go())
+
+
+def test_capture_tick_skips_while_a_pass_is_still_running(monkeypatch):
+    """A pass over SSH outlasts the 2s tick. The tick used to cancel it
+    (`exclusive=True`), dropping the report being backed up; it now skips
+    until the running pass is done."""
+    _db_pilot(monkeypatch)
+    calls = []
+    monkeypatch.setattr(tui, "procs_of", lambda *_: calls.append(1) or [])
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            app = cast("tui.OdooActivity", pilot.app)
+            app.arm_capture("systemd:b.service")
+
+            app._capture_busy = True  # a pass is in flight
+            app._poll_capture()
+            await app.workers.wait_for_complete()
+            assert calls == []
+
+            app._capture_busy = False
+            app._poll_capture()
+            await app.workers.wait_for_complete()
+            assert calls == [1]
+            assert app._capture_busy is False  # reset once the pass ends
+
+    asyncio.run(go())
+
+
+def test_capture_retries_a_pid_whose_backup_was_cut_off(monkeypatch):
+    """A pid only counts as seen once its backup is done: a pass cut off
+    mid-backup (the app quitting, a cancelled worker) retries it on the next
+    pass instead of dropping it for good."""
+    _db_pilot(monkeypatch)
+    monkeypatch.setattr(tui, "procs_of", _procs_of_baseline_then_wk_proc())
+    backups = []
+
+    def slow_backup(*_):
+        backups.append(1)
+        time.sleep(0.3 if len(backups) == 1 else 0)
+        return _FAKE_CAPTURED_REPORT
+
+    monkeypatch.setattr(tui, "backup_wkhtmltopdf_capture", slow_backup)
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _settle(pilot)
+            app = cast("tui.OdooActivity", pilot.app)
+            key = "systemd:b.service"
+            app.arm_capture(key)
+            app._do_poll_capture()  # baseline
+            await app.workers.wait_for_complete()
+
+            app._do_poll_capture()
+            await asyncio.sleep(0.1)  # inside the first, slow backup
+            app.workers.cancel_group(app, "report-capture")
+            with contextlib.suppress(WorkerCancelled):
+                await app.workers.wait_for_complete()
+            assert app.captured_reports_for(key) == []
+
+            app._do_poll_capture()
+            await app.workers.wait_for_complete()
+            assert len(backups) == 2
+            assert app.captured_reports_for(key) == [_FAKE_CAPTURED_REPORT]
+
+    asyncio.run(go())

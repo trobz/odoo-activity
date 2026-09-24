@@ -25,6 +25,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pyperclip
@@ -1953,6 +1954,240 @@ def procs_of(inst: Instance, host: Host = LOCAL) -> list[ProcRow]:
 
     by_pid, children = _ps_snapshot(host)
     return _descendants(master, by_pid, children)
+
+
+def wkhtmltopdf_version(host: Host = LOCAL) -> str | None:
+    """`wkhtmltopdf --version`'s stdout, or None if the binary isn't on
+    PATH/fails to run. Host-level, not instance-scoped -- unlike
+    report.url/report.delay (odoo-db, per database), there's one
+    wkhtmltopdf binary per host regardless of which instance/db is
+    selected."""
+    result = host.run(["wkhtmltopdf", "--version"])
+    if result.returncode != 0:
+        return None
+
+    return result.stdout.strip() or None
+
+
+def pdf_pip_packages(inst: Instance, host: Host = LOCAL) -> list[str] | None:
+    """`pip freeze | grep -i pdf` inside the venv backing `inst`'s live
+    process -- reuses procs_of + _environ_of's VIRTUAL_ENV resolution, the
+    same precedent _resolve_argv0 already uses for venv-relative binaries.
+    None if the instance isn't running or has no resolvable venv."""
+    host = container_host(inst, host)
+    procs = procs_of(inst, host)
+    if not procs:
+        return None
+
+    venv = _environ_of(procs[0]["pid"], host).get("VIRTUAL_ENV")
+    if not venv or not host.is_file(f"{venv}/bin/pip"):
+        return None
+
+    result = host.run(["sh", "-c", f"{shlex.quote(venv)}/bin/pip freeze | grep -i pdf"])
+    return [ln for ln in result.stdout.splitlines() if ln.strip()] or None
+
+
+class CapturedReport(TypedDict):
+    """One armed-and-caught wkhtmltopdf run, backed up before Odoo deletes
+    its temp files -- a row in the Reports tab's Capture DataTable, and (via
+    the generic Enter->raw-json path every db-mode tab already has) its own
+    "Inspect" view for free."""
+
+    pid: str
+    captured_at: str
+    cmd: str
+    backup_dir: str
+    base_href: str | None
+    css_links: list[str]
+
+
+# The two temp-file flags plus their CapturedReport key -- see
+# parse_wkhtmltopdf_argv. The cookie jar authenticates the rendering
+# request as the requesting user; header/footer/body are the rendered HTML
+# wkhtmltopdf actually converts.
+_WKHTMLTOPDF_TEMP_FILE_FLAGS: tuple[tuple[str, str], ...] = (
+    ("--cookie-jar", "cookie_jar"),
+    ("--header-html", "header_html"),
+    ("--footer-html", "footer_html"),
+)
+
+
+def parse_wkhtmltopdf_argv(cmd: str) -> dict[str, str]:
+    """Pull the temp-file paths out of a captured wkhtmltopdf command line:
+    `--cookie-jar`/`--header-html`/`--footer-html` (named flags) plus the
+    body HTML and output PDF (the last two positional arguments). Pure
+    string parsing -- no Host access, so it's testable with hand-built
+    strings the same way this repo already tests ps argv parsing.
+
+    `cmd` is a ProcRow's `cmd` field: space-joined argv as `ps` reports it,
+    not shell-quoted -- plain `.split()` is the right tokenizer here, same
+    as `shell_command`'s own `procs[0]["cmd"].split()`, not `shlex.split`
+    (which would misinterpret a stray quote-like character as shell syntax
+    that was never actually there).
+
+    The output PDF may legitimately not exist -- a report that fails
+    silently with no PDF and no error is exactly the case Capture exists
+    for, not a parse error.
+    """
+    tokens = cmd.split()
+    flags = dict(_WKHTMLTOPDF_TEMP_FILE_FLAGS)
+    result: dict[str, str] = {}
+    positional: list[str] = []
+
+    i = 1  # tokens[0] is the wkhtmltopdf binary itself, not an argument
+    while i < len(tokens):
+        tok = tokens[i]
+        key = flags.get(tok)
+        if key is not None and i + 1 < len(tokens):
+            result[key] = tokens[i + 1]
+            i += 2
+            continue
+        if not tok.startswith("-"):
+            positional.append(tok)
+        i += 1
+
+    if len(positional) >= 2:
+        result["body_html"] = positional[-2]
+        result["output_pdf"] = positional[-1]
+
+    return result
+
+
+# CSS bundles a report's <base href> should be able to reach -- exactly
+# what's needed to spot the report.url/asset mismatch the spec's foodcoop18
+# case turned on (see Technical notes, section 5).
+_REPORT_CSS_MARKERS = ("web.report_assets_pdf", "web.report_assets_common")
+
+
+class _ReportHTMLParser(HTMLParser):
+    """Pulls `<base href>` and the two known CSS `<link>` hrefs out of a
+    captured report body -- the fields Inspect (spec section 3.3) needs.
+    Tolerant by construction (HTMLParser doesn't raise on malformed markup),
+    so a body that doesn't match either shape just yields empty results
+    rather than an error the Inspect view would have to handle."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.base_href: str | None = None
+        self.css_links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "base" and self.base_href is None:
+            self.base_href = values.get("href")
+        elif tag == "link":
+            href = values.get("href") or ""
+            if any(marker in href for marker in _REPORT_CSS_MARKERS):
+                self.css_links.append(href)
+
+
+def parse_report_html(html: str) -> dict:
+    """{base_href, css_links} out of a captured report body -- see
+    _ReportHTMLParser. Pure -- no Host access."""
+    parser = _ReportHTMLParser()
+    parser.feed(html)
+    return {"base_href": parser.base_href, "css_links": parser.css_links}
+
+
+def backup_wkhtmltopdf_capture(proc: ProcRow, host: Host, backup_dir: Path) -> CapturedReport:
+    """Copy a just-seen wkhtmltopdf process's temp files into `backup_dir`
+    before Odoo deletes them -- must be called the moment the process is
+    *seen* (see caller), not after it exits: they're usually gone within a
+    second or two of the subprocess finishing.
+
+    `host.read_text` (already local/SSH-transparent) is enough -- every file
+    here (cookie jar, header/footer/body HTML) is text, never binary, so no
+    new Host method is needed. A missing/unreadable file (already deleted,
+    a permissions quirk) is skipped rather than fatal -- a partial backup is
+    still more useful than none.
+    """
+    paths = parse_wkhtmltopdf_argv(proc["cmd"])
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: dict[str, str] = {}
+    for key in ("cookie_jar", "header_html", "footer_html", "body_html"):
+        remote_path = paths.get(key)
+        if not remote_path:
+            continue
+        try:
+            text = host.read_text(remote_path)
+        except OSError:
+            continue
+        local_path = backup_dir / Path(remote_path).name
+        local_path.write_text(text)
+        saved[key] = str(local_path)
+
+    base_href = None
+    css_links: list[str] = []
+    body_backup = saved.get("body_html")
+    if body_backup:
+        parsed = parse_report_html(Path(body_backup).read_text())
+        base_href = parsed["base_href"]
+        css_links = parsed["css_links"]
+
+    return {
+        "pid": proc["pid"],
+        "captured_at": time.strftime("%H:%M:%S"),
+        "cmd": proc["cmd"],
+        "backup_dir": str(backup_dir),
+        "base_href": base_href,
+        "css_links": css_links,
+    }
+
+
+# The temp files a replay can't do without: the HTML wkhtmltopdf converts.
+# The cookie jar is left out on purpose -- Odoo deletes the temporary session
+# it names right after the run, so the backup's copy authenticates nothing,
+# and wkhtmltopdf creates a missing jar on its own.
+_REPLAY_REQUIRED = ("header_html", "footer_html", "body_html")
+
+
+def reproduce_wkhtmltopdf(cmd: str, backup_dir: str | Path, host: Host) -> subprocess.CompletedProcess[str]:
+    """Re-run a captured wkhtmltopdf command against its backup, on the host
+    that ran it.
+
+    Odoo deletes every temp file the moment wkhtmltopdf exits (the
+    `ExitStack` in `ir.actions.report._run_wkhtmltopdf`), so the paths in
+    `cmd` are gone by the time anyone presses `X`. Run as is, a missing body
+    gives `HostNotFoundError` -- the same message a stale `report.url`
+    gives -- and a fresh empty cookie jar is left in `/tmp`.
+
+    Instead: upload the backed-up files into a fresh `mktemp -d` on the
+    host, point every temp path in `cmd` (output PDF and cookie jar
+    included) at it, run, then remove it. The run stays on the host because
+    that is where `report.url` has to resolve, and it's the wkhtmltopdf
+    build that failed.
+
+    A replay that can't be faithful comes back as a failed result naming
+    why, never as a run: a required file missing from the backup, or an
+    upload whose size doesn't match (e.g. stdin not reaching the command).
+    """
+    argv = cmd.split()
+    paths = parse_wkhtmltopdf_argv(cmd)
+    backups = {key: Path(backup_dir) / Path(path).name for key, path in paths.items()}
+
+    missing = [key for key in _REPLAY_REQUIRED if key in paths and not backups[key].is_file()]
+    if missing:
+        return subprocess.CompletedProcess(argv, 1, "", f"not in the backup, can't replay: {', '.join(missing)}")
+
+    workdir = host.run(["mktemp", "-d", "-t", "oa-reproduce.XXXXXX"]).stdout.strip()
+    if not workdir:
+        return subprocess.CompletedProcess(argv, 1, "", "couldn't create a temp dir on the host")
+
+    try:
+        moved = {path: f"{workdir}/{Path(path).name}" for path in paths.values()}
+        for key in _REPLAY_REQUIRED:
+            if key not in paths:
+                continue
+            text = backups[key].read_text()
+            target = moved[paths[key]]
+            host.run(["sh", "-c", 'cat > "$1"', "sh", target], input_text=text)
+            if host.stat_size(target) != len(text.encode()):
+                return subprocess.CompletedProcess(argv, 1, "", f"couldn't upload the backed-up {key} to the host")
+
+        return host.run([moved.get(token, token) for token in argv])
+    finally:
+        host.run(["rm", "-rf", workdir])
 
 
 def instance_procs(inst: Instance, host: Host = LOCAL) -> tuple[list[ProcRow], list[ProcRow]]:

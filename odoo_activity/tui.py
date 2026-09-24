@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from textual import events, work
@@ -31,19 +32,37 @@ from odoo_activity.managers import (
 from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
+    CapturedReport,
     Instance,
+    ProcRow,
+    backup_wkhtmltopdf_capture,
     databases_of,
     dump_and_parse_stacks,
     format_duration,
     neutralized_databases,
     pg_target_of,
+    procs_of,
     read_cpu_times,
     read_host_stats,
+    reproduce_wkhtmltopdf,
     signal_process,
+    try_local_clipboard,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from odoo_activity.plugins import DbTarget, Plugin
+
+# Footer actions whose only gate is one yes/no question to the pane -- see
+# App.check_action, which asks it; anything needing more than that stays there.
+_PANE_GATES: dict[str, Callable[[ActivityPane], bool]] = {
+    "search": ActivityPane.has_search,
+    "quit_process": ActivityPane.is_top_active,
+    "traceback": ActivityPane.can_show_traceback,
+    "toggle_show_all": ActivityPane.has_show_all,
+    "toggle_config_mode": ActivityPane.is_config_active,
+}
 
 # sort priority for the instances list: running first, then a failure state
 # (systemd "failed", supervisor "exited"/"fatal"), then a clean "stopped"
@@ -54,6 +73,16 @@ _STATUS_ORDER = {"running": 0, "stopped": 2}
 _log = logging.getLogger("odoo_activity")
 
 _LAG_INTERVAL = 0.25  # how often the watchdog below ticks
+
+# Reports tab Capture: how often an armed instance is polled for new
+# wkhtmltopdf processes. A starting point, not a validated final value --
+# the spec's own open question. Kept well above sub-second on purpose: each
+# tick is one `ps` round trip per *armed* instance (an SSH round trip for a
+# remote one, even with the ControlMaster connection reuse host.py already
+# configures), additive across several armed instances at once -- not the
+# 0.5s cadence ActivityPane.poll already uses for the (host-round-trip-free)
+# Logs tail, which this deliberately does not piggyback on.
+_CAPTURE_POLL_INTERVAL = 2.0
 
 # Trobz brand palette (see trobz brand-guidelines skill)
 TROBZ_THEME = Theme(
@@ -220,6 +249,8 @@ class OdooActivity(App):
         ("e", "toggle_config_mode", "Compact/Explain/Expand/Clean"),
         ("f", "toggle_maximize", "Maximize"),
         ("R", "refresh", "Refresh"),
+        ("C", "copy_reproduce_command", "Copy reproduce cmd"),
+        ("X", "run_reproduce_command", "Run reproduce cmd"),
     ]
 
     def __init__(
@@ -282,6 +313,18 @@ class OdooActivity(App):
         self._shown_key: str | None = None  # highlighted row driving the activity pane
         self._instances_ready = False  # first _rebuild_instances has finished mounting rows
 
+        # Reports tab Capture -- instance-scoped (not per-db: a wkhtmltopdf
+        # process's `ps` row has no way to name which database on a
+        # multi-tenant instance triggered it), and app-level rather than on
+        # ActivityPane so arming survives a tab switch or navigating to a
+        # different instance -- nothing pane-scoped does today (see
+        # panes/detail.py's _render_active, which kills even the Logs tail
+        # on every switch).
+        self._capture_armed: set[str] = set()  # instance keys currently armed
+        self._captured_reports: dict[str, list[CapturedReport]] = {}  # instance key -> its captures, oldest first
+        self._capture_seen_pids: dict[str, set[str]] = {}  # instance key -> wkhtmltopdf pids already handled
+        self._capture_busy = False  # a poll pass is still running; the next tick skips instead of piling on
+
         # spinner over the initial (possibly slow, over ssh) discovery only --
         # _rebuild_instances clears this once it lands and focuses the list
         # (a loading widget can't take focus -- see Widget._check_disabled);
@@ -299,6 +342,11 @@ class OdooActivity(App):
         # samples the pulse, doesn't drive it — the phase is per row, so this
         # only has to be finer than _PULSE_PERIOD to render it smoothly
         self.set_interval(0.2, self._pulse_running)
+        # zero-cost while nothing is armed (see _poll_capture) -- a dedicated
+        # timer rather than riding ActivityPane.poll (0.5s, and a no-op
+        # unless Logs is active today) so Capture doesn't turn that into an
+        # ssh round trip every half second the moment anything is armed
+        self.set_interval(_CAPTURE_POLL_INTERVAL, self._poll_capture)
 
         self._lag_tick = time.monotonic()
         self.set_interval(_LAG_INTERVAL, self._check_loop_lag)
@@ -314,6 +362,109 @@ class OdooActivity(App):
         self._lag_tick = now
         if drift > 0.05:
             _log.warning("event loop lag: %.0fms", drift * 1000)
+
+    # -- Reports tab: Capture -------------------------------------------------
+
+    def arm_capture(self, inst_key: str) -> None:
+        self._capture_armed.add(inst_key)
+
+    def disarm_capture(self, inst_key: str) -> None:
+        """Stops the watcher; what it already caught stays in
+        `captured_reports_for`, backups untouched on disk -- matches the
+        spec's flow ("the ones already captured stay listed")."""
+        self._capture_armed.discard(inst_key)
+
+    def is_capture_armed(self, inst_key: str) -> bool:
+        return inst_key in self._capture_armed
+
+    def captured_reports_for(self, inst_key: str) -> list[CapturedReport]:
+        return self._captured_reports.get(inst_key, [])
+
+    def _poll_capture(self) -> None:
+        """Zero-cost early-out when nothing is armed -- no thread, no `ps`
+        call, just a set-membership check every tick. A tick that lands
+        while the previous pass is still running is skipped: over SSH a pass
+        (one `ps`, then several `read_text` round trips per backup) easily
+        outlasts the 2s interval, and cancelling it would drop the report it
+        was backing up."""
+        if self._capture_armed and not self._capture_busy:
+            self._do_poll_capture()
+
+    @work(group="report-capture")
+    async def _do_poll_capture(self) -> None:
+        """One pass over every armed instance. Backups run sequentially
+        inside this worker rather than as their own `@work` call, so a pass
+        is done when its backups are -- which is what `_capture_busy` tells
+        the next tick."""
+        self._capture_busy = True
+        try:
+            await self._poll_armed_instances()
+        finally:
+            self._capture_busy = False
+
+    async def _poll_armed_instances(self) -> None:
+        for inst_key in list(self._capture_armed):
+            inst = self._instances.get(inst_key)
+            if inst is None:
+                continue
+
+            host = host_for(inst, self.host)
+            procs = await to_thread(procs_of, inst, host)
+            wk_pids = {p["pid"] for p in procs if "wkhtmltopdf" in p["cmd"]}
+
+            if inst_key not in self._capture_seen_pids:
+                # First poll since arming: baseline only -- whatever's
+                # already running when Capture was enabled isn't "new".
+                self._capture_seen_pids[inst_key] = wk_pids
+                continue
+
+            seen = self._capture_seen_pids[inst_key]
+            seen &= wk_pids  # prune: an exited pid can be reused by an unrelated process later
+            new_pids = wk_pids - seen
+
+            for proc in procs:
+                if proc["pid"] not in new_pids:
+                    continue
+                await self._backup_capture(inst_key, proc, host)
+                # only once backed up: a pass cut off mid-backup retries this pid next tick
+                seen.add(proc["pid"])
+
+    async def _backup_capture(self, inst_key: str, proc: ProcRow, host: Host) -> None:
+        backup_dir = Path.home() / ".oa-reports" / inst_key.replace(":", "_") / f"{proc['pid']}-{int(time.time())}"
+        report = await to_thread(backup_wkhtmltopdf_capture, proc, host, backup_dir)
+        self._captured_reports.setdefault(inst_key, []).append(report)
+        self.query_one(ActivityPane).refresh_captured_reports()
+
+    def action_copy_reproduce_command(self) -> None:
+        row = self.query_one(ActivityPane).selected_db_row()
+        cmd = row.get("cmd") if row else None
+        if cmd:
+            self._copy_reproduce_command(str(cmd))
+
+    @work(exclusive=True, group="reproduce-copy")
+    async def _copy_reproduce_command(self, cmd: str) -> None:
+        text = self.process_host().shell_invocation(cmd)
+        if not await to_thread(try_local_clipboard, text):
+            self.copy_to_clipboard(text)
+        self.notify("Reproduce command copied to clipboard", timeout=3)
+
+    def action_run_reproduce_command(self) -> None:
+        row = self.query_one(ActivityPane).selected_db_row()
+        cmd = row.get("cmd") if row else None
+        backup_dir = row.get("backup_dir") if row else None
+        if cmd and backup_dir:
+            self._run_reproduce_command(str(cmd), str(backup_dir))
+
+    @work(exclusive=True, group="reproduce-run")
+    async def _run_reproduce_command(self, cmd: str, backup_dir: str) -> None:
+        """Replays the captured wkhtmltopdf command against its backup (the
+        originals are deleted by Odoo as soon as the run ends -- see
+        `reproduce_wkhtmltopdf`) and shows the real error inline instead of
+        Odoo's generic failure message."""
+        host = self.process_host()
+        result = await to_thread(reproduce_wkhtmltopdf, cmd, backup_dir, host)
+        detail = result.stdout.strip() or result.stderr.strip() or "(no output)"
+        self.notify(f"exit {result.returncode}: {detail}", timeout=10)
 
     def on_show(self) -> None:
         """Run after layout is complete and app is shown."""
@@ -701,8 +852,8 @@ class OdooActivity(App):
             (name,) = parameters
             return self.query_one(ActivityPane).has_tab(str(name))
 
-        if action == "search":
-            return self.query_one(ActivityPane).has_search()
+        if (gate := _PANE_GATES.get(action)) is not None:
+            return gate(self.query_one(ActivityPane))
 
         if action == "kill_process":
             # Top lists processes as a table, Processes as a tree; both can
@@ -710,22 +861,14 @@ class OdooActivity(App):
             pane = self.query_one(ActivityPane)
             return pane.is_top_active() or pane.is_processes_active()
 
-        if action == "quit_process":
-            return self.query_one(ActivityPane).is_top_active()
+        if action in ("copy_reproduce_command", "run_reproduce_command"):
+            pane = self.query_one(ActivityPane)
+            return pane.is_reports_active() and pane.selected_db_row() is not None
 
         # a db row resolves to its owning instance (see _row_owner), so these
         # two need the mode as well to stay out of database mode
         if action in ("dumpstacks", "copy_shell_command"):
             return self.query_one(ActivityPane).is_instance_mode() and self.current_instance() is not None
-
-        if action == "traceback":
-            return self.query_one(ActivityPane).can_show_traceback()
-
-        if action == "toggle_show_all":
-            return self.query_one(ActivityPane).has_show_all()
-
-        if action == "toggle_config_mode":
-            return self.query_one(ActivityPane).is_config_active()
 
         return True
 
