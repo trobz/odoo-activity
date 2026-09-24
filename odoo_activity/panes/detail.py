@@ -1524,11 +1524,11 @@ class ActivityPane(Vertical):
 
         if category == "Queries":
             # see `long_queries`
-            rows = await to_thread(long_queries, db, port, host)
+            rows, error = await to_thread(long_queries, db, port, host)
             if ident != self._dbtab.ident:
                 return
 
-            self._handle_rows(rows)
+            self._handle_rows(rows, _first_line(error))
             return
 
         if category == "Jobs":

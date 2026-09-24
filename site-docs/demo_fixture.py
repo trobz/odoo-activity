@@ -105,7 +105,7 @@ def main() -> None:
     detail_mod.db_port_of = lambda *_: "5432"
     detail_mod.jobrunner_pids = lambda *_: set()
     detail_mod.job_groups = lambda *_a, **_k: (JOB_GROUPS, "")
-    detail_mod.long_queries = lambda *_a, **_k: LONG_QUERIES_ROWS
+    detail_mod.long_queries = lambda *_a, **_k: (LONG_QUERIES_ROWS, "")
     detail_mod.start_odoo_db = lambda *_a, **_k: _FakeOdooDbProc([])
 
     tui.OdooActivity(include_sensitive_information=True).run()
