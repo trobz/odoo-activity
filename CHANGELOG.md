@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.28.0 (2026-09-28)
+
+### Features
+
+- **reports**: Add Reports tab — PDF diagnostics + Capture
+  ([`4f95e7b`](https://github.com/trobz/odoo-activity/commit/4f95e7b666511c11cb3f74ff274d157d7d6c5994))
+
+
 ## v0.27.1 (2026-09-24)
 
 ### Bug Fixes
