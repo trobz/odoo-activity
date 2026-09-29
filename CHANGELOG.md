@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v0.28.1 (2026-09-29)
+
+### Bug Fixes
+
+- **probes**: Resolve a systemd-execed venv without VIRTUAL_ENV or pip
+  ([`03cb53a`](https://github.com/trobz/odoo-activity/commit/03cb53a8030e5d893cd496d5fe66130359e99fe5))
+
+- **probes**: Try pip freeze before falling back to uv pip
+  ([`2621501`](https://github.com/trobz/odoo-activity/commit/26215018e5ee8d706992b2f90df7e8092b430f56))
+
+
 ## v0.28.0 (2026-09-28)
 
 ### Features
