@@ -959,23 +959,41 @@ def test_pdf_pip_packages_falls_back_to_argv0_when_systemd_execs_the_venv_direct
         _fake_procs("/opt/odoo/foodcoop18/.venv/bin/python /opt/odoo/foodcoop18/.venv/bin/odoo --config odoo.conf"),
     )
     monkeypatch.setattr(probes, "_environ_of", lambda *_: {})
-    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/opt/odoo/foodcoop18/.venv/bin/python")
+    monkeypatch.setattr(
+        Host,
+        "is_file",
+        lambda self, path: path in ("/opt/odoo/foodcoop18/.venv/bin/python", "/opt/odoo/foodcoop18/.venv/bin/pip"),
+    )
     calls = _recorder(monkeypatch, stdout="pypdf==4.0.0\nreportlab==4.1.0\n", returncode=0)
 
     result = probes.pdf_pip_packages(_INSTANCE, Host())
 
     assert result == ["pypdf==4.0.0"]
-    assert calls == [["uv", "pip", "freeze", "--python", "/opt/odoo/foodcoop18/.venv/bin/python"]]
+    assert calls == [["sh", "-c", "/opt/odoo/foodcoop18/.venv/bin/pip freeze"]]
 
 
-def test_pdf_pip_packages_reads_uv_pip_freeze_in_the_instance_venv(monkeypatch):
-    """Not `pip freeze` directly: a `uv`-managed venv routinely has no
-    `pip` binary at all -- confirmed live on foodcoop18-stag02, where the
-    resolved venv had no `.venv/bin/pip`. `uv pip freeze` reads the same
-    dist-info metadata without needing pip installed in the target venv."""
+def test_pdf_pip_packages_prefers_pip_freeze_when_pip_exists(monkeypatch):
+    """The common case: a venv made with `python -m venv` ships pip, so
+    that's what's used -- not `uv pip`."""
     monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
     monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
-    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path in ("/venv/bin/python3", "/venv/bin/pip"))
+    calls = _recorder(monkeypatch, stdout="pypdf==4.0.0\nreportlab==4.1.0\n", returncode=0)
+
+    result = probes.pdf_pip_packages(_INSTANCE, Host())
+
+    assert result == ["pypdf==4.0.0"]
+    assert calls == [["sh", "-c", "/venv/bin/pip freeze"]]
+
+
+def test_pdf_pip_packages_falls_back_to_uv_pip_when_pip_is_missing(monkeypatch):
+    """A venv made with `uv venv` routinely has no `pip` binary at all --
+    confirmed live on foodcoop18-stag02, where the resolved venv had no
+    `.venv/bin/pip`. `uv pip freeze` reads the same dist-info metadata
+    without needing pip installed in the target venv."""
+    monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")  # no /venv/bin/pip
     calls = _recorder(monkeypatch, stdout="pypdf==4.0.0\nreportlab==4.1.0\n", returncode=0)
 
     result = probes.pdf_pip_packages(_INSTANCE, Host())
@@ -987,19 +1005,18 @@ def test_pdf_pip_packages_reads_uv_pip_freeze_in_the_instance_venv(monkeypatch):
 def test_pdf_pip_packages_none_when_nothing_matches(monkeypatch):
     monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
     monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
-    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path in ("/venv/bin/python3", "/venv/bin/pip"))
     _recorder(monkeypatch, stdout="reportlab==4.1.0\nrequests==2.31.0\n", returncode=0)
 
     assert probes.pdf_pip_packages(_INSTANCE, Host()) is None
 
 
-def test_pdf_pip_packages_none_when_uv_pip_freeze_fails(monkeypatch):
-    """`uv pip freeze` exits nonzero for an interpreter it can't resolve as
-    a venv/system Python -- don't return the (irrelevant) stderr text as if
-    it were a package list."""
+def test_pdf_pip_packages_none_when_the_freeze_command_fails(monkeypatch):
+    """Neither `pip freeze` nor `uv pip freeze` exiting nonzero should
+    return the (irrelevant) stderr text as if it were a package list."""
     monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
     monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
-    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")  # uv pip fallback path
     _recorder(monkeypatch, stdout="", returncode=2)
 
     assert probes.pdf_pip_packages(_INSTANCE, Host()) is None
