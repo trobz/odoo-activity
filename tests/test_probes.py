@@ -947,26 +947,60 @@ def test_pdf_pip_packages_none_when_no_venv_resolves(monkeypatch):
     assert probes.pdf_pip_packages(_INSTANCE, Host()) is None
 
 
-def test_pdf_pip_packages_greps_pip_freeze_in_the_instance_venv(monkeypatch):
-    monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
-    monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
-    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/pip")
+def test_pdf_pip_packages_falls_back_to_argv0_when_systemd_execs_the_venv_directly(monkeypatch):
+    """A unit with `ExecStart=/opt/odoo/<inst>/.venv/bin/python ...` never
+    runs an activation script, so `VIRTUAL_ENV` stays unset even though the
+    process is running inside that venv -- confirmed live on
+    foodcoop18-stag02. argv[0] itself still names the venv's own
+    interpreter by absolute path, so that's the fallback."""
+    monkeypatch.setattr(
+        probes,
+        "procs_of",
+        _fake_procs("/opt/odoo/foodcoop18/.venv/bin/python /opt/odoo/foodcoop18/.venv/bin/odoo --config odoo.conf"),
+    )
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {})
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/opt/odoo/foodcoop18/.venv/bin/python")
     calls = _recorder(monkeypatch, stdout="pypdf==4.0.0\nreportlab==4.1.0\n", returncode=0)
 
     result = probes.pdf_pip_packages(_INSTANCE, Host())
 
-    assert result == ["pypdf==4.0.0", "reportlab==4.1.0"]
-    assert calls == [["sh", "-c", "/venv/bin/pip freeze | grep -i pdf"]]
+    assert result == ["pypdf==4.0.0"]
+    assert calls == [["uv", "pip", "freeze", "--python", "/opt/odoo/foodcoop18/.venv/bin/python"]]
 
 
-def test_pdf_pip_packages_none_when_grep_finds_nothing(monkeypatch):
+def test_pdf_pip_packages_reads_uv_pip_freeze_in_the_instance_venv(monkeypatch):
+    """Not `pip freeze` directly: a `uv`-managed venv routinely has no
+    `pip` binary at all -- confirmed live on foodcoop18-stag02, where the
+    resolved venv had no `.venv/bin/pip`. `uv pip freeze` reads the same
+    dist-info metadata without needing pip installed in the target venv."""
     monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
     monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
-    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/pip")
-    # grep with no match exits 1 -- pdf_pip_packages must not treat that as
-    # an error and must still return None, not raise or propagate the
-    # nonzero code.
-    _recorder(monkeypatch, stdout="", returncode=1)
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")
+    calls = _recorder(monkeypatch, stdout="pypdf==4.0.0\nreportlab==4.1.0\n", returncode=0)
+
+    result = probes.pdf_pip_packages(_INSTANCE, Host())
+
+    assert result == ["pypdf==4.0.0"]
+    assert calls == [["uv", "pip", "freeze", "--python", "/venv/bin/python3"]]
+
+
+def test_pdf_pip_packages_none_when_nothing_matches(monkeypatch):
+    monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")
+    _recorder(monkeypatch, stdout="reportlab==4.1.0\nrequests==2.31.0\n", returncode=0)
+
+    assert probes.pdf_pip_packages(_INSTANCE, Host()) is None
+
+
+def test_pdf_pip_packages_none_when_uv_pip_freeze_fails(monkeypatch):
+    """`uv pip freeze` exits nonzero for an interpreter it can't resolve as
+    a venv/system Python -- don't return the (irrelevant) stderr text as if
+    it were a package list."""
+    monkeypatch.setattr(probes, "procs_of", _fake_procs("python3 /opt/odoo/odoo-bin"))
+    monkeypatch.setattr(probes, "_environ_of", lambda *_: {"VIRTUAL_ENV": "/venv"})
+    monkeypatch.setattr(Host, "is_file", lambda self, path: path == "/venv/bin/python3")
+    _recorder(monkeypatch, stdout="", returncode=2)
 
     assert probes.pdf_pip_packages(_INSTANCE, Host()) is None
 

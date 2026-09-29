@@ -1970,21 +1970,50 @@ def wkhtmltopdf_version(host: Host = LOCAL) -> str | None:
 
 
 def pdf_pip_packages(inst: Instance, host: Host = LOCAL) -> list[str] | None:
-    """`pip freeze | grep -i pdf` inside the venv backing `inst`'s live
-    process -- reuses procs_of + _environ_of's VIRTUAL_ENV resolution, the
-    same precedent _resolve_argv0 already uses for venv-relative binaries.
-    None if the instance isn't running or has no resolvable venv."""
+    """PDF-related packages installed in the venv backing `inst`'s live
+    process, read via `uv pip freeze --python <interpreter>`. None if the
+    instance isn't running or has no resolvable venv.
+
+    Not `pip freeze` directly: a `uv`-managed venv routinely has no `pip`
+    binary at all (`uv venv` doesn't install one by default) -- confirmed
+    live on `foodcoop18-stag02` (2026-09-29), where the resolved venv had
+    no `.venv/bin/pip`. `uv pip freeze` reads the same dist-info metadata
+    without needing pip installed in the target venv, and matches this
+    org's own tooling (odoo-activity itself, and Odoo venvs alike, are
+    routinely uv-managed).
+
+    Venv resolution tries `VIRTUAL_ENV` in the process's environment first,
+    same precedent `_resolve_argv0` uses. But a unit launched by systemd (or
+    similar) with an absolute `ExecStart=/opt/odoo/<inst>/.venv/bin/python
+    ...` never runs an activation script, so that variable is routinely
+    unset even though the process is very much running inside a venv --
+    also confirmed live on the same host: `VIRTUAL_ENV` empty, argv[0]
+    itself `/opt/odoo/odoo-foodcoop18-staging/.venv/bin/python`. Falls back
+    to that argv[0] when it is itself an absolute `<venv>/bin/<name>` path
+    -- unlike `_exe_of` (`/proc/<pid>/exe`), which resolves straight through
+    that symlink to the base interpreter and loses the venv entirely,
+    argv[0] still names it as invoked.
+    """
     host = container_host(inst, host)
     procs = procs_of(inst, host)
     if not procs:
         return None
 
-    venv = _environ_of(procs[0]["pid"], host).get("VIRTUAL_ENV")
-    if not venv or not host.is_file(f"{venv}/bin/pip"):
+    pid = procs[0]["pid"]
+    venv = _environ_of(pid, host).get("VIRTUAL_ENV")
+    python = f"{venv}/bin/python3" if venv else None
+    if not python or not host.is_file(python):
+        argv0 = procs[0]["cmd"].split(None, 1)[0]
+        python = argv0 if argv0.startswith("/") and "/bin/" in argv0 and host.is_file(argv0) else None
+
+    if not python:
         return None
 
-    result = host.run(["sh", "-c", f"{shlex.quote(venv)}/bin/pip freeze | grep -i pdf"])
-    return [ln for ln in result.stdout.splitlines() if ln.strip()] or None
+    result = host.run(["uv", "pip", "freeze", "--python", python])
+    if result.returncode != 0:
+        return None
+
+    return [ln for ln in result.stdout.splitlines() if ln.strip() and "pdf" in ln.lower()] or None
 
 
 class CapturedReport(TypedDict):
