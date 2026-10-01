@@ -256,6 +256,20 @@ def test_start_odoo_logs_with_verbose_and_extra_flags(monkeypatch):
     )
 
 
+def test_start_odoo_logs_window_precedes_the_command(monkeypatch):
+    """`--from`/`--to` are odoo-logs global options, like `--verbose`."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(Host, "popen", lambda self, argv, **_: seen.append(argv) or "proc")
+
+    probes.start_odoo_logs(
+        "list", [Path("/var/log/server.log")], Host(), since="2026-09-25 19:50", until="2026-09-25 20:10"
+    )
+
+    assert seen[-1][2].endswith(
+        "exec odoo-logs --from '2026-09-25 19:50' --to '2026-09-25 20:10' --output-format json list /var/log/server.log"
+    )
+
+
 def test_matching_traceback_blocks_reverses_the_squashed_id():
     """`error` comes off the grouped row already squashed ("(N)" instead of
     a real pid) -- the search must still find the real pid in raw text."""

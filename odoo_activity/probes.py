@@ -2838,6 +2838,8 @@ def start_odoo_logs(
     *,
     verbose_file: str | None = None,
     extra: tuple[str, ...] = (),
+    since: str | None = None,
+    until: str | None = None,
 ) -> subprocess.Popen[str] | None:
     """Start `odoo-logs --output-format json <command> <files...>`, memory-
     and CPU-limited the way Odoo's own workers are.
@@ -2855,7 +2857,8 @@ def start_odoo_logs(
     back out of it, since the normal JSON output never carries more than a
     command's own columns (see error_traceback). `extra` are command-specific
     flags (e.g. `errors`'s `--traceback-only`), inserted after the command
-    name and before the file list.
+    name and before the file list. `since`/`until` are odoo-logs's own global
+    `--from`/`--to` (`YYYY-MM-DD[ HH:MM:SS]`), so they precede the command too.
 
     Returns the live process rather than waiting on it, so a caller can
     `.kill()` it if abandoned (e.g. the user picked a different analysis
@@ -2871,6 +2874,10 @@ def start_odoo_logs(
     argv = ["odoo-logs"]
     if verbose_file:
         argv += ["--verbose", verbose_file]
+    if since:
+        argv += ["--from", since]
+    if until:
+        argv += ["--to", until]
     argv += ["--output-format", "json", command, *extra, *(str(f) for f in files)]
     wrapped = (
         f"ulimit -t {_LOG_ANALYSIS_CPU_SECONDS}; ulimit -v {_LOG_ANALYSIS_MEMORY_MB * 1024}; exec {shlex.join(argv)}"

@@ -603,6 +603,53 @@ def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Hos
 
 @mcp.tool()
 @_pinned_host
+def instance_log_files(
+    name: str, since: str | None = None, until: str | None = None, *, target: Host
+) -> list[dict] | str:
+    """The instance's log files -- the current one and its rotated `.gz`
+    siblings -- with the period each one covers, oldest first. Only the
+    first and last entry of each file are read, so it is cheap even on
+    gigabytes of logs: use it to find which files hold a time window before
+    reading any log. Times are as written in the logs (Odoo logs UTC unless
+    configured otherwise).
+
+    Each row: `path`, `size` (bytes), `start`, `end` (timestamps) and `note`
+    (`gz`, `truncated`, `empty`, `no timestamps`, `overlaps previous`).
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        since: only files that may hold entries at or after this
+            (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`).
+        until: only files that may hold entries at or before this (same
+            format; a bare date covers that whole day).
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return "(no such instance)"
+
+    files = probes.instance_log_files(inst, target)
+    if not files:
+        return "(no log file found)"
+
+    proc = probes.start_odoo_logs("list", files, target, since=since, until=until)
+    if proc is None:
+        return "(couldn't start odoo-logs)"
+
+    try:
+        result = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "(odoo-logs timed out after 90s)"
+
+    rows, raw = probes.parse_odoo_db_output(*result)
+    return rows if rows is not None else raw
+
+
+@mcp.tool()
+@_pinned_host
 def instance_error_traceback(name: str, error_type: str, error: str, *, target: Host) -> str:
     """The full traceback text behind one row of
     `instance_log_analysis(name, "errors")` -- that row only carries a count

@@ -78,6 +78,57 @@ def test_instance_log_analysis_runs_odoo_logs_against_resolved_files(monkeypatch
     assert captured == {"command": "errors", "files": [Path("/var/log/server.log")]}
 
 
+def test_instance_log_files_no_such_instance(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: None)
+    assert mcp_server.instance_log_files("demo") == "(no such instance)"
+
+
+def test_instance_log_files_no_log_file(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [])
+    assert mcp_server.instance_log_files("demo") == "(no log file found)"
+
+
+def test_instance_log_files_runs_odoo_logs_list_with_the_window(monkeypatch):
+    """Same resolve/run/parse shape as instance_log_analysis; the window goes
+    to odoo-logs itself, which keeps only the files that overlap it."""
+    files = [Path("/var/log/server.log"), Path("/var/log/server.log.2026-09-25")]
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: files)
+
+    captured = {}
+    rows = [
+        {"path": "/var/log/server.log.2026-09-25", "size": 1, "start": "2026-09-25 07:16:00", "end": "x", "note": ""}
+    ]
+
+    class _FakeProc:
+        def communicate(self, timeout=None):
+            return json.dumps(rows), "Getting logs from 2026-09-25 19:50:00 to None"
+
+    def fake_start(command, files, host, *, since=None, until=None):
+        captured.update(command=command, files=files, since=since, until=until)
+        return _FakeProc()
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    assert mcp_server.instance_log_files("demo", since="2026-09-25 19:50", until="2026-09-25 20:10") == rows
+    assert captured == {"command": "list", "files": files, "since": "2026-09-25 19:50", "until": "2026-09-25 20:10"}
+
+
+def test_instance_log_files_relays_an_odoo_logs_without_list(monkeypatch):
+    """An older odoo-logs has no `list`: its own message beats a bare failure."""
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [Path("/var/log/server.log")])
+
+    class _FakeProc:
+        def communicate(self, timeout=None):
+            return "", "Error: No such command 'list'."
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", lambda *_a, **_k: _FakeProc())
+
+    assert mcp_server.instance_log_files("demo") == "Error: No such command 'list'."
+
+
 def test_instance_error_traceback_no_such_instance(monkeypatch):
     monkeypatch.setattr(mcp_server, "_find", lambda *_: None)
     assert mcp_server.instance_error_traceback("demo", "KeyError", "'socket'") == "(no such instance)"
@@ -263,6 +314,7 @@ def test_mcp_tools_do_not_crash():
         assert isinstance(mcp_server.instance_config(name), str)
         assert isinstance(mcp_server.instance_log_tail(name), str)
         assert isinstance(mcp_server.instance_log_analysis(name, "errors"), (list, str))
+        assert isinstance(mcp_server.instance_log_files(name), (list, str))
         assert isinstance(mcp_server.instance_error_traceback(name, "KeyError", "'socket'"), str)
 
         dbs = mcp_server.instance_databases(name)
