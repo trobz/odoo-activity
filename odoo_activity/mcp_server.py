@@ -570,6 +570,7 @@ def instance_log_analysis(
     command: LogAnalysisCommand,
     since: str | None = None,
     until: str | None = None,
+    database: str | None = None,
     *,
     target: Host,
 ) -> list[dict] | str:
@@ -586,6 +587,10 @@ def instance_log_analysis(
             `YYYY-MM-DD HH:MM:SS`, as written in the logs: usually UTC).
         until: only entries at or before this (same format; a bare date
             covers that whole day).
+        database: only entries for this database -- an instance serves
+            several, and without it every row mixes them. Lines whose
+            database is unknown (`?`, e.g. a log line written before a
+            request picks one) are kept, as they may belong to it.
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
@@ -603,7 +608,7 @@ def instance_log_analysis(
     if isinstance(files, str):
         return files
 
-    proc = probes.start_odoo_logs(command, files, target, since=since, until=until)
+    proc = probes.start_odoo_logs(command, files, target, since=since, until=until, database=database)
     if proc is None:
         return "(couldn't start odoo-logs)"
 
@@ -688,6 +693,7 @@ def instance_error_traceback(
     error: str,
     since: str | None = None,
     until: str | None = None,
+    database: str | None = None,
     *,
     target: Host,
 ) -> str:
@@ -706,12 +712,14 @@ def instance_error_traceback(
             `YYYY-MM-DD HH:MM:SS`, as written in the logs: usually UTC).
         until: only entries at or before this (same format; a bare date
             covers that whole day).
+        database: only entries for this database (as in
+            `instance_log_analysis`).
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
 
-    Pass the same `since`/`until` as the `instance_log_analysis` call the row
-    came from (or the row's own `first`/`last`): without them every rotated
+    Pass the same `since`/`until`/`database` as the `instance_log_analysis`
+    call the row came from (or the row's own `first`/`last`): without them every rotated
     file is read, which can exceed the memory limit and find nothing.
     """
     inst = _find(name, target)
@@ -723,7 +731,7 @@ def instance_error_traceback(
         return files
 
     return (
-        probes.error_traceback(files, error_type, error, target, since=since, until=until)
+        probes.error_traceback(files, error_type, error, target, since=since, until=until, database=database)
         or "(no matching traceback found)"
     )
 

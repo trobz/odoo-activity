@@ -66,7 +66,7 @@ def test_instance_log_analysis_runs_odoo_logs_against_resolved_files(monkeypatch
         def communicate(self, timeout=None):
             return json.dumps([{"type": "AccessError", "count": 3}]), ""
 
-    def fake_start(command, files, host, *, since=None, until=None):
+    def fake_start(command, files, host, *, since=None, until=None, database=None):
         captured["command"] = command
         captured["files"] = files
         return _FakeProc()
@@ -99,7 +99,7 @@ def test_instance_log_analysis_with_a_window_reads_only_the_overlapping_files(mo
     _instance_with_logs(monkeypatch, everything)
     calls = []
 
-    def fake_start(command, files, host, *, since=None, until=None):
+    def fake_start(command, files, host, *, since=None, until=None, database=None):
         calls.append({"command": command, "files": files, "since": since, "until": until})
         if command == "list":
             return _FakeProc(json.dumps([{"path": "/var/log/server.log.2026-09-25"}]))
@@ -115,6 +115,40 @@ def test_instance_log_analysis_with_a_window_reads_only_the_overlapping_files(mo
         {"command": "list", "files": everything, **window},
         {"command": "errors", "files": [Path("/var/log/server.log.2026-09-25")], **window},
     ]
+
+
+def test_instance_log_analysis_forwards_the_database(monkeypatch):
+    """`-d` is an odoo-logs global option; the tool just hands it on, with or
+    without a window."""
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    seen = []
+
+    def fake_start(command, files, host, *, since=None, until=None, database=None):
+        seen.append((command, database))
+        return _FakeProc(json.dumps([{"path": "/var/log/server.log"}]) if command == "list" else "[]")
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    mcp_server.instance_log_analysis("demo", "calls", database="lalouve_staging")
+    mcp_server.instance_log_analysis("demo", "calls", since="2026-09-29", database="lalouve_staging")
+
+    # the window pass (`list`) looks at files, not databases
+    assert seen == [("calls", "lalouve_staging"), ("list", None), ("calls", "lalouve_staging")]
+
+
+def test_instance_error_traceback_forwards_the_database(monkeypatch):
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    captured = {}
+
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None, database=None):
+        captured["database"] = database
+        return "KeyError: 'socket'"
+
+    monkeypatch.setattr(mcp_server.probes, "error_traceback", fake_error_traceback)
+
+    mcp_server.instance_error_traceback("demo", "KeyError", "'socket'", database="lalouve_staging")
+
+    assert captured == {"database": "lalouve_staging"}
 
 
 def test_instance_log_analysis_window_covered_by_no_file(monkeypatch):
@@ -149,7 +183,7 @@ def test_instance_log_analysis_without_a_window_still_reads_every_file(monkeypat
 
     mcp_server.instance_log_analysis("demo", "errors")
 
-    assert calls == [("errors", everything, {"since": None, "until": None})]
+    assert calls == [("errors", everything, {"since": None, "until": None, "database": None})]
 
 
 def test_instance_log_files_no_such_instance(monkeypatch):
@@ -179,7 +213,7 @@ def test_instance_log_files_runs_odoo_logs_list_with_the_window(monkeypatch):
         def communicate(self, timeout=None):
             return json.dumps(rows), "Getting logs from 2026-09-25 19:50:00 to None"
 
-    def fake_start(command, files, host, *, since=None, until=None):
+    def fake_start(command, files, host, *, since=None, until=None, database=None):
         captured.update(command=command, files=files, since=since, until=until)
         return _FakeProc()
 
@@ -229,7 +263,7 @@ def test_instance_error_traceback_resolves_files_and_forwards_type_error(monkeyp
 
     captured = {}
 
-    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None):
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None, database=None):
         captured["window"] = (since, until)
         captured["files"] = files
         captured["error_type"] = error_type
@@ -260,7 +294,7 @@ def test_instance_error_traceback_with_a_window_reads_only_the_overlapping_files
     )
     captured = {}
 
-    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None):
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None, database=None):
         captured.update(files=files, since=since, until=until)
         return "KeyError: 'socket'"
 

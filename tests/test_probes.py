@@ -280,6 +280,23 @@ def test_start_odoo_logs_with_verbose_and_extra_flags(monkeypatch):
     )
 
 
+def test_start_odoo_logs_database_precedes_the_command(monkeypatch):
+    """`--database` is a global option too: before the subcommand, with the
+    window, and left out entirely when not asked for."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(Host, "popen", lambda self, argv, **_: seen.append(argv) or "proc")
+
+    probes.start_odoo_logs(
+        "calls", [Path("/var/log/server.log")], Host(), since="2026-09-29", database="lalouve_staging"
+    )
+    probes.start_odoo_logs("calls", [Path("/var/log/server.log")], Host())
+
+    assert seen[0][2].endswith(
+        "exec odoo-logs --from 2026-09-29 --database lalouve_staging --output-format json calls /var/log/server.log"
+    )
+    assert "--database" not in seen[1][2]
+
+
 def test_start_odoo_logs_window_precedes_the_command(monkeypatch):
     """`--from`/`--to` are odoo-logs global options, like `--verbose`."""
     seen: list[list[str]] = []
@@ -409,8 +426,10 @@ def test_error_traceback_end_to_end(monkeypatch, tmp_path):
         def kill(self):
             pass
 
-    def fake_start_odoo_logs(command, files, host, *, verbose_file: str, extra=(), since=None, until=None):
-        seen_start_kwargs["window"] = (since, until)
+    def fake_start_odoo_logs(
+        command, files, host, *, verbose_file: str, extra=(), since=None, until=None, database=None
+    ):
+        seen_start_kwargs["window"] = (since, until, database)
         seen_start_kwargs["command"] = command
         seen_start_kwargs["files"] = files
         seen_start_kwargs["verbose_file"] = verbose_file
@@ -429,10 +448,16 @@ def test_error_traceback_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(Host, "run", fake_run)
 
     result = probes.error_traceback(
-        [Path("/var/log/server.log")], "KeyError", "'socket'", Host(), since="2026-01-01", until="2026-01-02"
+        [Path("/var/log/server.log")],
+        "KeyError",
+        "'socket'",
+        Host(),
+        since="2026-01-01",
+        until="2026-01-02",
+        database="demo_db",
     )
 
-    assert seen_start_kwargs["window"] == ("2026-01-01", "2026-01-02")
+    assert seen_start_kwargs["window"] == ("2026-01-01", "2026-01-02", "demo_db")
     assert seen_start_kwargs["command"] == "errors"
     assert seen_start_kwargs["extra"] == ("--traceback-only",)
     assert seen_start_kwargs["verbose_file"].startswith("/tmp/oa-errors-")

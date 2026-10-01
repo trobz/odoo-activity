@@ -2853,6 +2853,7 @@ def start_odoo_logs(
     extra: tuple[str, ...] = (),
     since: str | None = None,
     until: str | None = None,
+    database: str | None = None,
 ) -> subprocess.Popen[str] | None:
     """Start `odoo-logs --output-format json <command> <files...>`, memory-
     and CPU-limited the way Odoo's own workers are.
@@ -2871,7 +2872,8 @@ def start_odoo_logs(
     command's own columns (see error_traceback). `extra` are command-specific
     flags (e.g. `errors`'s `--traceback-only`), inserted after the command
     name and before the file list. `since`/`until` are odoo-logs's own global
-    `--from`/`--to` (`YYYY-MM-DD[ HH:MM:SS]`), so they precede the command too.
+    `--from`/`--to` (`YYYY-MM-DD[ HH:MM:SS]`), and `database` its `--database`,
+    so they precede the command too.
 
     Returns the live process rather than waiting on it, so a caller can
     `.kill()` it if abandoned (e.g. the user picked a different analysis
@@ -2891,6 +2893,8 @@ def start_odoo_logs(
         argv += ["--from", since]
     if until:
         argv += ["--to", until]
+    if database:
+        argv += ["--database", database]
     argv += ["--output-format", "json", command, *extra, *(str(f) for f in files)]
     wrapped = (
         f"ulimit -t {_LOG_ANALYSIS_CPU_SECONDS}; ulimit -v {_LOG_ANALYSIS_MEMORY_MB * 1024}; exec {shlex.join(argv)}"
@@ -2946,6 +2950,7 @@ def error_traceback(
     *,
     since: str | None = None,
     until: str | None = None,
+    database: str | None = None,
 ) -> str:
     """The full traceback text behind one `errors` group.
 
@@ -2976,7 +2981,14 @@ def error_traceback(
     verbose_path = f"/tmp/oa-errors-{os.getpid()}-{uuid.uuid4().hex}.log"
 
     proc = start_odoo_logs(
-        "errors", files, host, verbose_file=verbose_path, extra=("--traceback-only",), since=since, until=until
+        "errors",
+        files,
+        host,
+        verbose_file=verbose_path,
+        extra=("--traceback-only",),
+        since=since,
+        until=until,
+        database=database,
     )
     if proc is None:
         return ""
