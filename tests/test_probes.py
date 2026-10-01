@@ -270,6 +270,46 @@ def test_start_odoo_logs_window_precedes_the_command(monkeypatch):
     )
 
 
+class _Proc:
+    def __init__(self, stdout="", stderr=""):
+        self._result = (stdout, stderr)
+
+    def communicate(self, timeout=None):
+        return self._result
+
+
+def test_files_in_window_keeps_what_odoo_logs_list_returns(monkeypatch):
+    seen = {}
+
+    def fake_start(command, files, host, **kw):
+        seen.update(command=command, files=files, **kw)
+        return _Proc('[{"path": "/var/log/server.log.2"}]')
+
+    monkeypatch.setattr(probes, "start_odoo_logs", fake_start)
+    files = [Path("/var/log/server.log"), Path("/var/log/server.log.2")]
+
+    found = probes.files_in_window(files, "2026-09-25 19:50", "2026-09-25 20:10", Host())
+
+    assert found == [Path("/var/log/server.log.2")]
+    assert seen == {"command": "list", "files": files, "since": "2026-09-25 19:50", "until": "2026-09-25 20:10"}
+
+
+def test_files_in_window_hands_back_odoo_logs_own_message(monkeypatch):
+    monkeypatch.setattr(probes, "start_odoo_logs", lambda *_a, **_k: _Proc("", "Error: No such command 'list'."))
+
+    assert probes.files_in_window([Path("/var/log/server.log")], "2026-09-25", None, Host()) == (
+        "Error: No such command 'list'."
+    )
+
+
+def test_files_in_window_when_odoo_logs_cannot_start(monkeypatch):
+    monkeypatch.setattr(probes, "start_odoo_logs", lambda *_a, **_k: None)
+
+    assert probes.files_in_window([Path("/var/log/server.log")], "2026-09-25", None, Host()) == (
+        "(couldn't start odoo-logs)"
+    )
+
+
 def test_matching_traceback_blocks_reverses_the_squashed_id():
     """`error` comes off the grouped row already squashed ("(N)" instead of
     a real pid) -- the search must still find the real pid in raw text."""

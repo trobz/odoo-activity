@@ -565,7 +565,14 @@ def db_query(
 
 @mcp.tool()
 @_pinned_host
-def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Host) -> list[dict] | str:
+def instance_log_analysis(
+    name: str,
+    command: LogAnalysisCommand,
+    since: str | None = None,
+    until: str | None = None,
+    *,
+    target: Host,
+) -> list[dict] | str:
     """Run one of odoo-logs's 10 analyses against the instance's logfile and
     its rotated `.gz` siblings: errors, cron history, logins, outgoing mail,
     per-user activity, traffic usage, password changes, queue_job lifecycle,
@@ -575,9 +582,18 @@ def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Hos
         name: instance name as `list_instances` reports it.
         command: errors, crons, logins, mails, users, usage, passwords,
             jobs, workers, or calls.
+        since: only entries at or after this (`YYYY-MM-DD` or
+            `YYYY-MM-DD HH:MM:SS`, as written in the logs: usually UTC).
+        until: only entries at or before this (same format; a bare date
+            covers that whole day).
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
+
+    Always give `since`/`until` on an instance with a lot of logs: without
+    them every rotated file is read, which can exceed the memory limit the
+    analysis runs under and return nothing. With a window only the files
+    that overlap it are read (see `instance_log_files`).
     """
     inst = _find(name, target)
     if inst is None:
@@ -587,7 +603,16 @@ def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Hos
     if not files:
         return "(no log file found)"
 
-    proc = probes.start_odoo_logs(command, files, target)
+    if since or until:
+        in_window = probes.files_in_window(files, since, until, target)
+        if isinstance(in_window, str):
+            return in_window
+        if not in_window:
+            return "(no log file covers that window)"
+
+        files = in_window
+
+    proc = probes.start_odoo_logs(command, files, target, since=since, until=until)
     if proc is None:
         return "(couldn't start odoo-logs)"
 

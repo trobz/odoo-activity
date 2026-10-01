@@ -2889,6 +2889,32 @@ def start_odoo_logs(
         return None
 
 
+def files_in_window(files: list[Path], since: str | None, until: str | None, host: Host = LOCAL) -> list[Path] | str:
+    """Of `files`, the ones whose period overlaps `since`/`until`, from
+    `odoo-logs list` -- so a windowed analysis reads those and nothing else.
+
+    A scan has to parse every file it is given, and a rotation of large logs
+    passes the memory limit start_odoo_logs runs under; `list` only reads
+    each file's first and last entry. A str is a message to relay as-is
+    (odoo-logs missing, too old to have `list`, or timed out).
+    """
+    proc = start_odoo_logs("list", files, host, since=since, until=until)
+    if proc is None:
+        return "(couldn't start odoo-logs)"
+
+    try:
+        result = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "(odoo-logs timed out after 90s)"
+
+    rows, raw = parse_odoo_db_output(*result)
+    if rows is None:
+        return raw
+
+    return [Path(row["path"]) for row in rows]
+
+
 # A log entry's own head line -- just enough to find where one entry ends
 # and the next begins in a `--verbose`-dumped file, not a full re-parse
 # (that stays odoo-logs's job). Matches patterns.py's own TIME group.

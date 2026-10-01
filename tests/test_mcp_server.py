@@ -66,7 +66,7 @@ def test_instance_log_analysis_runs_odoo_logs_against_resolved_files(monkeypatch
         def communicate(self, timeout=None):
             return json.dumps([{"type": "AccessError", "count": 3}]), ""
 
-    def fake_start(command, files, host):
+    def fake_start(command, files, host, *, since=None, until=None):
         captured["command"] = command
         captured["files"] = files
         return _FakeProc()
@@ -76,6 +76,80 @@ def test_instance_log_analysis_runs_odoo_logs_against_resolved_files(monkeypatch
     result = mcp_server.instance_log_analysis("demo", "errors")
     assert result == [{"type": "AccessError", "count": 3}]
     assert captured == {"command": "errors", "files": [Path("/var/log/server.log")]}
+
+
+def _instance_with_logs(monkeypatch, files):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: files)
+
+
+class _FakeProc:
+    def __init__(self, stdout="[]", stderr=""):
+        self._result = (stdout, stderr)
+
+    def communicate(self, timeout=None):
+        return self._result
+
+
+def test_instance_log_analysis_with_a_window_reads_only_the_overlapping_files(monkeypatch):
+    """The window is resolved by `odoo-logs list` first, then handed to the
+    analysis itself, so it neither parses the other files nor returns rows
+    from outside the window."""
+    everything = [Path("/var/log/server.log"), Path("/var/log/server.log.2026-09-25"), Path("/var/log/server.log.2")]
+    _instance_with_logs(monkeypatch, everything)
+    calls = []
+
+    def fake_start(command, files, host, *, since=None, until=None):
+        calls.append({"command": command, "files": files, "since": since, "until": until})
+        if command == "list":
+            return _FakeProc(json.dumps([{"path": "/var/log/server.log.2026-09-25"}]))
+        return _FakeProc(json.dumps([{"type": "AccessError", "count": 3}]))
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    result = mcp_server.instance_log_analysis("demo", "errors", since="2026-09-25 19:50", until="2026-09-25 20:10")
+
+    window = {"since": "2026-09-25 19:50", "until": "2026-09-25 20:10"}
+    assert result == [{"type": "AccessError", "count": 3}]
+    assert calls == [
+        {"command": "list", "files": everything, **window},
+        {"command": "errors", "files": [Path("/var/log/server.log.2026-09-25")], **window},
+    ]
+
+
+def test_instance_log_analysis_window_covered_by_no_file(monkeypatch):
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", lambda *_a, **_k: _FakeProc("[]"))
+
+    assert mcp_server.instance_log_analysis("demo", "errors", since="2020-01-01") == "(no log file covers that window)"
+
+
+def test_instance_log_analysis_window_relays_an_odoo_logs_without_list(monkeypatch):
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    monkeypatch.setattr(
+        mcp_server.probes,
+        "start_odoo_logs",
+        lambda *_a, **_k: _FakeProc("", "Error: No such command 'list'."),
+    )
+
+    assert mcp_server.instance_log_analysis("demo", "errors", since="2026-09-25") == "Error: No such command 'list'."
+
+
+def test_instance_log_analysis_without_a_window_still_reads_every_file(monkeypatch):
+    """Unchanged behaviour: no `list` pass, no window handed to odoo-logs."""
+    everything = [Path("/var/log/server.log"), Path("/var/log/server.log.1")]
+    _instance_with_logs(monkeypatch, everything)
+    calls = []
+
+    def fake_start(command, files, host, **kw):
+        calls.append((command, files, kw))
+        return _FakeProc("[]")
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    mcp_server.instance_log_analysis("demo", "errors")
+
+    assert calls == [("errors", everything, {"since": None, "until": None})]
 
 
 def test_instance_log_files_no_such_instance(monkeypatch):
