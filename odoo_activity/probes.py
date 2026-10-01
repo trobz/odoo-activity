@@ -1360,11 +1360,25 @@ def logfile_of(inst: Instance, host: Host = LOCAL) -> Path | None:
 
 
 _LOG_ROTATION_RE = re.compile(r"\.(\d+)(?:\.gz)?$")
+# `server.log-2026-09-29-1790640084.gz`: the date, then the rotation's epoch.
+_LOG_EPOCH_RE = re.compile(r"-(\d{9,})(?:\.gz)?$")
+
+
+def _rotation_key(path: str) -> tuple[int, int]:
+    """Numbered rotations first (`.9` before `.10`), then dated ones newest
+    first; anything else keeps its glob order, last."""
+    if m := _LOG_ROTATION_RE.search(path):
+        return 0, int(m.group(1))
+    if m := _LOG_EPOCH_RE.search(path):
+        return 1, -int(m.group(1))
+
+    return 2, 0
 
 
 def instance_log_files(inst: Instance, host: Host = LOCAL) -> list[Path]:
     """This instance's logfile plus its rotated siblings (`server.log.1`,
-    `server.log.2.gz`, ...), oldest rotation last.
+    `server.log.2.gz`, or dated ones like `server.log-2026-09-29-1790640084.gz`
+    -- logrotate's `dateext` -- ...), oldest rotation last.
 
     odoo-logs's `LOGS` argument is typed `list[Path]` with Typer's
     `exists=True` validation — it *validates* paths, it doesn't *find* them,
@@ -1379,11 +1393,10 @@ def instance_log_files(inst: Instance, host: Host = LOCAL) -> list[Path]:
     if base is None or not host.is_file(base):
         return []
 
-    rotated = sorted(
-        (p for p in host.glob(f"{base}.*") if p != str(base)),
-        key=lambda p: int(m.group(1)) if (m := _LOG_ROTATION_RE.search(p)) else 0,
-    )
-    return [base, *(Path(p) for p in rotated)]
+    # A dot or a dash after the name: `server.log_rotating_lock` is neither.
+    siblings = {p for pattern in (f"{base}.*", f"{base}-*") for p in host.glob(pattern)} - {str(base)}
+
+    return [base, *(Path(p) for p in sorted(siblings, key=_rotation_key))]
 
 
 def _redirected_stdout(inst: Instance, host: Host = LOCAL) -> Path | None:

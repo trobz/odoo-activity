@@ -154,6 +154,30 @@ def test_instance_log_files_orders_rotations_numerically(tmp_path):
     ]
 
 
+def test_instance_log_files_finds_dated_rotations(tmp_path):
+    """logrotate's `dateext` names a rotation `server.log-<date>-<epoch>`,
+    with a dash, which a `server.log.*` glob never matched. Newest first,
+    and a lock file sharing the prefix is not a log."""
+    logfile = tmp_path / "server.log"
+    logfile.write_text("current")
+    (tmp_path / "server.log_rotating_lock").write_text("")
+    for name in (
+        "server.log-2026-09-28-1790553864.gz",
+        "server.log-2026-09-30-1790726664.gz",
+        "server.log-2026-08-04-1785801934",
+    ):
+        (tmp_path / name).write_text("old")
+
+    inst = _argv_inst(f"odoo-bin -d demo --logfile {logfile}")
+
+    assert probes.instance_log_files(inst, Host()) == [
+        logfile,
+        tmp_path / "server.log-2026-09-30-1790726664.gz",
+        tmp_path / "server.log-2026-09-28-1790553864.gz",
+        tmp_path / "server.log-2026-08-04-1785801934",
+    ]
+
+
 def test_instance_log_files_empty_when_logfile_missing(tmp_path):
     """A configured `logfile` that was never actually created — handing
     odoo-logs a missing path would refuse the whole command."""
