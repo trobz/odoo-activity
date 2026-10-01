@@ -385,7 +385,8 @@ def test_error_traceback_end_to_end(monkeypatch, tmp_path):
         def kill(self):
             pass
 
-    def fake_start_odoo_logs(command, files, host, *, verbose_file: str, extra=()):
+    def fake_start_odoo_logs(command, files, host, *, verbose_file: str, extra=(), since=None, until=None):
+        seen_start_kwargs["window"] = (since, until)
         seen_start_kwargs["command"] = command
         seen_start_kwargs["files"] = files
         seen_start_kwargs["verbose_file"] = verbose_file
@@ -403,8 +404,11 @@ def test_error_traceback_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(probes, "start_odoo_logs", fake_start_odoo_logs)
     monkeypatch.setattr(Host, "run", fake_run)
 
-    result = probes.error_traceback([Path("/var/log/server.log")], "KeyError", "'socket'", Host())
+    result = probes.error_traceback(
+        [Path("/var/log/server.log")], "KeyError", "'socket'", Host(), since="2026-01-01", until="2026-01-02"
+    )
 
+    assert seen_start_kwargs["window"] == ("2026-01-01", "2026-01-02")
     assert seen_start_kwargs["command"] == "errors"
     assert seen_start_kwargs["extra"] == ("--traceback-only",)
     assert seen_start_kwargs["verbose_file"].startswith("/tmp/oa-errors-")

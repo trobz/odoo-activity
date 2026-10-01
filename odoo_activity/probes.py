@@ -2925,7 +2925,15 @@ _LOG_LINE_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} ", 
 _SQUASHED_ID = re.escape("(N)")
 
 
-def error_traceback(files: list[Path], error_type: str, error: str, host: Host = LOCAL) -> str:
+def error_traceback(
+    files: list[Path],
+    error_type: str,
+    error: str,
+    host: Host = LOCAL,
+    *,
+    since: str | None = None,
+    until: str | None = None,
+) -> str:
     """The full traceback text behind one `errors` group.
 
     odoo-logs's grouped `errors` row keeps only a count and first/last
@@ -2943,6 +2951,10 @@ def error_traceback(files: list[Path], error_type: str, error: str, host: Host =
     reverses that back into `\\d+`, or a real id in the raw text would never
     match the literal "(N)".
 
+    `since`/`until` narrow the scan the way `instance_log_analysis`'s do, so
+    a traceback can be fetched for a windowed analysis without going back
+    over every rotated file.
+
     Empty if odoo-logs found nothing (wrong types/errors, no traceback
     survived `--traceback-only`, or odoo-logs isn't on PATH -- all
     indistinguishable here, same degradation as start_odoo_logs's own
@@ -2950,7 +2962,9 @@ def error_traceback(files: list[Path], error_type: str, error: str, host: Host =
     """
     verbose_path = f"/tmp/oa-errors-{os.getpid()}-{uuid.uuid4().hex}.log"
 
-    proc = start_odoo_logs("errors", files, host, verbose_file=verbose_path, extra=("--traceback-only",))
+    proc = start_odoo_logs(
+        "errors", files, host, verbose_file=verbose_path, extra=("--traceback-only",), since=since, until=until
+    )
     if proc is None:
         return ""
 

@@ -229,7 +229,8 @@ def test_instance_error_traceback_resolves_files_and_forwards_type_error(monkeyp
 
     captured = {}
 
-    def fake_error_traceback(files, error_type, error, host):
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None):
+        captured["window"] = (since, until)
         captured["files"] = files
         captured["error_type"] = error_type
         captured["error"] = error
@@ -240,7 +241,51 @@ def test_instance_error_traceback_resolves_files_and_forwards_type_error(monkeyp
     result = mcp_server.instance_error_traceback("demo", "KeyError", "'socket'")
 
     assert result == "Traceback (most recent call last):\nKeyError: 'socket'"
-    assert captured == {"files": [Path("/var/log/server.log")], "error_type": "KeyError", "error": "'socket'"}
+    assert captured == {
+        "window": (None, None),
+        "files": [Path("/var/log/server.log")],
+        "error_type": "KeyError",
+        "error": "'socket'",
+    }
+
+
+def test_instance_error_traceback_with_a_window_reads_only_the_overlapping_files(monkeypatch):
+    """Same file narrowing as instance_log_analysis, then the window itself
+    goes on to the traceback scan."""
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log"), Path("/var/log/server.log.2026-09-25")])
+    monkeypatch.setattr(
+        mcp_server.probes,
+        "files_in_window",
+        lambda files, since, until, host: [Path("/var/log/server.log.2026-09-25")],
+    )
+    captured = {}
+
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None):
+        captured.update(files=files, since=since, until=until)
+        return "KeyError: 'socket'"
+
+    monkeypatch.setattr(mcp_server.probes, "error_traceback", fake_error_traceback)
+
+    result = mcp_server.instance_error_traceback(
+        "demo", "KeyError", "'socket'", since="2026-09-25 19:50", until="2026-09-25 20:10"
+    )
+
+    assert result == "KeyError: 'socket'"
+    assert captured == {
+        "files": [Path("/var/log/server.log.2026-09-25")],
+        "since": "2026-09-25 19:50",
+        "until": "2026-09-25 20:10",
+    }
+
+
+def test_instance_error_traceback_window_covered_by_no_file(monkeypatch):
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    monkeypatch.setattr(mcp_server.probes, "files_in_window", lambda *_a, **_k: [])
+
+    assert (
+        mcp_server.instance_error_traceback("demo", "KeyError", "'socket'", since="2020-01-01")
+        == "(no log file covers that window)"
+    )
 
 
 def test_mail_audit_has_no_include_sensitive_information_argument():

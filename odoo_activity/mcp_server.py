@@ -599,18 +599,9 @@ def instance_log_analysis(
     if inst is None:
         return "(no such instance)"
 
-    files = probes.instance_log_files(inst, target)
-    if not files:
-        return "(no log file found)"
-
-    if since or until:
-        in_window = probes.files_in_window(files, since, until, target)
-        if isinstance(in_window, str):
-            return in_window
-        if not in_window:
-            return "(no log file covers that window)"
-
-        files = in_window
+    files = _log_files(inst, since, until, target)
+    if isinstance(files, str):
+        return files
 
     proc = probes.start_odoo_logs(command, files, target, since=since, until=until)
     if proc is None:
@@ -624,6 +615,22 @@ def instance_log_analysis(
 
     rows, raw = probes.parse_odoo_db_output(*result)
     return rows if rows is not None else raw
+
+
+def _log_files(inst, since: str | None, until: str | None, target: Host) -> list[Path] | str:
+    """The instance's log files, narrowed to those overlapping `since`/`until`
+    when given -- or a message the tool should return as-is."""
+    files = probes.instance_log_files(inst, target)
+    if not files:
+        return "(no log file found)"
+    if not (since or until):
+        return files
+
+    in_window = probes.files_in_window(files, since, until, target)
+    if isinstance(in_window, str):
+        return in_window
+
+    return in_window or "(no log file covers that window)"
 
 
 @mcp.tool()
@@ -675,7 +682,15 @@ def instance_log_files(
 
 @mcp.tool()
 @_pinned_host
-def instance_error_traceback(name: str, error_type: str, error: str, *, target: Host) -> str:
+def instance_error_traceback(
+    name: str,
+    error_type: str,
+    error: str,
+    since: str | None = None,
+    until: str | None = None,
+    *,
+    target: Host,
+) -> str:
     """The full traceback text behind one row of
     `instance_log_analysis(name, "errors")` -- that row only carries a count
     and first/last seen timestamps, never the traceback itself, since
@@ -687,19 +702,30 @@ def instance_error_traceback(name: str, error_type: str, error: str, *, target: 
         name: instance name as `list_instances` reports it.
         error_type: the row's own `type` field, verbatim.
         error: the row's own `error` field, verbatim.
+        since: only entries at or after this (`YYYY-MM-DD` or
+            `YYYY-MM-DD HH:MM:SS`, as written in the logs: usually UTC).
+        until: only entries at or before this (same format; a bare date
+            covers that whole day).
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
+
+    Pass the same `since`/`until` as the `instance_log_analysis` call the row
+    came from (or the row's own `first`/`last`): without them every rotated
+    file is read, which can exceed the memory limit and find nothing.
     """
     inst = _find(name, target)
     if inst is None:
         return "(no such instance)"
 
-    files = probes.instance_log_files(inst, target)
-    if not files:
-        return "(no log file found)"
+    files = _log_files(inst, since, until, target)
+    if isinstance(files, str):
+        return files
 
-    return probes.error_traceback(files, error_type, error, target) or "(no matching traceback found)"
+    return (
+        probes.error_traceback(files, error_type, error, target, since=since, until=until)
+        or "(no matching traceback found)"
+    )
 
 
 @mcp.tool()
