@@ -565,7 +565,15 @@ def db_query(
 
 @mcp.tool()
 @_pinned_host
-def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Host) -> list[dict] | str:
+def instance_log_analysis(
+    name: str,
+    command: LogAnalysisCommand,
+    since: str | None = None,
+    until: str | None = None,
+    database: str | None = None,
+    *,
+    target: Host,
+) -> list[dict] | str:
     """Run one of odoo-logs's 10 analyses against the instance's logfile and
     its rotated `.gz` siblings: errors, cron history, logins, outgoing mail,
     per-user activity, traffic usage, password changes, queue_job lifecycle,
@@ -575,6 +583,82 @@ def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Hos
         name: instance name as `list_instances` reports it.
         command: errors, crons, logins, mails, users, usage, passwords,
             jobs, workers, or calls.
+        since: only entries at or after this (`YYYY-MM-DD` or
+            `YYYY-MM-DD HH:MM:SS`, as written in the logs: usually UTC).
+        until: only entries at or before this (same format; a bare date
+            covers that whole day).
+        database: only entries for this database -- an instance serves
+            several, and without it every row mixes them. Lines whose
+            database is unknown (`?`, e.g. a log line written before a
+            request picks one) are kept, as they may belong to it.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+
+    Always give `since`/`until` on an instance with a lot of logs: without
+    them every rotated file is read, which can exceed the memory limit the
+    analysis runs under and return nothing. With a window only the files
+    that overlap it are read (see `instance_log_files`).
+    """
+    inst = _find(name, target)
+    if inst is None:
+        return "(no such instance)"
+
+    files = _log_files(inst, since, until, target)
+    if isinstance(files, str):
+        return files
+
+    proc = probes.start_odoo_logs(command, files, target, since=since, until=until, database=database)
+    if proc is None:
+        return "(couldn't start odoo-logs)"
+
+    try:
+        result = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "(odoo-logs timed out after 90s)"
+
+    rows, raw = probes.parse_odoo_db_output(*result)
+    return rows if rows is not None else raw
+
+
+def _log_files(inst, since: str | None, until: str | None, target: Host) -> list[Path] | str:
+    """The instance's log files, narrowed to those overlapping `since`/`until`
+    when given -- or a message the tool should return as-is."""
+    files = probes.instance_log_files(inst, target)
+    if not files:
+        return "(no log file found)"
+    if not (since or until):
+        return files
+
+    in_window = probes.files_in_window(files, since, until, target)
+    if isinstance(in_window, str):
+        return in_window
+
+    return in_window or "(no log file covers that window)"
+
+
+@mcp.tool()
+@_pinned_host
+def instance_log_files(
+    name: str, since: str | None = None, until: str | None = None, *, target: Host
+) -> list[dict] | str:
+    """The instance's log files -- the current one and its rotated `.gz`
+    siblings -- with the period each one covers, oldest first. Only the
+    first and last entry of each file are read, so it is cheap even on
+    gigabytes of logs: use it to find which files hold a time window before
+    reading any log. Times are as written in the logs (Odoo logs UTC unless
+    configured otherwise).
+
+    Each row: `path`, `size` (bytes), `start`, `end` (timestamps) and `note`
+    (`gz`, `truncated`, `empty`, `no timestamps`, `overlaps previous`).
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        since: only files that may hold entries at or after this
+            (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`).
+        until: only files that may hold entries at or before this (same
+            format; a bare date covers that whole day).
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
@@ -587,7 +671,7 @@ def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Hos
     if not files:
         return "(no log file found)"
 
-    proc = probes.start_odoo_logs(command, files, target)
+    proc = probes.start_odoo_logs("list", files, target, since=since, until=until)
     if proc is None:
         return "(couldn't start odoo-logs)"
 
@@ -603,7 +687,16 @@ def instance_log_analysis(name: str, command: LogAnalysisCommand, *, target: Hos
 
 @mcp.tool()
 @_pinned_host
-def instance_error_traceback(name: str, error_type: str, error: str, *, target: Host) -> str:
+def instance_error_traceback(
+    name: str,
+    error_type: str,
+    error: str,
+    since: str | None = None,
+    until: str | None = None,
+    database: str | None = None,
+    *,
+    target: Host,
+) -> str:
     """The full traceback text behind one row of
     `instance_log_analysis(name, "errors")` -- that row only carries a count
     and first/last seen timestamps, never the traceback itself, since
@@ -615,19 +708,32 @@ def instance_error_traceback(name: str, error_type: str, error: str, *, target: 
         name: instance name as `list_instances` reports it.
         error_type: the row's own `type` field, verbatim.
         error: the row's own `error` field, verbatim.
+        since: only entries at or after this (`YYYY-MM-DD` or
+            `YYYY-MM-DD HH:MM:SS`, as written in the logs: usually UTC).
+        until: only entries at or before this (same format; a bare date
+            covers that whole day).
+        database: only entries for this database (as in
+            `instance_log_analysis`).
         host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
             Omit to probe the machine this server runs on.
         ssh_port: ssh port, if `host` is not on the default 22.
+
+    Pass the same `since`/`until`/`database` as the `instance_log_analysis`
+    call the row came from (or the row's own `first`/`last`): without them every rotated
+    file is read, which can exceed the memory limit and find nothing.
     """
     inst = _find(name, target)
     if inst is None:
         return "(no such instance)"
 
-    files = probes.instance_log_files(inst, target)
-    if not files:
-        return "(no log file found)"
+    files = _log_files(inst, since, until, target)
+    if isinstance(files, str):
+        return files
 
-    return probes.error_traceback(files, error_type, error, target) or "(no matching traceback found)"
+    return (
+        probes.error_traceback(files, error_type, error, target, since=since, until=until, database=database)
+        or "(no matching traceback found)"
+    )
 
 
 @mcp.tool()

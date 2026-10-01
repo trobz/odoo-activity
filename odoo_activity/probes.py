@@ -1360,11 +1360,25 @@ def logfile_of(inst: Instance, host: Host = LOCAL) -> Path | None:
 
 
 _LOG_ROTATION_RE = re.compile(r"\.(\d+)(?:\.gz)?$")
+# `server.log-2026-09-29-1790640084.gz`: the date, then the rotation's epoch.
+_LOG_EPOCH_RE = re.compile(r"-(\d{9,})(?:\.gz)?$")
+
+
+def _rotation_key(path: str) -> tuple[int, int]:
+    """Numbered rotations first (`.9` before `.10`), then dated ones newest
+    first; anything else keeps its glob order, last."""
+    if m := _LOG_ROTATION_RE.search(path):
+        return 0, int(m.group(1))
+    if m := _LOG_EPOCH_RE.search(path):
+        return 1, -int(m.group(1))
+
+    return 2, 0
 
 
 def instance_log_files(inst: Instance, host: Host = LOCAL) -> list[Path]:
     """This instance's logfile plus its rotated siblings (`server.log.1`,
-    `server.log.2.gz`, ...), oldest rotation last.
+    `server.log.2.gz`, or dated ones like `server.log-2026-09-29-1790640084.gz`
+    -- logrotate's `dateext` -- ...), oldest rotation last.
 
     odoo-logs's `LOGS` argument is typed `list[Path]` with Typer's
     `exists=True` validation — it *validates* paths, it doesn't *find* them,
@@ -1379,11 +1393,10 @@ def instance_log_files(inst: Instance, host: Host = LOCAL) -> list[Path]:
     if base is None or not host.is_file(base):
         return []
 
-    rotated = sorted(
-        (p for p in host.glob(f"{base}.*") if p != str(base)),
-        key=lambda p: int(m.group(1)) if (m := _LOG_ROTATION_RE.search(p)) else 0,
-    )
-    return [base, *(Path(p) for p in rotated)]
+    # A dot or a dash after the name: `server.log_rotating_lock` is neither.
+    siblings = {p for pattern in (f"{base}.*", f"{base}-*") for p in host.glob(pattern)} - {str(base)}
+
+    return [base, *(Path(p) for p in sorted(siblings, key=_rotation_key))]
 
 
 def _redirected_stdout(inst: Instance, host: Host = LOCAL) -> Path | None:
@@ -2872,6 +2885,9 @@ def start_odoo_logs(
     *,
     verbose_file: str | None = None,
     extra: tuple[str, ...] = (),
+    since: str | None = None,
+    until: str | None = None,
+    database: str | None = None,
 ) -> subprocess.Popen[str] | None:
     """Start `odoo-logs --output-format json <command> <files...>`, memory-
     and CPU-limited the way Odoo's own workers are.
@@ -2889,7 +2905,9 @@ def start_odoo_logs(
     back out of it, since the normal JSON output never carries more than a
     command's own columns (see error_traceback). `extra` are command-specific
     flags (e.g. `errors`'s `--traceback-only`), inserted after the command
-    name and before the file list.
+    name and before the file list. `since`/`until` are odoo-logs's own global
+    `--from`/`--to` (`YYYY-MM-DD[ HH:MM:SS]`), and `database` its `--database`,
+    so they precede the command too.
 
     Returns the live process rather than waiting on it, so a caller can
     `.kill()` it if abandoned (e.g. the user picked a different analysis
@@ -2905,6 +2923,12 @@ def start_odoo_logs(
     argv = ["odoo-logs"]
     if verbose_file:
         argv += ["--verbose", verbose_file]
+    if since:
+        argv += ["--from", since]
+    if until:
+        argv += ["--to", until]
+    if database:
+        argv += ["--database", database]
     argv += ["--output-format", "json", command, *extra, *(str(f) for f in files)]
     wrapped = (
         f"ulimit -t {_LOG_ANALYSIS_CPU_SECONDS}; ulimit -v {_LOG_ANALYSIS_MEMORY_MB * 1024}; exec {shlex.join(argv)}"
@@ -2914,6 +2938,32 @@ def start_odoo_logs(
         return host.popen(["sh", "-c", wrapped])
     except FileNotFoundError:
         return None
+
+
+def files_in_window(files: list[Path], since: str | None, until: str | None, host: Host = LOCAL) -> list[Path] | str:
+    """Of `files`, the ones whose period overlaps `since`/`until`, from
+    `odoo-logs list` -- so a windowed analysis reads those and nothing else.
+
+    A scan has to parse every file it is given, and a rotation of large logs
+    passes the memory limit start_odoo_logs runs under; `list` only reads
+    each file's first and last entry. A str is a message to relay as-is
+    (odoo-logs missing, too old to have `list`, or timed out).
+    """
+    proc = start_odoo_logs("list", files, host, since=since, until=until)
+    if proc is None:
+        return "(couldn't start odoo-logs)"
+
+    try:
+        result = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "(odoo-logs timed out after 90s)"
+
+    rows, raw = parse_odoo_db_output(*result)
+    if rows is None:
+        return raw
+
+    return [Path(row["path"]) for row in rows]
 
 
 # A log entry's own head line -- just enough to find where one entry ends
@@ -2926,7 +2976,16 @@ _LOG_LINE_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} ", 
 _SQUASHED_ID = re.escape("(N)")
 
 
-def error_traceback(files: list[Path], error_type: str, error: str, host: Host = LOCAL) -> str:
+def error_traceback(
+    files: list[Path],
+    error_type: str,
+    error: str,
+    host: Host = LOCAL,
+    *,
+    since: str | None = None,
+    until: str | None = None,
+    database: str | None = None,
+) -> str:
     """The full traceback text behind one `errors` group.
 
     odoo-logs's grouped `errors` row keeps only a count and first/last
@@ -2944,6 +3003,10 @@ def error_traceback(files: list[Path], error_type: str, error: str, host: Host =
     reverses that back into `\\d+`, or a real id in the raw text would never
     match the literal "(N)".
 
+    `since`/`until` narrow the scan the way `instance_log_analysis`'s do, so
+    a traceback can be fetched for a windowed analysis without going back
+    over every rotated file.
+
     Empty if odoo-logs found nothing (wrong types/errors, no traceback
     survived `--traceback-only`, or odoo-logs isn't on PATH -- all
     indistinguishable here, same degradation as start_odoo_logs's own
@@ -2951,7 +3014,16 @@ def error_traceback(files: list[Path], error_type: str, error: str, host: Host =
     """
     verbose_path = f"/tmp/oa-errors-{os.getpid()}-{uuid.uuid4().hex}.log"
 
-    proc = start_odoo_logs("errors", files, host, verbose_file=verbose_path, extra=("--traceback-only",))
+    proc = start_odoo_logs(
+        "errors",
+        files,
+        host,
+        verbose_file=verbose_path,
+        extra=("--traceback-only",),
+        since=since,
+        until=until,
+        database=database,
+    )
     if proc is None:
         return ""
 
