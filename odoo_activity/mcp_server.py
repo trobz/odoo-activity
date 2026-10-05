@@ -26,6 +26,7 @@ login.
 import functools
 import inspect
 import re
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -681,6 +682,12 @@ def instance_log_files(
         proc.kill()
         return "(odoo-logs timed out after 90s)"
 
+    if proc.returncode in (-signal.SIGKILL, 128 + signal.SIGKILL):
+        return (
+            "(odoo-logs list was killed, probably by the 60s CPU limit"
+            " while caching .gz archives; calling again should continue from there)"
+        )
+
     rows, raw = probes.parse_odoo_db_output(*result)
     return rows if rows is not None else raw
 
@@ -719,12 +726,18 @@ def instance_error_traceback(
         ssh_port: ssh port, if `host` is not on the default 22.
 
     Pass the same `since`/`until`/`database` as the `instance_log_analysis`
-    call the row came from (or the row's own `first`/`last`): without them every rotated
-    file is read, which can exceed the memory limit and find nothing.
+    call the row came from. The row's own `first`/`last` also work as
+    bounds: they carry microseconds, which are cut to the second before
+    they reach odoo-logs (whose `--from`/`--to` only accepts
+    `YYYY-MM-DD[ HH:MM:SS]`). Without them every rotated file is read,
+    which can exceed the memory limit and find nothing.
     """
     inst = _find(name, target)
     if inst is None:
         return "(no such instance)"
+
+    since = since.split(",")[0].split(".")[0] if since else None
+    until = until.split(",")[0].split(".")[0] if until else None
 
     files = _log_files(inst, since, until, target)
     if isinstance(files, str):

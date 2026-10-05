@@ -86,6 +86,7 @@ def _instance_with_logs(monkeypatch, files):
 class _FakeProc:
     def __init__(self, stdout="[]", stderr=""):
         self._result = (stdout, stderr)
+        self.returncode = 0
 
     def communicate(self, timeout=None):
         return self._result
@@ -134,6 +135,36 @@ def test_instance_log_analysis_forwards_the_database(monkeypatch):
 
     # the window pass (`list`) looks at files, not databases
     assert seen == [("calls", "lalouve_staging"), ("list", None), ("calls", "lalouve_staging")]
+
+
+def test_instance_error_traceback_cuts_row_timestamps_to_the_second(monkeypatch):
+    """A row's own `first`/`last` carry microseconds, which odoo-logs's
+    --from/--to rejects ("unrecognized date: '2026-10-02 02:00:07.836000'"):
+    they are cut to the second before being passed on."""
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    captured = {}
+
+    def fake_files_in_window(files, since, until, host):
+        captured["since"] = since
+        captured["until"] = until
+        return files
+
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None, database=None):
+        captured["tb_since"] = since
+        return "Traceback text"
+
+    monkeypatch.setattr(mcp_server.probes, "files_in_window", fake_files_in_window)
+    monkeypatch.setattr(mcp_server.probes, "error_traceback", fake_error_traceback)
+
+    result = mcp_server.instance_error_traceback(
+        "demo", "AccessError", "(N)", since="2026-10-02 02:00:07.836000", until="2026-10-02 02:59:59,999"
+    )
+    assert result == "Traceback text"
+    assert captured == {
+        "since": "2026-10-02 02:00:07",
+        "until": "2026-10-02 02:59:59",
+        "tb_since": "2026-10-02 02:00:07",
+    }
 
 
 def test_instance_error_traceback_forwards_the_database(monkeypatch):
@@ -210,6 +241,8 @@ def test_instance_log_files_runs_odoo_logs_list_with_the_window(monkeypatch):
     ]
 
     class _FakeProc:
+        returncode = 0
+
         def communicate(self, timeout=None):
             return json.dumps(rows), "Getting logs from 2026-09-25 19:50:00 to None"
 
@@ -229,6 +262,8 @@ def test_instance_log_files_relays_an_odoo_logs_without_list(monkeypatch):
     monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [Path("/var/log/server.log")])
 
     class _FakeProc:
+        returncode = 0
+
         def communicate(self, timeout=None):
             return "", "Error: No such command 'list'."
 

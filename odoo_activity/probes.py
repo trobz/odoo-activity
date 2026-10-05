@@ -1394,7 +1394,12 @@ def instance_log_files(inst: Instance, host: Host = LOCAL) -> list[Path]:
         return []
 
     # A dot or a dash after the name: `server.log_rotating_lock` is neither.
-    siblings = {p for pattern in (f"{base}.*", f"{base}-*") for p in host.glob(pattern)} - {str(base)}
+    # is_file, not the glob, is what keeps out directories sharing the
+    # prefix (`server.log-backup/`): `-*` matches them, and odoo-logs
+    # refuses the whole command over one directory in the list.
+    siblings = {
+        p for pattern in (f"{base}.*", f"{base}-*") for p in host.glob(pattern) if p != str(base) and host.is_file(p)
+    }
 
     return [base, *(Path(p) for p in sorted(siblings, key=_rotation_key))]
 
@@ -2924,6 +2929,16 @@ def files_in_window(files: list[Path], since: str | None, until: str | None, hos
     except subprocess.TimeoutExpired:
         proc.kill()
         return "(odoo-logs timed out after 90s)"
+
+    # ulimit -t kills list without any output of its own: an empty return
+    # here would read as "no logs". Most likely on a first call over a big
+    # rotation, while the .gz cache is cold; odoo-logs saves that cache as
+    # it goes, so the next call continues from there.
+    if proc.returncode in (-signal.SIGKILL, 128 + signal.SIGKILL):
+        return (
+            f"(odoo-logs list was killed, probably by the {_LOG_ANALYSIS_CPU_SECONDS}s CPU limit"
+            " while caching .gz archives; calling again should continue from there)"
+        )
 
     rows, raw = parse_odoo_db_output(*result)
     if rows is None:

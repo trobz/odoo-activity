@@ -178,6 +178,22 @@ def test_instance_log_files_finds_dated_rotations(tmp_path):
     ]
 
 
+def test_instance_log_files_skips_a_directory_sharing_the_prefix(tmp_path):
+    """`server.log-backup/` matches the new `-*` glob; odoo-logs refuses the
+    whole command over one directory in its file list, so the sibling
+    lookup must drop it the way it never found it before dateext support."""
+    logfile = tmp_path / "server.log"
+    logfile.write_text("current")
+    backup = tmp_path / "server.log-backup"
+    backup.mkdir()
+    (backup / "keep.txt").write_text("data")
+    (tmp_path / "server.log.1.gz").write_text("old")
+
+    inst = _argv_inst(f"odoo-bin -d demo --logfile {logfile}")
+
+    assert probes.instance_log_files(inst, Host()) == [logfile, tmp_path / "server.log.1.gz"]
+
+
 def test_instance_log_files_empty_when_logfile_missing(tmp_path):
     """A configured `logfile` that was never actually created — handing
     odoo-logs a missing path would refuse the whole command."""
@@ -314,9 +330,23 @@ def test_start_odoo_logs_window_precedes_the_command(monkeypatch):
 class _Proc:
     def __init__(self, stdout="", stderr=""):
         self._result = (stdout, stderr)
+        self.returncode = 0
 
     def communicate(self, timeout=None):
         return self._result
+
+
+def test_files_in_window_reports_a_killed_list(monkeypatch):
+    """ulimit -t kills list silently; a killed run must not read as "no logs"."""
+    killed = _Proc("")
+    killed.returncode = -9
+
+    monkeypatch.setattr(probes, "start_odoo_logs", lambda *_a, **_k: killed)
+
+    assert probes.files_in_window([Path("/var/log/server.log")], None, None, Host()) == (
+        "(odoo-logs list was killed, probably by the 60s CPU limit while caching"
+        " .gz archives; calling again should continue from there)"
+    )
 
 
 def test_files_in_window_keeps_what_odoo_logs_list_returns(monkeypatch):
