@@ -154,6 +154,46 @@ def test_instance_log_files_orders_rotations_numerically(tmp_path):
     ]
 
 
+def test_instance_log_files_finds_dated_rotations(tmp_path):
+    """logrotate's `dateext` names a rotation `server.log-<date>-<epoch>`,
+    with a dash, which a `server.log.*` glob never matched. Newest first,
+    and a lock file sharing the prefix is not a log."""
+    logfile = tmp_path / "server.log"
+    logfile.write_text("current")
+    (tmp_path / "server.log_rotating_lock").write_text("")
+    for name in (
+        "server.log-2026-09-28-1790553864.gz",
+        "server.log-2026-09-30-1790726664.gz",
+        "server.log-2026-08-04-1785801934",
+    ):
+        (tmp_path / name).write_text("old")
+
+    inst = _argv_inst(f"odoo-bin -d demo --logfile {logfile}")
+
+    assert probes.instance_log_files(inst, Host()) == [
+        logfile,
+        tmp_path / "server.log-2026-09-30-1790726664.gz",
+        tmp_path / "server.log-2026-09-28-1790553864.gz",
+        tmp_path / "server.log-2026-08-04-1785801934",
+    ]
+
+
+def test_instance_log_files_skips_a_directory_sharing_the_prefix(tmp_path):
+    """`server.log-backup/` matches the new `-*` glob; odoo-logs refuses the
+    whole command over one directory in its file list, so the sibling
+    lookup must drop it the way it never found it before dateext support."""
+    logfile = tmp_path / "server.log"
+    logfile.write_text("current")
+    backup = tmp_path / "server.log-backup"
+    backup.mkdir()
+    (backup / "keep.txt").write_text("data")
+    (tmp_path / "server.log.1.gz").write_text("old")
+
+    inst = _argv_inst(f"odoo-bin -d demo --logfile {logfile}")
+
+    assert probes.instance_log_files(inst, Host()) == [logfile, tmp_path / "server.log.1.gz"]
+
+
 def test_instance_log_files_empty_when_logfile_missing(tmp_path):
     """A configured `logfile` that was never actually created — handing
     odoo-logs a missing path would refuse the whole command."""
@@ -256,6 +296,91 @@ def test_start_odoo_logs_with_verbose_and_extra_flags(monkeypatch):
     )
 
 
+def test_start_odoo_logs_database_precedes_the_command(monkeypatch):
+    """`--database` is a global option too: before the subcommand, with the
+    window, and left out entirely when not asked for."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(Host, "popen", lambda self, argv, **_: seen.append(argv) or "proc")
+
+    probes.start_odoo_logs(
+        "calls", [Path("/var/log/server.log")], Host(), since="2026-09-29", database="lalouve_staging"
+    )
+    probes.start_odoo_logs("calls", [Path("/var/log/server.log")], Host())
+
+    assert seen[0][2].endswith(
+        "exec odoo-logs --from 2026-09-29 --database lalouve_staging --output-format json calls /var/log/server.log"
+    )
+    assert "--database" not in seen[1][2]
+
+
+def test_start_odoo_logs_window_precedes_the_command(monkeypatch):
+    """`--from`/`--to` are odoo-logs global options, like `--verbose`."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(Host, "popen", lambda self, argv, **_: seen.append(argv) or "proc")
+
+    probes.start_odoo_logs(
+        "list", [Path("/var/log/server.log")], Host(), since="2026-09-25 19:50", until="2026-09-25 20:10"
+    )
+
+    assert seen[-1][2].endswith(
+        "exec odoo-logs --from '2026-09-25 19:50' --to '2026-09-25 20:10' --output-format json list /var/log/server.log"
+    )
+
+
+class _Proc:
+    def __init__(self, stdout="", stderr=""):
+        self._result = (stdout, stderr)
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        return self._result
+
+
+def test_files_in_window_reports_a_killed_list(monkeypatch):
+    """ulimit -t kills list silently; a killed run must not read as "no logs"."""
+    killed = _Proc("")
+    killed.returncode = -9
+
+    monkeypatch.setattr(probes, "start_odoo_logs", lambda *_a, **_k: killed)
+
+    assert probes.files_in_window([Path("/var/log/server.log")], None, None, Host()) == (
+        "(odoo-logs list was killed, probably by the 60s CPU limit while caching"
+        " .gz archives; calling again should continue from there)"
+    )
+
+
+def test_files_in_window_keeps_what_odoo_logs_list_returns(monkeypatch):
+    seen = {}
+
+    def fake_start(command, files, host, **kw):
+        seen.update(command=command, files=files, **kw)
+        return _Proc('[{"path": "/var/log/server.log.2"}]')
+
+    monkeypatch.setattr(probes, "start_odoo_logs", fake_start)
+    files = [Path("/var/log/server.log"), Path("/var/log/server.log.2")]
+
+    found = probes.files_in_window(files, "2026-09-25 19:50", "2026-09-25 20:10", Host())
+
+    assert found == [Path("/var/log/server.log.2")]
+    assert seen == {"command": "list", "files": files, "since": "2026-09-25 19:50", "until": "2026-09-25 20:10"}
+
+
+def test_files_in_window_hands_back_odoo_logs_own_message(monkeypatch):
+    monkeypatch.setattr(probes, "start_odoo_logs", lambda *_a, **_k: _Proc("", "Error: No such command 'list'."))
+
+    assert probes.files_in_window([Path("/var/log/server.log")], "2026-09-25", None, Host()) == (
+        "Error: No such command 'list'."
+    )
+
+
+def test_files_in_window_when_odoo_logs_cannot_start(monkeypatch):
+    monkeypatch.setattr(probes, "start_odoo_logs", lambda *_a, **_k: None)
+
+    assert probes.files_in_window([Path("/var/log/server.log")], "2026-09-25", None, Host()) == (
+        "(couldn't start odoo-logs)"
+    )
+
+
 def test_matching_traceback_blocks_reverses_the_squashed_id():
     """`error` comes off the grouped row already squashed ("(N)" instead of
     a real pid) -- the search must still find the real pid in raw text."""
@@ -331,7 +456,10 @@ def test_error_traceback_end_to_end(monkeypatch, tmp_path):
         def kill(self):
             pass
 
-    def fake_start_odoo_logs(command, files, host, *, verbose_file: str, extra=()):
+    def fake_start_odoo_logs(
+        command, files, host, *, verbose_file: str, extra=(), since=None, until=None, database=None
+    ):
+        seen_start_kwargs["window"] = (since, until, database)
         seen_start_kwargs["command"] = command
         seen_start_kwargs["files"] = files
         seen_start_kwargs["verbose_file"] = verbose_file
@@ -349,8 +477,17 @@ def test_error_traceback_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(probes, "start_odoo_logs", fake_start_odoo_logs)
     monkeypatch.setattr(Host, "run", fake_run)
 
-    result = probes.error_traceback([Path("/var/log/server.log")], "KeyError", "'socket'", Host())
+    result = probes.error_traceback(
+        [Path("/var/log/server.log")],
+        "KeyError",
+        "'socket'",
+        Host(),
+        since="2026-01-01",
+        until="2026-01-02",
+        database="demo_db",
+    )
 
+    assert seen_start_kwargs["window"] == ("2026-01-01", "2026-01-02", "demo_db")
     assert seen_start_kwargs["command"] == "errors"
     assert seen_start_kwargs["extra"] == ("--traceback-only",)
     assert seen_start_kwargs["verbose_file"].startswith("/tmp/oa-errors-")

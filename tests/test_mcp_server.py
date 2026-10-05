@@ -66,7 +66,7 @@ def test_instance_log_analysis_runs_odoo_logs_against_resolved_files(monkeypatch
         def communicate(self, timeout=None):
             return json.dumps([{"type": "AccessError", "count": 3}]), ""
 
-    def fake_start(command, files, host):
+    def fake_start(command, files, host, *, since=None, until=None, database=None):
         captured["command"] = command
         captured["files"] = files
         return _FakeProc()
@@ -76,6 +76,200 @@ def test_instance_log_analysis_runs_odoo_logs_against_resolved_files(monkeypatch
     result = mcp_server.instance_log_analysis("demo", "errors")
     assert result == [{"type": "AccessError", "count": 3}]
     assert captured == {"command": "errors", "files": [Path("/var/log/server.log")]}
+
+
+def _instance_with_logs(monkeypatch, files):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: files)
+
+
+class _FakeProc:
+    def __init__(self, stdout="[]", stderr=""):
+        self._result = (stdout, stderr)
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        return self._result
+
+
+def test_instance_log_analysis_with_a_window_reads_only_the_overlapping_files(monkeypatch):
+    """The window is resolved by `odoo-logs list` first, then handed to the
+    analysis itself, so it neither parses the other files nor returns rows
+    from outside the window."""
+    everything = [Path("/var/log/server.log"), Path("/var/log/server.log.2026-09-25"), Path("/var/log/server.log.2")]
+    _instance_with_logs(monkeypatch, everything)
+    calls = []
+
+    def fake_start(command, files, host, *, since=None, until=None, database=None):
+        calls.append({"command": command, "files": files, "since": since, "until": until})
+        if command == "list":
+            return _FakeProc(json.dumps([{"path": "/var/log/server.log.2026-09-25"}]))
+        return _FakeProc(json.dumps([{"type": "AccessError", "count": 3}]))
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    result = mcp_server.instance_log_analysis("demo", "errors", since="2026-09-25 19:50", until="2026-09-25 20:10")
+
+    window = {"since": "2026-09-25 19:50", "until": "2026-09-25 20:10"}
+    assert result == [{"type": "AccessError", "count": 3}]
+    assert calls == [
+        {"command": "list", "files": everything, **window},
+        {"command": "errors", "files": [Path("/var/log/server.log.2026-09-25")], **window},
+    ]
+
+
+def test_instance_log_analysis_forwards_the_database(monkeypatch):
+    """`-d` is an odoo-logs global option; the tool just hands it on, with or
+    without a window."""
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    seen = []
+
+    def fake_start(command, files, host, *, since=None, until=None, database=None):
+        seen.append((command, database))
+        return _FakeProc(json.dumps([{"path": "/var/log/server.log"}]) if command == "list" else "[]")
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    mcp_server.instance_log_analysis("demo", "calls", database="lalouve_staging")
+    mcp_server.instance_log_analysis("demo", "calls", since="2026-09-29", database="lalouve_staging")
+
+    # the window pass (`list`) looks at files, not databases
+    assert seen == [("calls", "lalouve_staging"), ("list", None), ("calls", "lalouve_staging")]
+
+
+def test_instance_error_traceback_cuts_row_timestamps_to_the_second(monkeypatch):
+    """A row's own `first`/`last` carry microseconds, which odoo-logs's
+    --from/--to rejects ("unrecognized date: '2026-10-02 02:00:07.836000'"):
+    they are cut to the second before being passed on."""
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    captured = {}
+
+    def fake_files_in_window(files, since, until, host):
+        captured["since"] = since
+        captured["until"] = until
+        return files
+
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None, database=None):
+        captured["tb_since"] = since
+        return "Traceback text"
+
+    monkeypatch.setattr(mcp_server.probes, "files_in_window", fake_files_in_window)
+    monkeypatch.setattr(mcp_server.probes, "error_traceback", fake_error_traceback)
+
+    result = mcp_server.instance_error_traceback(
+        "demo", "AccessError", "(N)", since="2026-10-02 02:00:07.836000", until="2026-10-02 02:59:59,999"
+    )
+    assert result == "Traceback text"
+    assert captured == {
+        "since": "2026-10-02 02:00:07",
+        "until": "2026-10-02 02:59:59",
+        "tb_since": "2026-10-02 02:00:07",
+    }
+
+
+def test_instance_error_traceback_forwards_the_database(monkeypatch):
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    captured = {}
+
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None, database=None):
+        captured["database"] = database
+        return "KeyError: 'socket'"
+
+    monkeypatch.setattr(mcp_server.probes, "error_traceback", fake_error_traceback)
+
+    mcp_server.instance_error_traceback("demo", "KeyError", "'socket'", database="lalouve_staging")
+
+    assert captured == {"database": "lalouve_staging"}
+
+
+def test_instance_log_analysis_window_covered_by_no_file(monkeypatch):
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", lambda *_a, **_k: _FakeProc("[]"))
+
+    assert mcp_server.instance_log_analysis("demo", "errors", since="2020-01-01") == "(no log file covers that window)"
+
+
+def test_instance_log_analysis_window_relays_an_odoo_logs_without_list(monkeypatch):
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    monkeypatch.setattr(
+        mcp_server.probes,
+        "start_odoo_logs",
+        lambda *_a, **_k: _FakeProc("", "Error: No such command 'list'."),
+    )
+
+    assert mcp_server.instance_log_analysis("demo", "errors", since="2026-09-25") == "Error: No such command 'list'."
+
+
+def test_instance_log_analysis_without_a_window_still_reads_every_file(monkeypatch):
+    """Unchanged behaviour: no `list` pass, no window handed to odoo-logs."""
+    everything = [Path("/var/log/server.log"), Path("/var/log/server.log.1")]
+    _instance_with_logs(monkeypatch, everything)
+    calls = []
+
+    def fake_start(command, files, host, **kw):
+        calls.append((command, files, kw))
+        return _FakeProc("[]")
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    mcp_server.instance_log_analysis("demo", "errors")
+
+    assert calls == [("errors", everything, {"since": None, "until": None, "database": None})]
+
+
+def test_instance_log_files_no_such_instance(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: None)
+    assert mcp_server.instance_log_files("demo") == "(no such instance)"
+
+
+def test_instance_log_files_no_log_file(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [])
+    assert mcp_server.instance_log_files("demo") == "(no log file found)"
+
+
+def test_instance_log_files_runs_odoo_logs_list_with_the_window(monkeypatch):
+    """Same resolve/run/parse shape as instance_log_analysis; the window goes
+    to odoo-logs itself, which keeps only the files that overlap it."""
+    files = [Path("/var/log/server.log"), Path("/var/log/server.log.2026-09-25")]
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: files)
+
+    captured = {}
+    rows = [
+        {"path": "/var/log/server.log.2026-09-25", "size": 1, "start": "2026-09-25 07:16:00", "end": "x", "note": ""}
+    ]
+
+    class _FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return json.dumps(rows), "Getting logs from 2026-09-25 19:50:00 to None"
+
+    def fake_start(command, files, host, *, since=None, until=None, database=None):
+        captured.update(command=command, files=files, since=since, until=until)
+        return _FakeProc()
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", fake_start)
+
+    assert mcp_server.instance_log_files("demo", since="2026-09-25 19:50", until="2026-09-25 20:10") == rows
+    assert captured == {"command": "list", "files": files, "since": "2026-09-25 19:50", "until": "2026-09-25 20:10"}
+
+
+def test_instance_log_files_relays_an_odoo_logs_without_list(monkeypatch):
+    """An older odoo-logs has no `list`: its own message beats a bare failure."""
+    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "demo"})
+    monkeypatch.setattr(mcp_server.probes, "instance_log_files", lambda *_a, **_k: [Path("/var/log/server.log")])
+
+    class _FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "", "Error: No such command 'list'."
+
+    monkeypatch.setattr(mcp_server.probes, "start_odoo_logs", lambda *_a, **_k: _FakeProc())
+
+    assert mcp_server.instance_log_files("demo") == "Error: No such command 'list'."
 
 
 def test_instance_error_traceback_no_such_instance(monkeypatch):
@@ -104,7 +298,8 @@ def test_instance_error_traceback_resolves_files_and_forwards_type_error(monkeyp
 
     captured = {}
 
-    def fake_error_traceback(files, error_type, error, host):
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None, database=None):
+        captured["window"] = (since, until)
         captured["files"] = files
         captured["error_type"] = error_type
         captured["error"] = error
@@ -115,7 +310,51 @@ def test_instance_error_traceback_resolves_files_and_forwards_type_error(monkeyp
     result = mcp_server.instance_error_traceback("demo", "KeyError", "'socket'")
 
     assert result == "Traceback (most recent call last):\nKeyError: 'socket'"
-    assert captured == {"files": [Path("/var/log/server.log")], "error_type": "KeyError", "error": "'socket'"}
+    assert captured == {
+        "window": (None, None),
+        "files": [Path("/var/log/server.log")],
+        "error_type": "KeyError",
+        "error": "'socket'",
+    }
+
+
+def test_instance_error_traceback_with_a_window_reads_only_the_overlapping_files(monkeypatch):
+    """Same file narrowing as instance_log_analysis, then the window itself
+    goes on to the traceback scan."""
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log"), Path("/var/log/server.log.2026-09-25")])
+    monkeypatch.setattr(
+        mcp_server.probes,
+        "files_in_window",
+        lambda files, since, until, host: [Path("/var/log/server.log.2026-09-25")],
+    )
+    captured = {}
+
+    def fake_error_traceback(files, error_type, error, host, *, since=None, until=None, database=None):
+        captured.update(files=files, since=since, until=until)
+        return "KeyError: 'socket'"
+
+    monkeypatch.setattr(mcp_server.probes, "error_traceback", fake_error_traceback)
+
+    result = mcp_server.instance_error_traceback(
+        "demo", "KeyError", "'socket'", since="2026-09-25 19:50", until="2026-09-25 20:10"
+    )
+
+    assert result == "KeyError: 'socket'"
+    assert captured == {
+        "files": [Path("/var/log/server.log.2026-09-25")],
+        "since": "2026-09-25 19:50",
+        "until": "2026-09-25 20:10",
+    }
+
+
+def test_instance_error_traceback_window_covered_by_no_file(monkeypatch):
+    _instance_with_logs(monkeypatch, [Path("/var/log/server.log")])
+    monkeypatch.setattr(mcp_server.probes, "files_in_window", lambda *_a, **_k: [])
+
+    assert (
+        mcp_server.instance_error_traceback("demo", "KeyError", "'socket'", since="2020-01-01")
+        == "(no log file covers that window)"
+    )
 
 
 def test_mail_audit_has_no_include_sensitive_information_argument():
@@ -263,6 +502,7 @@ def test_mcp_tools_do_not_crash():
         assert isinstance(mcp_server.instance_config(name), str)
         assert isinstance(mcp_server.instance_log_tail(name), str)
         assert isinstance(mcp_server.instance_log_analysis(name, "errors"), (list, str))
+        assert isinstance(mcp_server.instance_log_files(name), (list, str))
         assert isinstance(mcp_server.instance_error_traceback(name, "KeyError", "'socket'"), str)
 
         dbs = mcp_server.instance_databases(name)
