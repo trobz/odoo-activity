@@ -2,6 +2,31 @@
 
 <!-- version list -->
 
+## v0.29.0 (2026-10-05)
+
+### Bug Fixes
+
+- Find dated log rotations (server.log-<date>-<epoch>)
+  ([`4e4aceb`](https://github.com/trobz/odoo-activity/commit/4e4acebbc6854858f62f261030ba5ec65deaf62f))
+
+- **mcp**: Address review feedback on the log tools
+  ([`de685b1`](https://github.com/trobz/odoo-activity/commit/de685b132dd5759f4d363b44516bfad32782a9f6))
+
+### Features
+
+- **mcp**: Add an optional database filter to the log tools
+  ([`be83f59`](https://github.com/trobz/odoo-activity/commit/be83f597b0dc491581bbc7a6325545e29ea40f05))
+
+- **mcp**: Add instance_log_files tool
+  ([`49d7944`](https://github.com/trobz/odoo-activity/commit/49d7944b82f09b8bdfd5d7638ec117512fb1dc57))
+
+- **mcp**: Add since/until to instance_error_traceback
+  ([`147517f`](https://github.com/trobz/odoo-activity/commit/147517f6bdf2b377acb82581772c1db30d78b8f6))
+
+- **mcp**: Add since/until to instance_log_analysis
+  ([`8740443`](https://github.com/trobz/odoo-activity/commit/8740443eb6bed9218d77b2bf973b7c85705f3586))
+
+
 ## v0.28.1 (2026-09-29)
 
 ### Bug Fixes
