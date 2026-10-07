@@ -3043,7 +3043,9 @@ def _matching_traceback_blocks(text: str, error_type: str, error: str) -> str:
 
     fingerprint = re.escape(error_type)
     if error:
-        fingerprint += ": " + re.escape(error).replace(_SQUASHED_ID, r"\(\d+\)")
+        fingerprint += ": " + re.escape(error).replace(_SQUASHED_ID, r"\(\d+\)").replace(
+            re.escape("[...]"), r"\[[^\]]*\]"
+        )
     needle = re.compile(fingerprint, re.MULTILINE)
 
     bounds = zip(starts, [*starts[1:], len(text)], strict=True)
