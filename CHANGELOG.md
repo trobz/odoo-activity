@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.29.1 (2026-10-08)
+
+### Bug Fixes
+
+- **probes**: Match odoo-logs's [...] tag when finding a traceback
+  ([`f4583f5`](https://github.com/trobz/odoo-activity/commit/f4583f5dbc097cf2f798d95bc27278e8373a37f9))
+
+
 ## v0.29.0 (2026-10-05)
 
 ### Bug Fixes
