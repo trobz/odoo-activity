@@ -403,6 +403,31 @@ def test_matching_traceback_blocks_reverses_the_squashed_id():
     assert "unrelated block" not in result
 
 
+def test_matching_traceback_blocks_reverses_the_truncated_tag():
+    """odoo-logs `errors` groups SMTP refusals under a `[...]` tag (their
+    `[host timestamp id]` differs per attempt); the search must match the
+    real tag in the raw text the same way it does the squashed pid."""
+    dumped = (
+        "2026-01-01 10:00:00,000 123 ERROR demo odoo.addons.mail.models.mail_mail: "
+        "failed sending mail (id: 50) due to Mail Delivery Failed\n"
+        "Traceback (most recent call last):\n"
+        "  File demo.py, line 1\n"
+        "SMTPSenderRefused: (550, b'5.4.1 Access denied [mx.example.com 2026-09-07T07:34:14Z 08DF0B042CF0]')\n"
+        "2026-01-01 11:00:00,000 124 ERROR demo odoo.modules.loading: "
+        "Some modules are not loaded\n"
+        "unrelated block\n"
+    )
+
+    result = probes._matching_traceback_blocks(
+        dumped,
+        "SMTPSenderRefused",
+        "(550, b'5.4.1 Access denied [...]')",
+    )
+
+    assert "08DF0B042CF0" in result
+    assert "unrelated block" not in result
+
+
 def test_matching_traceback_blocks_ignores_a_mention_in_the_body():
     """A block's own exception line is its *last* line -- text elsewhere in
     the block (e.g. a retry handler logging a different exception's
