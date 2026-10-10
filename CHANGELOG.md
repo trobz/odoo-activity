@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.29.2 (2026-10-10)
+
+### Bug Fixes
+
+- **mcp**: Honor --host-file when connecting, not just listing
+  ([`8dac0c4`](https://github.com/trobz/odoo-activity/commit/8dac0c460cae4fb1f980f3e6cc8e9fa12008c009))
+
+
 ## v0.29.1 (2026-10-08)
 
 ### Bug Fixes
