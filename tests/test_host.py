@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 from odoo_activity.host import _REMOTE_PATH_FIX, _SSH_OPTS, Host
 
@@ -58,6 +59,48 @@ def test_remote_run_wraps_in_ssh(monkeypatch):
     Host(alias="openerp@demo").run(["echo", "hi there"])
 
     assert captured["cmd"] == ["ssh", *_SSH_OPTS, "openerp@demo", f"{_REMOTE_PATH_FIX} echo 'hi there'"]
+
+
+def test_config_file_adds_dash_capital_f(monkeypatch):
+    """A Host carrying a config_file resolves its alias through that file:
+    oa-mcp-multi's --host-file must be authoritative for connecting, not just
+    for listing, or ssh silently falls back to ~/.ssh/config."""
+    captured = {}
+
+    def fake_run(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    Host(alias="demo", port=2222, config_file=Path("/etc/oa/hosts")).run(["echo", "hi"])
+
+    assert captured["cmd"] == [
+        "ssh",
+        *_SSH_OPTS,
+        "-F",
+        "/etc/oa/hosts",
+        "-p",
+        "2222",
+        "demo",
+        f"{_REMOTE_PATH_FIX} echo hi",
+    ]
+
+
+def test_no_config_file_means_no_dash_f(monkeypatch):
+    """Unset config_file leaves ssh on its own default -- no -F, so a server
+    started without --host-file never points ssh at a possibly-absent file."""
+    captured = {}
+
+    def fake_run(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    Host(alias="demo").run(["echo", "hi"])
+
+    assert "-F" not in captured["cmd"]
 
 
 def test_remote_popen_wraps_in_ssh(monkeypatch):

@@ -93,11 +93,17 @@ class Host:
     `glob`, ...) has to go out as argv for a container the same way it does
     for a remote box, and the pid a signal names has to be the one the
     container's own pid namespace uses.
+
+    `config_file` is an ssh config passed as `ssh -F` on every invocation,
+    so the file an alias is *listed* from (oa-mcp-multi's --host-file) is
+    also the one it's *resolved* through -- otherwise ssh falls back to
+    ~/.ssh/config and the two can disagree. None means ssh's own default.
     """
 
     alias: str | None = None
     port: int | None = None
     container: str | None = None
+    config_file: Path | None = None
 
     @property
     def is_local(self) -> bool:
@@ -126,9 +132,10 @@ class Host:
             argv = ["docker", "exec", self.container, *argv]
         if self.alias is None:
             return argv
+        config_opts = ["-F", str(self.config_file)] if self.config_file else []
         port_opts = ["-p", str(self.port)] if self.port else []
         remote_cmd = f"{_REMOTE_PATH_FIX} {shlex.join(argv)}"
-        return ["ssh", *_SSH_OPTS, *port_opts, self.alias, remote_cmd]
+        return ["ssh", *_SSH_OPTS, *config_opts, *port_opts, self.alias, remote_cmd]
 
     def shell_invocation(self, cmd: str) -> str:
         """`cmd` as the user should paste it into their own terminal to
@@ -146,8 +153,9 @@ class Host:
             cmd = shlex.join(["docker", "exec", "-it", self.container, "sh", "-lc", cmd])
         if self.alias is None:
             return cmd
+        config_opts = ["-F", str(self.config_file)] if self.config_file else []
         port_opts = ["-p", str(self.port)] if self.port else []
-        return shlex.join(["ssh", "-t", *port_opts, self.alias, cmd])
+        return shlex.join(["ssh", "-t", *config_opts, *port_opts, self.alias, cmd])
 
     def run(self, argv: list[str], input_text: str | None = None) -> subprocess.CompletedProcess[str]:
         """Like subprocess.run(capture_output=True, text=True), local or over ssh.
@@ -232,10 +240,14 @@ def close_control_master(host: Host) -> None:
     if host.alias is None:
         return
 
+    # Must carry the same -F/-p as the connecting call: ControlPath's %C is a
+    # hash of the resolved (user, host, port), so a teardown that resolves the
+    # alias differently computes a different socket name and finds nothing.
+    config_opts = ["-F", str(host.config_file)] if host.config_file else []
     port_opts = ["-p", str(host.port)] if host.port else []
     with contextlib.suppress(subprocess.SubprocessError, OSError):
         subprocess.run(
-            ["ssh", "-O", "exit", "-o", f"ControlPath={_CONTROL_PATH}", *port_opts, host.alias],
+            ["ssh", "-O", "exit", "-o", f"ControlPath={_CONTROL_PATH}", *config_opts, *port_opts, host.alias],
             stdin=_NO_STDIN,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

@@ -127,7 +127,13 @@ def _resolve_host(host: str | None, ssh_port: int | None) -> Host:
         return _pinned_target
 
     _check_host(host)
-    return Host(alias=host, port=ssh_port)
+    # Resolve aliases through the same file list_hosts reads them from, so a
+    # custom --host-file is authoritative for connecting too -- not just for
+    # enumeration. Left as the default (ssh's own ~/.ssh/config) when unset, so
+    # a server started without --host-file keeps ssh's native behaviour and
+    # never passes -F at a possibly-absent default config.
+    config_file = _host_file if _host_file != _DEFAULT_HOST_FILE else None
+    return Host(alias=host, port=ssh_port, config_file=config_file)
 
 
 def _pinned_host(fn):
@@ -980,7 +986,11 @@ def main_multi(
     ),
     host_file: Annotated[
         Path,
-        typer.Option("--host-file", help="ssh config to read literal Host aliases from, for list_hosts()."),
+        typer.Option(
+            "--host-file",
+            help="ssh config to read literal Host aliases from, for list_hosts(). Also passed as `ssh -F` "
+            "when connecting, so the file aliases are listed from is the one they resolve through.",
+        ),
     ] = _DEFAULT_HOST_FILE,
     include_sensitive_information: bool = typer.Option(
         False,
