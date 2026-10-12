@@ -22,6 +22,7 @@ Repository = "https://github.com/trobz/odoo-activity"
 [project.entry-points."odoo_activity.plugins"]
 odooly = "odoo_activity.plugins.odooly:OdoolyPlugin"
 pos = "odoo_activity.plugins.pos:PosPlugin"
+password-audit = "odoo_activity.plugins.password_audit:PasswordAuditPlugin"
 
 # the bundled managers come through the same door a third-party one would
 [project.entry-points."odoo_activity.managers"]

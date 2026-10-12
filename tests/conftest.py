@@ -1,6 +1,21 @@
+import os
+
 import pytest
 
 from odoo_activity import probes, tui
+
+
+@pytest.fixture(autouse=True)
+def _private_audit_umask():
+    """Synthetic audit artifacts inherit the strict production umask.
+
+    The audit worker validates every artifact as a 0600 single-link file;
+    fixtures that create hash/wordlist files get the same 077 umask the
+    worker sets for itself — no per-test chmod noise.
+    """
+    previous = os.umask(0o077)
+    yield
+    os.umask(previous)
 
 
 @pytest.fixture(autouse=True)
