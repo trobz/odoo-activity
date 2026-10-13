@@ -179,12 +179,13 @@ def test_login_candidates_skip_unrepresentable_guesses_without_injection(tmp_pat
     logins = [f"prefix{separator}suffix@example.test", f"valid-local@example{separator}.test", "normal@example.test"]
     baseline = pa.build_candidates()
     candidates = pa.build_candidates(logins=logins)
+    common = len(pa.COMMON_WEAK) + len(pa._common_year_variants(pa._years()))
     assert candidates == [
-        *baseline[: len(pa.COMMON_WEAK)],
+        *baseline[:common],
         "valid-local",
         "normal@example.test",
         "normal",
-        *baseline[len(pa.COMMON_WEAK) :],
+        *baseline[common:],
     ]
     assert all(not any(sep in guess for sep in _SEPARATORS) for guess in candidates)
     path = tmp_path / "synthetic.hashcat"

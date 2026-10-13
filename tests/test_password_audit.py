@@ -108,7 +108,21 @@ def test_tier1_company_leet_is_lean_and_applies_each_type_to_all_occurrences():
     assert "tr0bz2026" not in words
     assert "tr0bzwinter" not in words
     assert "z0e@0rbit.example" not in words
-    assert "admin2024" in words  # fixed common entries remain exempt
+    assert "admin" in words  # fixed common entries remain exempt
+    assert "portal" in words  # odoo demo portal user
+    assert {"changeme", "tochange"} <= set(words)  # placeholder passwords
+    assert "letmein" not in words
+    assert len(words) == len(set(words))
+
+
+def test_tier1_admin_odoo_year_variants_follow_the_clock(monkeypatch):
+    monkeypatch.setattr(pa, "_years", lambda: ["2027", "2026", "2025"])
+    words = pa.build_candidates([], [])
+    for base in ("admin", "Admin", "odoo", "Odoo"):
+        for year in ("2027", "2026", "2025"):
+            assert {f"{base}{year}", f"{base}{year}!"} <= set(words)
+    assert "admin2024" not in words  # no stale hard-coded year
+    assert not any(year in weak for weak in pa.COMMON_WEAK for year in ("2024", "2025", "2026"))
     assert len(words) == len(set(words))
 
 

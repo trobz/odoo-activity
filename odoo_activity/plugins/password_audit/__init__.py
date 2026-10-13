@@ -104,6 +104,8 @@ HASHCAT_MODE = 12100
 # Superset of odoo-db check-passwords' common list (which is: admin, odoo,
 # admin123, odoo123, password, 123456, 1234567890, azerty, qwerty, demo) —
 # the derived wordlist must cover at least everything that scan catches.
+# Year variants (admin2026, Odoo2025!) are generated from the live clock by
+# _common_year_variants, not hard-coded here.
 COMMON_WEAK: tuple[str, ...] = (
     "admin",
     "odoo",
@@ -113,17 +115,15 @@ COMMON_WEAK: tuple[str, ...] = (
     "azerty",
     "qwerty",
     "welcome",
-    "letmein",
+    "changeme",
+    "tochange",
     "demo",
+    "portal",
     "test",
     "admin123",
     "odoo123",
     "password123",
     "P@ssw0rd",
-    "admin2024",
-    "admin2025",
-    "odoo2024",
-    "odoo2025",
 )
 
 # The trivial-guess baseline, beyond check-passwords': every 1-char and
@@ -171,6 +171,25 @@ def _years() -> list[str]:
     return [str(year - offset) for offset in (0, 1, 2)]
 
 
+# the default-credential words most often "upgraded" with a year
+# (admin2026, Odoo2026!) — tier-1, unlike company/season year mutations,
+# because they need no per-db input and are a handful of candidates
+_YEAR_BASES = ("admin", "odoo")
+_YEAR_SUFFIXES = ("", "!")
+
+
+def _common_year_variants(years: list[str]) -> list[str]:
+    """admin/odoo + year, lowercase and capitalized, bare or with a
+    trailing '!': 2 bases x 2 cases x len(years) x 2 suffixes."""
+    return [
+        f"{case}{year}{suffix}"
+        for base in _YEAR_BASES
+        for case in (base, base.capitalize())
+        for year in years
+        for suffix in _YEAR_SUFFIXES
+    ]
+
+
 # trailing punctuation worth guessing after a company name (tier-1);
 # year/season combos stay in tier-2
 _SYMBOLS = ("!", "#", "$", "*", "?", ".", "-", "_")
@@ -198,8 +217,9 @@ def _company_variants(companies: list[str]) -> list[str]:
 
 def build_candidates(companies: list[str] | None = None, logins: list[str] | None = None) -> list[str]:
     """Tier-1 wordlist, LEAN for minimum coverage: common weak passwords,
-    login-derived guesses (full login + email local part), the bare
-    company name (each case variant), and the 62 single characters — at
+    admin/odoo + recent-year variants (live clock), login-derived guesses
+    (full login + email local part), the bare company name (each case
+    variant), and the 62 single characters — at
     least the baseline odoo-db's check-passwords tests, deduped,
     order-stable. Leet additions use o0/e3/a4/i1, one type replacing all
     occurrences, bare or ! suffix only; at most 128 new candidates per
@@ -208,7 +228,7 @@ def build_candidates(companies: list[str] | None = None, logins: list[str] | Non
     tier-2 (`build_tier2`): they doubled this list to ~2.5k candidates
     per db, defeating "minimum coverage fits any budget".
     """
-    candidates = list(COMMON_WEAK)
+    candidates = [*COMMON_WEAK, *_common_year_variants(_years())]
     for login in logins or []:
         for guess in (login, login.split("@")[0]):  # full login AND email local part
             # A line-oriented wordlist cannot represent record separators.
