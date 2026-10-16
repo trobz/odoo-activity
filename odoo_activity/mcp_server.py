@@ -26,8 +26,10 @@ login.
 import functools
 import inspect
 import math
+import os
 import re
 import signal
+import stat
 import subprocess
 import time
 from collections import Counter
@@ -1006,14 +1008,25 @@ class _AuditWork(TypedDict):
 def _plan_records(path: Path, check):
     """Stream bounded regular inputs; check the shared deadline per record."""
     check()
-    if not path.is_file():
-        msg = f"missing or non-regular planner input/companion wordlist: {path}"
-        raise ValueError(msg)
-    if path.stat().st_size > _PASSWORD_PLAN_MAX_BYTES:
-        msg = f"planner input byte limit exceeded: {path}"
-        raise ValueError(msg)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        msg = f"missing or unreadable planner input/companion wordlist: {path}"
+        raise ValueError(msg) from exc
+    try:
+        stream = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
     total = 0
-    with path.open("rb") as stream:
+    with stream:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            msg = f"non-regular planner input/companion wordlist: {path}"
+            raise ValueError(msg)
+        if info.st_size > _PASSWORD_PLAN_MAX_BYTES:
+            msg = f"planner input byte limit exceeded: {path}"
+            raise ValueError(msg)
         for count in range(_PASSWORD_PLAN_MAX_RECORDS + 1):
             check()
             record = stream.readline(_PASSWORD_PLAN_MAX_RECORD_BYTES + 1)
@@ -1064,16 +1077,10 @@ def _rounds_label(entry: _AuditWork) -> str:
     return "/".join(f"{rounds:,}" for rounds in sorted({r for r, _s in entry["groups"]}))
 
 
-def _pass_call(entry: _AuditWork, tier: int, cost: float | None) -> str:
+def _pass_call(entry: _AuditWork, tier: int, cost: float) -> str:
     wordlist = entry["path"].with_suffix(".derived.txt" if tier == 1 else ".tier2.txt")
-    if cost is None:
-        return (
-            f"   password_crack(hash_file={str(entry['path'])!r}, wordlist={str(wordlist)!r}) "
-            "— unsized pass (no measured rate); allocate from the audit budget "
-            "yourself, poll to completion, and stop when the budget is spent."
-        )
-    # Floor the estimate to an integral bounded cap (never unbounded zero).
-    runtime = max(1, math.floor(cost))
+    # Fund and cap complete integral seconds, including fractional estimates.
+    runtime = max(1, math.ceil(cost))
     minutes = runtime / 60
     if _minutes_seconds(minutes) > runtime:
         minutes = math.nextafter(minutes, 0.0)
@@ -1100,7 +1107,7 @@ def _allocate_tier1(
     skipped: list[str] = []
     for entry in sorted(entries, key=lambda e: -e["hashes"]):
         label = entry["label"]
-        cost = max(1.0, _candidate_seconds(entry, sizes[entry["path"]], speeds))
+        cost = max(1, math.ceil(_candidate_seconds(entry, sizes[entry["path"]], speeds)))
         if cost <= remaining:
             funded += cost
             remaining = max(0.0, remaining - cost)
@@ -1126,7 +1133,7 @@ def _fit_tier2(
     total = 0.0
     for entry in sorted(entries, key=lambda e: -max(r for r, _s in e["groups"])):
         label = entry["label"]
-        cost = max(1.0, _candidate_seconds(entry, sizes[entry["path"]], speeds))
+        cost = max(1, math.ceil(_candidate_seconds(entry, sizes[entry["path"]], speeds)))
         if total + cost <= remaining:
             total += cost
             plan.append(
@@ -1139,6 +1146,7 @@ def _fit_tier2(
 
 
 _PASSWORD_PLAN_HEADROOM_S = 250.0
+_PASSWORD_PLAN_RESERVE_S = 5.0
 _PASSWORD_PLAN_MAX_FILES = 128
 _PASSWORD_PLAN_MAX_BYTES = 32 * 1024 * 1024
 _PASSWORD_PLAN_MAX_RECORDS = 200_000
@@ -1223,6 +1231,8 @@ def _unsized_plan(
     entries: list[_AuditWork],
     cal_lines: list[str],
     unsized: list[int],
+    started: float,
+    budget: int,
 ) -> str:
     """Degrade to an unsized tier-1-only plan when calibration cannot finish.
 
@@ -1230,21 +1240,30 @@ def _unsized_plan(
     250s MCP-call headroom. That is not an audit-stopping error:
     password_crack works without calibration, so emit every database's
     tier-1 pass in order without seconds estimates, skip tier 2, and let the
-    operator stop at the audit budget.
+    operator reduce caps for launch delays against the audit deadline.
     """
     lines = [
         "calibration (conservative min(8, smallest actual per-round salt-group count) wordlist benchmark; "
         "measured rate used without throughput scaling): " + "; ".join(cal_lines)
     ]
     lines.append(
-        "ESTIMATES UNAVAILABLE: calibration failed for "
+        "ESTIMATES UNAVAILABLE: calibration unavailable for "
         f"{', '.join(f'{r:,}' for r in unsized)} rounds; the plan is unsized. "
         "Run tier 1 in order, poll password_crack_status, and stop at the "
         "audit budget; tier 2 is skipped without measured rates."
     )
-    for entry in entries:
+    elapsed = max(0.0, time.monotonic() - started)
+    remaining = max(0, math.floor(budget - elapsed))
+    lines.append(f"calibration + planning elapsed: {elapsed:,.0f}s (charged to budget)")
+    lines.append(f"audit remaining: {remaining}s; unsized caps share this budget, not completion estimates.")
+    for index, entry in enumerate(entries):
+        cap = remaining // (len(entries) - index)
+        if cap < 1:
+            lines.append(f"   tier 1 for {entry['label']}: UNFUNDED — less than 1s allocated")
+            continue
+        remaining -= cap
         lines.append(f"1. tier 1 for {entry['label']} ({entry['hashes']} hashes, {_rounds_label(entry)} rounds)")
-        lines.append(_pass_call(entry, 1, None))
+        lines.append(_pass_call(entry, 1, cap))
     return "\n".join(lines)
 
 
@@ -1266,7 +1285,9 @@ def password_plan(
     GPU probe. When calibration cannot finish inside that headroom (slow
     GPUs, e.g. an iGPU at 600k rounds), the plan degrades to an unsized
     tier-1-only result instead of aborting: run the tier-1 passes in order,
-    poll, and stop at the budget; tier 2 is skipped without measured rates.
+    with explicit caps sharing the remaining budget, poll, and stop at the
+    budget; tier 2 is skipped without measured rates. Fractional pass estimates
+    are rounded up to whole seconds for both funding and runtime caps.
 
     Calibrates each round count with min(8, smallest actual salt-group count)
     among its databases. The measured eight-salt rate is used conservatively
@@ -1326,22 +1347,23 @@ def password_plan(
     speeds: dict[int, float] = {}
     cal_lines = []
     unsized: list[int] = []
-    for rounds in sorted({r for entry in entries for r, _s in entry["groups"]}):
+    round_counts = sorted({r for entry in entries for r, _s in entry["groups"]})
+    for rounds in round_counts:
         remaining = _planning_remaining(started, budget, deadline)
         smallest_actual = _smallest_salt_shape(entries, rounds)
         n_salts = min(8, smallest_actual)
-        speed, cal_err = pa.calibrate(rounds, timeout_s=remaining, n_salts=n_salts)
-        _planning_remaining(started, budget, deadline)
+        reserve = min(_PASSWORD_PLAN_RESERVE_S, remaining / 2)
+        speed, cal_err = pa.calibrate(rounds, timeout_s=remaining - reserve, n_salts=n_salts)
         if speed is None:
             # Calibration can legitimately fail on slow GPUs (e.g. an iGPU
             # cannot finish one 600k-round probe inside the 250s MCP-call
             # headroom). That is not an audit-stopping error: password_crack
             # works without calibration, so degrade to an unsized tier-1-only
             # plan instead of aborting the whole flow.
-            elapsed = max(0.0, time.monotonic() - started)
-            unsized.append(rounds)
+            unsized.extend(r for r in round_counts if r not in speeds)
             cal_lines.append(f"unmeasured at {rounds:,} rounds ({cal_err})")
-            continue
+            break
+        _planning_remaining(started, budget, deadline)
         speeds[rounds] = speed
         cal_lines.append(
             f"{speed:,.0f} candidate-salt pairs/s at {rounds:,} rounds "
@@ -1353,7 +1375,7 @@ def password_plan(
         "measured rate used without throughput scaling): " + "; ".join(cal_lines)
     ]
     if unsized:
-        return _unsized_plan(entries, cal_lines, unsized)
+        return _unsized_plan(entries, cal_lines, unsized, started, budget)
     lines.extend(f"database {entry['label']}: {entry['path']}" for entry in entries)
     lines.append(
         "Execution: never omit minutes (the independent 250s default is not the plan). "

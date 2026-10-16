@@ -1,6 +1,7 @@
 """Planner regressions use synthetic exports and a fake calibrator, never a GPU."""
 
 import base64
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,7 +49,7 @@ def planner(monkeypatch, tmp_path):
         return {"hash_file": str(path)}
 
     def delay_read(path, seconds):
-        original = Path.open
+        original = os.fdopen
 
         class SlowRead:
             def __init__(self, stream):
@@ -64,11 +65,12 @@ def planner(monkeypatch, tmp_path):
                 clock[0] += seconds
                 return self.stream.readline(size)
 
-        def slow_open(candidate, *args, **kwargs):
-            stream = original(candidate, *args, **kwargs)
-            return SlowRead(stream) if candidate == path else stream
+        def slow_open(fd, *args, **kwargs):
+            matches = os.fstat(fd).st_ino == path.stat().st_ino
+            stream = original(fd, *args, **kwargs)
+            return SlowRead(stream) if matches else stream
 
-        monkeypatch.setattr(Path, "open", slow_open)
+        monkeypatch.setattr(os, "fdopen", slow_open)
 
     return SimpleNamespace(export=export, pa=pa, calls=calls, clock=clock, delay_read=delay_read)
 
@@ -141,7 +143,7 @@ def test_mixed_rounds_use_every_unique_salt_group(planner):
     result = mcp_server.password_plan([audit], 1)
     assert planner.calls == [100, 200]
     assert "tier 1 (prioritized): ~21s funded" in result
-    assert "tier1+tier2 est 23s" in result
+    assert "tier1+tier2 est 24s" in result
 
 
 def test_duplicate_digests_do_not_add_pbkdf2_work_or_salt_penalty(planner):
@@ -167,7 +169,7 @@ def test_calibration_wall_time_including_setup_is_charged(planner):
     assert "leftover 2s" in result
 
 
-@pytest.mark.parametrize("minutes, expected_timeouts", [(1 / 60, [1.0]), (60, [250.0, 130.0, 10.0])])
+@pytest.mark.parametrize("minutes, expected_timeouts", [(1 / 60, [0.5]), (60, [245.0, 125.0, 5.0])])
 def test_many_rounds_stop_calibrating_at_planning_deadline(planner, minutes, expected_timeouts):
     audit = planner.export("mixed", work={(r, "salt"): 1 for r in range(100, 110)})
     timeouts = []
@@ -201,9 +203,9 @@ def test_calibration_timeout_degrades_to_unsized_plan(planner):
 
     planner.pa.calibrate = calibrate
     result = mcp_server.password_plan([audit], 10 / 60)
-    assert planner.calls == [100, 200]
+    assert planner.calls == [100]
     assert "unmeasured at 100 rounds" in result
-    assert "unmeasured at 200 rounds" in result
+    assert "100, 200 rounds; the plan is unsized" in result
     assert "tier 1" in result
     # Unsized plan: every database gets a tier-1 pass with an explicit call,
     # no per-pass seconds estimate, and no tier-2.

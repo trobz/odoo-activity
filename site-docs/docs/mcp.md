@@ -105,15 +105,21 @@ findings run on the **MCP server machine**, not the database host.
 1. Export each authorized database and retain the exact returned paths.
 2. Call `password_plan(audits=[{"hash_file": "<exact export path>"}], minutes=...)`.
    Calibration and input-reading time are charged to the total budget.
-   Planning is capped at the smaller of that budget and 250 seconds; failure
-   or deadline exhaustion returns an error, never a partial plan. Calibration
+   Planning is capped at the smaller of that budget and 250 seconds. Probes
+   reserve up to five seconds (at most half the remaining planning time)
+   for returning a result. A failed probe stops calibration and returns an
+   unsized tier-1-only plan whose explicit runtime caps share the remaining
+   audit budget; passes with less than one second allocated are unfunded.
+   These caps are allocations, not completion estimates. Input errors and
+   deadline exhaustion on the measured path still return errors. Calibration
    uses `min(8, smallest actual salt-group count)` for each round count in
    the audit. The output names both the synthetic benchmark shape and the
    smallest actual count. Low-salt audits are not assigned an optimistic
    eight-salt rate; for larger counts, the measured eight-salt rate is used
    conservatively, without fabricated throughput scaling.
 3. Follow funded passes in order. Each pass names its exact hash and wordlist
-   paths and explicit minute/runtime cap; unfunded/skipped passes are not
+   paths and explicit minute/runtime cap; measured estimates are rounded up
+   to whole seconds for both funding and caps; unfunded/skipped passes are not
    launch instructions. **All wordlist passes are asynchronous**, even short
    ones: poll `password_crack_status` until completion before another pass.
 4. Preserve the original audit deadline. Before *every* pass, cap its seconds
