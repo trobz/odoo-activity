@@ -2,6 +2,25 @@
 
 <!-- version list -->
 
+## v0.31.0 (2026-10-16)
+
+### Bug Fixes
+
+- **password-audit**: Address planner budget and input review
+  ([`312a601`](https://github.com/trobz/odoo-activity/commit/312a601d8e9a54d2128a04710fd975f05fec5d4a))
+
+- **password-audit**: Bound candidate type inference
+  ([`e36692b`](https://github.com/trobz/odoo-activity/commit/e36692b17173892c7a071ea24894484cea0404d0))
+
+### Features
+
+- Add opt-in password-audit MCP workflow
+  ([`407895c`](https://github.com/trobz/odoo-activity/commit/407895cc2b8c3755ce4ef31a35acf95ce03688c9))
+
+- **password-audit**: Generate admin/odoo year variants in tier-1
+  ([`1061188`](https://github.com/trobz/odoo-activity/commit/10611880eb115dfcf27793afcaaa92016378a886))
+
+
 ## v0.30.0 (2026-10-16)
 
 ### Documentation
