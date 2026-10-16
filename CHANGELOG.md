@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.30.0 (2026-10-16)
+
+### Documentation
+
+- Align database flag docs with what odoo-db returns
+  ([`11c1a5f`](https://github.com/trobz/odoo-activity/commit/11c1a5f4939f385a90346b009d9f1c5612d1a9f9))
+
+### Features
+
+- **probes**: Show odoo-db's database.* flags off the same list run
+  ([`c494783`](https://github.com/trobz/odoo-activity/commit/c4947831972e458400852c20b768e3392f156548))
+
+
 ## v0.29.2 (2026-10-10)
 
 ### Bug Fixes
