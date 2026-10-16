@@ -52,7 +52,8 @@ def section_table(title: str, columns: list[str], rows: list[list[str]]) -> Tabl
     for col in columns:
         table.add_column(col, overflow="fold" if col in _FOLDED_COLUMNS else "ellipsis")
     for row in rows:
-        table.add_row(*row)
+        # cells are data, not markup: Rich would crash on `[/x]` and swallow `[bold]`
+        table.add_row(*(Text(cell) if isinstance(cell, str) else cell for cell in row))
     return table
 
 

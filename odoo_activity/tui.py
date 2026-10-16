@@ -32,14 +32,18 @@ from odoo_activity.managers import (
 from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
+    DATABASE_BOOL_FLAGS,
+    BoolFlag,
     CapturedReport,
+    DbFlags,
     Instance,
     ProcRow,
     backup_wkhtmltopdf_capture,
+    database_flags,
     databases_of,
+    dump_age,
     dump_and_parse_stacks,
     format_duration,
-    neutralized_databases,
     pg_target_of,
     procs_of,
     read_cpu_times,
@@ -51,6 +55,7 @@ from odoo_activity.probes import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import date
 
     from odoo_activity.plugins import DbTarget, Plugin
 
@@ -154,6 +159,27 @@ def _neutralized_marker(state: bool | None) -> str:
     way is the one thing this tag exists to prevent.
     """
     return "" if state is None else _NEUTRALIZATION_TAGS[state]
+
+
+# off the same `odoo-db list` run
+_FLAG_TAGS: dict[BoolFlag, str] = {
+    "anonymized": "ANON",
+    "obfuscated": "OBFUSC",
+    "shrunk": "SHRUNK",
+    "configured_for_safe_testing": "SAFE-TEST",
+}
+
+
+def _flag_markers(flags: DbFlags | None, today: date | None = None) -> str:
+    """Each step that ran, then the dump's age."""
+    if flags is None:
+        return ""
+
+    tags = [f"[cyan]{_FLAG_TAGS[name]}[/]" for name in DATABASE_BOOL_FLAGS if flags[name] is True]
+    if (age := dump_age(flags["source_dump_datetime"], today)) is not None:
+        tags.append(f"[dim]dump {age}d[/]")
+
+    return f"  {' '.join(tags)}" if tags else ""
 
 
 def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50) -> str:
@@ -309,7 +335,7 @@ class OdooActivity(App):
         self._row_owner: dict[str, str] = {}  # row key -> owning instance key
         self._row_db: dict[str, str] = {}  # db row key -> db name
         self._db_cache: dict[str, tuple[list[str], str | None]] = {}  # instance key -> its (dbs, port)
-        self._neutralized: dict[str, dict[str, bool]] = {}  # instance key -> {db: is_neutralized}
+        self._db_flags: dict[str, dict[str, DbFlags]] = {}  # instance key -> {db: DbFlags}
         self._shown_key: str | None = None  # highlighted row driving the activity pane
         self._instances_ready = False  # first _rebuild_instances has finished mounting rows
 
@@ -594,7 +620,8 @@ class OdooActivity(App):
             # same column rather than as a ragged suffix of the db name
             tags = _markers(self.plugins, (inst, db)) if inst is not None else ""
             marker = f"  {tags}" if tags else ""
-            neutral = _neutralized_marker(self._neutralized.get(key, {}).get(db))
+            flags = self._db_flags.get(key, {}).get(db)
+            neutral = _neutralized_marker(flags["neutralized"] if flags else None) + _flag_markers(flags)
             label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}{neutral}{marker}"
             items.append(ListItem(Label(label), name=db_key))
 
@@ -632,11 +659,11 @@ class OdooActivity(App):
         if inst is None:
             return
 
-        self._db_cache[key], self._neutralized[key] = await to_thread(self._fetch_databases, inst)
+        self._db_cache[key], self._db_flags[key] = await to_thread(self._fetch_databases, inst)
         await self._mount_databases(key)
 
-    def _fetch_databases(self, inst: Instance) -> tuple[tuple[list[str], str | None], dict[str, bool]]:
-        """The instance's dbs and their neutralization, in one thread hop.
+    def _fetch_databases(self, inst: Instance) -> tuple[tuple[list[str], str | None], dict[str, DbFlags]]:
+        """The instance's dbs and their `database.*` flags, in one thread hop.
 
         Both in a single `to_thread`, deliberately: each await in the worker
         is a point where an arrow keypress starts the next (exclusive) fetch
@@ -649,8 +676,12 @@ class OdooActivity(App):
         to be reachable.
         """
         dbs = databases_of(inst, self.host)
-        neutralized = neutralized_databases(pg_target_of(inst, self.host), self.host) if dbs[0] else {}
-        return dbs, neutralized
+        flags = database_flags(pg_target_of(inst, self.host), self.host) if dbs[0] else {}
+        return dbs, flags
+
+    def db_flags(self, inst: Instance, db: str) -> DbFlags | None:
+        """`db`'s cached flags (None if unknown), so the Neutralization tab needn't rerun `odoo-db list`."""
+        return self._db_flags.get(f"{inst['manager']}:{inst['name']}", {}).get(db)
 
     async def _mount_databases(self, key: str) -> None:
         """Replace `key`'s db rows in place with what `_db_cache` now holds."""
@@ -779,10 +810,10 @@ class OdooActivity(App):
             if names or inst is None or inst["manager"] != "docker" or inst["status"] != "running":
                 continue
 
-            fetched, neutralized = await to_thread(self._fetch_databases, inst)
+            fetched, flags = await to_thread(self._fetch_databases, inst)
             if fetched[0]:
                 self._db_cache[key] = fetched
-                self._neutralized[key] = neutralized
+                self._db_flags[key] = flags
                 await self._mount_databases(key)
 
     def current_instance(self) -> Instance | None:

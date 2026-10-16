@@ -238,7 +238,9 @@ that matters once `mail_servers` is empty and Odoo falls back to
 `odoo-db check-sensitive-information <db>`, rendered as its own set of
 tables like Mail. The db row's tag is the binary claim
 (`database.is_neutralized`, off `odoo-db list`); this tab checks it, and
-only when opened — it's a per-database read.
+only when opened — it's a per-database read. The same run also tags each
+other `database.is_*` that is true (`ANON`, `OBFUSC`, `SHRUNK`,
+`SAFE-TEST`) and the dump's age (`dump 142d`).
 
 The verdict leads, in odoo-db's own words so the tab and the CLI agree:
 green where the claim holds and nothing below can reach the outside, yellow **PARTIALLY NEUTRALIZED** where the flag is set but a
@@ -246,6 +248,10 @@ surface each module's `neutralize.sql` should have cleared is still live (a
 payment provider still enabled, an IAP token still billable, a live bank
 feed) — treat such a database as production until they're cleared — and red
 where it isn't neutralized at all.
+
+Under it, a **Database flags** table lists every one of those flags as
+`yes`/`no`/`not set` (never copied, or odoo-db too old to know it), plus the
+dump timestamp.
 
 Below that come the secrets neutralization never touches: it clears what a
 database can *do*, not what it *holds*, and only for modules shipping a

@@ -24,9 +24,10 @@ import uuid
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Literal
 
 import pyperclip
 
@@ -2811,8 +2812,56 @@ def parse_odoo_db_output(stdout: str, stderr: str) -> tuple[list[dict] | None, s
     return data, raw
 
 
-def neutralized_databases(port: str | PgTarget | None = None, host: Host = LOCAL) -> dict[str, bool]:
-    """{db: is_neutralized} for every Odoo database on the cluster, from
+class DbFlags(TypedDict):
+    """A db's `database.*` params, as `odoo-db list` reports them."""
+
+    neutralized: bool  # unset is False, not None: a prod db never sets it
+    shrunk: bool | None
+    anonymized: bool | None
+    obfuscated: bool | None
+    configured_for_safe_testing: bool | None
+    source_dump_datetime: str | None
+
+
+BoolFlag = Literal["anonymized", "obfuscated", "shrunk", "configured_for_safe_testing"]
+
+# display order, row tags and Neutralization tab alike
+DATABASE_BOOL_FLAGS: tuple[BoolFlag, ...] = ("anonymized", "obfuscated", "shrunk", "configured_for_safe_testing")
+
+
+def dump_age(value: str | None, today: date | None = None) -> int | None:
+    """Days since the dump; None if unparseable (odoo-db passes it raw) or in the future."""
+    if not value:
+        return None
+
+    try:
+        dumped = datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
+
+    age = ((today or date.today()) - dumped).days
+    return age if age >= 0 else None
+
+
+def _bool_or_none(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _db_flags_of(row: dict) -> DbFlags:
+    """None for a key an older odoo-db omits: unknown, not False (step skipped)."""
+    dump = row.get("source_dump_datetime")
+    return {
+        "neutralized": bool(row.get("neutralized")),
+        "shrunk": _bool_or_none(row.get("shrunk")),
+        "anonymized": _bool_or_none(row.get("anonymized")),
+        "obfuscated": _bool_or_none(row.get("obfuscated")),
+        "configured_for_safe_testing": _bool_or_none(row.get("configured_for_safe_testing")),
+        "source_dump_datetime": dump if isinstance(dump, str) and dump else None,
+    }
+
+
+def database_flags(port: str | PgTarget | None = None, host: Host = LOCAL) -> dict[str, DbFlags]:
+    """{db: DbFlags} for every Odoo database on the cluster, from
     `odoo-db list`.
 
     odoo-db is the brain here: `database.is_neutralized` is the flag
@@ -2820,7 +2869,7 @@ def neutralized_databases(port: str | PgTarget | None = None, host: Host = LOCAL
     actually left live (a payment provider still enabled, an IAP token
     still billable) is Odoo domain knowledge that one place should track
     across versions -- `odoo-db check-sensitive-information` does, and the
-    Neutralization tab shows it. This is the row tag only: one binary,
+    Neutralization tab shows it. This feeds the row tags only:
     cluster-wide, one process instead of a psql per database, because it
     runs on every instance highlight -- sometimes against a host already
     loaded enough for the user to be debugging it.
@@ -2841,7 +2890,7 @@ def neutralized_databases(port: str | PgTarget | None = None, host: Host = LOCAL
         return {}
 
     rows, _raw = parse_odoo_db_output(stdout, stderr)
-    return {row["db"]: bool(row.get("neutralized")) for row in rows or [] if row.get("db")}
+    return {row["db"]: _db_flags_of(row) for row in rows or [] if row.get("db")}
 
 
 # odoo-logs's 10 commands, in the order the Logs Analysis tab lists them --

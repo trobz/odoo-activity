@@ -938,37 +938,99 @@ def test_a_containers_workdir_comes_off_the_image_not_a_running_process(monkeypa
     assert calls == [["docker", "inspect", "-f", "{{.Config.WorkingDir}}", "acme-odoo-1"]]
 
 
-def test_neutralized_databases_reads_the_cluster_in_one_odoo_db_run(monkeypatch):
-    """The row tag is a binary claim off `odoo-db list`, one process for the
-    whole cluster -- it runs on every instance highlight, sometimes against
+def _odoo_db_list(monkeypatch, rows: list[dict]) -> list[list[str]]:
+    """Stub `odoo-db list` to answer `rows`; returns the argvs it was run with."""
+    seen: list[list[str]] = []
+
+    def popen(_self, argv, **_kw):
+        seen.append(argv)
+        payload = json.dumps(rows)
+        return SimpleNamespace(communicate=lambda timeout=None: (payload, ""), kill=lambda: None)
+
+    monkeypatch.setattr(Host, "popen", popen)
+    return seen
+
+
+def test_database_flags_reads_the_cluster_in_one_odoo_db_run(monkeypatch):
+    """The row tags come off `odoo-db list`, one process for the whole
+    cluster -- it runs on every instance highlight, sometimes against
     a host already loaded enough to be worth debugging.
 
     A db odoo-db skipped (not an Odoo database, or it would not open) is
     absent from the map: unknown, which the UI shows as no tag rather than
     as a guess in either direction."""
-    seen: list[list[str]] = []
-
-    def popen(_self, argv, **_kw):
-        seen.append(argv)
-        payload = json.dumps([
-            {"db": "staging", "version": "19.0", "neutralized": True},
+    seen = _odoo_db_list(
+        monkeypatch,
+        [
+            {
+                "db": "staging",
+                "version": "19.0",
+                "neutralized": True,
+                "shrunk": False,
+                "anonymized": True,
+                "obfuscated": None,
+                "configured_for_safe_testing": None,
+                "source_dump_datetime": "2026-05-19T14:30:00",
+            },
             {"db": "prod", "version": "17.0", "neutralized": False},
-        ])
-        return SimpleNamespace(communicate=lambda timeout=None: (payload, ""), kill=lambda: None)
+        ],
+    )
 
-    monkeypatch.setattr(Host, "popen", popen)
-
-    assert probes.neutralized_databases("5433", Host()) == {"staging": True, "prod": False}
+    assert probes.database_flags("5433", Host()) == {
+        "staging": {
+            "neutralized": True,
+            "shrunk": False,
+            "anonymized": True,
+            "obfuscated": None,
+            "configured_for_safe_testing": None,
+            "source_dump_datetime": "2026-05-19T14:30:00",
+        },
+        # an odoo-db that predates the other flags omits them: unknown, not False
+        "prod": {
+            "neutralized": False,
+            "shrunk": None,
+            "anonymized": None,
+            "obfuscated": None,
+            "configured_for_safe_testing": None,
+            "source_dump_datetime": None,
+        },
+    }
     # `list` is cluster-wide: no database argument, one run
     assert seen == [["env", "PGPORT=5433", "odoo-db", "--output-format", "json", "list"]]
 
 
-def test_neutralized_databases_answers_nothing_when_odoo_db_cannot(monkeypatch):
+def test_database_flags_reads_anything_but_a_bool_as_unknown(monkeypatch):
+    """A non-empty string where a bool belongs must not read as True."""
+    _odoo_db_list(
+        monkeypatch,
+        [{"db": "x", "neutralized": True, "anonymized": "false", "shrunk": 1, "source_dump_datetime": ""}],
+    )
+
+    flags = probes.database_flags(None, Host())["x"]
+    assert flags["anonymized"] is None
+    assert flags["shrunk"] is None
+    assert flags["source_dump_datetime"] is None
+
+
+def test_dump_age_counts_whole_days_and_drops_what_it_cannot_date():
+    from datetime import date
+
+    today = date(2026, 10, 8)
+    assert probes.dump_age("2026-10-08", today) == 0
+    assert probes.dump_age("2026-05-19", today) == 142
+    assert probes.dump_age("2026-05-19T14:30:00", today) == 142
+    assert probes.dump_age("2026-05-19T23:30:00+07:00", today) == 142  # its own calendar day
+    assert probes.dump_age("20261340", today) is None
+    assert probes.dump_age("2027-01-01", today) is None
+    assert probes.dump_age(None, today) is None
+
+
+def test_database_flags_answers_nothing_when_odoo_db_cannot(monkeypatch):
     """No odoo-db on the host, or a run that hangs, leaves every row
     untagged rather than tagging them all as live -- a wrong green and a
     wrong red are both worse than no tag."""
     monkeypatch.setattr(Host, "popen", lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError))
-    assert probes.neutralized_databases(None, Host()) == {}
+    assert probes.database_flags(None, Host()) == {}
 
     killed: list[bool] = []
 
@@ -979,7 +1041,7 @@ def test_neutralized_databases_answers_nothing_when_odoo_db_cannot(monkeypatch):
         return SimpleNamespace(communicate=communicate, kill=lambda: killed.append(True))
 
     monkeypatch.setattr(Host, "popen", hanging)
-    assert probes.neutralized_databases(None, Host()) == {}
+    assert probes.database_flags(None, Host()) == {}
     assert killed == [True]  # not left running behind us
 
 

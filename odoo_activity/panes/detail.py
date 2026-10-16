@@ -1694,6 +1694,7 @@ class ActivityPane(Vertical):
         Only fetched when the tab is opened: it is a per-database read, while
         the row tag it details is a cluster-wide one.
         """
+        flags = self.app.db_flags(self._db[0], db) if self._db else None  # before the await: `_db` may move
         outcome = await self._run_odoo_db("Neutralization", db, port, host, ident, include_inactive=False)
         if outcome is None:
             return
@@ -1706,7 +1707,7 @@ class ActivityPane(Vertical):
         self._dbtab.actions = self._plugin_actions("Neutralization")
         self._dbtab.rows = []  # not table-backed -- stale rows from a prior tab shouldn't feed `/` search here
         self._use("log")
-        render_neutralization(self.query_one("#acbody", RichLog), rows[0] if rows else {})
+        render_neutralization(self.query_one("#acbody", RichLog), rows[0] if rows else {}, flags)
         self._render_actions()
 
     async def _fetch_reports(
@@ -2207,7 +2208,8 @@ class ActivityPane(Vertical):
         columns = table_columns(rows)
         table.add_columns(*(c.upper() for c in columns))
         for i, row in pairs:
-            table.add_row(*(stringify(row.get(c, "")) for c in columns), key=str(i))
+            # Text, not str: DataTable reads a str cell as markup (`[/opt/odoo/addons]` crashes it)
+            table.add_row(*(Text(stringify(row.get(c, "")), no_wrap=True) for c in columns), key=str(i))
 
     def _visible_db_rows(self) -> list[tuple[int, dict]]:
         """(original index, row) for the db rows passing the active-flag and
@@ -2272,7 +2274,7 @@ class ActivityPane(Vertical):
             table.add_column(wrap_col.upper(), width=max(20, (table.size.width or 80) - other_width))
 
         for n, (i, row) in enumerate(pairs, start=1):
-            cells: list[str | Text] = [stringify(row.get(c, "")) for c in fixed]
+            cells = [Text(stringify(row.get(c, ""))) for c in fixed]
             if wrap_col:
                 cells.append(Text(str(row.get(wrap_col, "")), no_wrap=False))
             if self._dbtab.numbered:

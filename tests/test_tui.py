@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+from textual.coordinate import Coordinate
 from textual.widgets import DataTable
 from textual.worker import WorkerCancelled
 
@@ -267,7 +268,7 @@ def test_render_mail_flags_a_test_catcher_server_with_an_explicit_warning():
 
     renderables = list(body.written.renderables)
     assert isinstance(renderables[0], Table)
-    assert next(iter(renderables[0].columns[1].cells)) == "mailhog"
+    assert str(next(iter(renderables[0].columns[1].cells))) == "mailhog"
     assert [c.header for c in renderables[0].columns] == [
         "seq",
         "name",
@@ -373,7 +374,7 @@ def test_render_mail_flags_a_known_production_relay_positively():
 
     renderables = list(body.written.renderables)
     assert isinstance(renderables[0], Table)
-    assert next(iter(renderables[0].columns[1].cells)) == "Primary"
+    assert str(next(iter(renderables[0].columns[1].cells))) == "Primary"
     assert isinstance(renderables[1], Text)
     assert "KNOWN RELAY" in str(renderables[1])
     assert "Google Workspace SMTP relay" in str(renderables[1])
@@ -1245,6 +1246,24 @@ def test_params_filter_keeps_original_row_index_as_key(monkeypatch):
 
             assert shown == [_PARAMS_ROWS[1]]  # row 1, not row 0
             assert pane._showing_raw is True
+
+    asyncio.run(go())
+
+
+def test_db_tab_cells_are_not_read_as_markup(monkeypatch):
+    """A str cell carrying `[/x]` shows as-is, not as markup."""
+    _params_setup(monkeypatch)
+    rows = [{"key": "[/opt/odoo/addons]", "value": "x"}, {"key": "[bold]y[/bold]", "value": "z"}]
+    monkeypatch.setattr(detail_mod, "start_odoo_db", lambda *_a, **_k: _FakeOdooDbProc(rows))
+
+    async def go():
+        async with tui.OdooActivity().run_test(size=(100, 40)) as pilot:
+            await _open_params(pilot)
+            await pilot.pause()
+
+            table = pilot.app.query_one("#actable", DataTable)
+            keys = [str(table.get_cell_at(Coordinate(r, 0))) for r in range(table.row_count)]
+            assert keys == ["[/opt/odoo/addons]", "[bold]y[/bold]"]
 
     asyncio.run(go())
 
@@ -2453,7 +2472,9 @@ def test_db_rows_carry_their_neutralization_status(monkeypatch):
     monkeypatch.setattr(probes, "procs_of", lambda *_: [])
     monkeypatch.setattr(tui, "databases_of", lambda *_: (["staging", "prod", "unknown"], None))
     monkeypatch.setattr(tui, "pg_target_of", lambda *_: probes.PgTarget())
-    monkeypatch.setattr(tui, "neutralized_databases", lambda *_: {"staging": True, "prod": False})
+    monkeypatch.setattr(
+        tui, "database_flags", lambda *_: {"staging": _flags(neutralized=True), "prod": _flags(neutralized=False)}
+    )
 
     async def go():
         async with tui.OdooActivity().run_test(size=(120, 40)) as pilot:
@@ -2469,6 +2490,75 @@ def test_db_rows_carry_their_neutralization_status(monkeypatch):
             assert "NEUTRALIZED" not in str(labels["systemd:b.service::db::unknown"])
 
     asyncio.run(go())
+
+
+def _flags(**over) -> probes.DbFlags:
+    """A database that never went through the copy pipeline, with `over` set."""
+    flags: probes.DbFlags = {
+        "neutralized": False,
+        "shrunk": None,
+        "anonymized": None,
+        "obfuscated": None,
+        "configured_for_safe_testing": None,
+        "source_dump_datetime": None,
+    }
+    return {**flags, **over}
+
+
+def test_db_rows_tag_only_the_copy_steps_that_ran(monkeypatch):
+    """True gets a tag; false and null get none."""
+    instances = [{"name": "b.service", "status": "running", "uptime": "0:01:00", "manager": "systemd"}]
+    monkeypatch.setattr(tui, "list_instances", lambda *_: instances)
+    monkeypatch.setattr(probes, "procs_of", lambda *_: [])
+    monkeypatch.setattr(tui, "databases_of", lambda *_: (["copy", "prod"], None))
+    monkeypatch.setattr(tui, "pg_target_of", lambda *_: probes.PgTarget())
+    copy = _flags(
+        neutralized=True,
+        anonymized=True,
+        obfuscated=False,
+        configured_for_safe_testing=True,
+        source_dump_datetime="2026-05-19",
+    )
+    monkeypatch.setattr(tui, "database_flags", lambda *_: {"copy": copy, "prod": _flags()})
+
+    async def go():
+        app = tui.OdooActivity()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            labels = {
+                item.name: str(next(iter(item.query(tui.Label))).content)
+                for item in app.query_one("#instances", tui.ListView).children
+            }
+            row = labels["systemd:b.service::db::copy"]
+            assert "ANON" in row
+            assert "SAFE-TEST" in row
+            assert "dump " in row
+            assert "OBFUSC" not in row  # false
+            assert "SHRUNK" not in row  # null
+
+            prod = labels["systemd:b.service::db::prod"]
+            assert not any(tag in prod for tag in ("ANON", "OBFUSC", "SHRUNK", "SAFE-TEST", "dump "))
+
+            inst = instances[0]
+            assert app.db_flags(inst, "copy") == copy  # ty: ignore[invalid-argument-type]
+            assert app.db_flags(inst, "gone") is None  # ty: ignore[invalid-argument-type]
+
+    asyncio.run(go())
+
+
+def test_flag_markers_name_each_step_that_ran_then_the_dump_age():
+    from datetime import date
+
+    today = date(2026, 10, 8)
+    assert tui._flag_markers(None, today) == ""
+    assert tui._flag_markers(_flags(neutralized=True), today) == ""
+    assert (
+        tui._flag_markers(_flags(shrunk=True, obfuscated=True, source_dump_datetime="2026-05-19"), today)
+        == "  [cyan]OBFUSC[/] [cyan]SHRUNK[/] [dim]dump 142d[/]"
+    )
+    assert tui._flag_markers(_flags(source_dump_datetime="sometime in may"), today) == ""  # unparseable
 
 
 def _plain(renderable) -> str:
@@ -2570,6 +2660,47 @@ def test_render_neutralization_says_what_a_green_database_still_holds():
     assert isinstance(renderables[1], Text)
     assert "never what it holds" in str(renderables[1])
     assert "acme.api_key" in _plain(renderables[2])
+
+
+def test_render_neutralization_lists_every_copy_flag_under_the_verdict():
+    """All flags, "no" (step skipped) told from "not set" (never copied)."""
+    from odoo_activity.panes.neutralization import render_neutralization
+
+    class _FakeBody:
+        def clear(self):
+            pass
+
+        def write(self, renderable):
+            self.written = renderable
+
+    def rendered(flags):
+        body = _FakeBody()
+        render_neutralization(body, {"is_neutralized": True, "live_surfaces": []}, flags)  # ty: ignore[invalid-argument-type]
+        return list(body.written.renderables)
+
+    renderables = rendered(_flags(neutralized=True, anonymized=True, obfuscated=False, source_dump_datetime="bogus"))
+    assert renderables[0].style == "bold green"  # the verdict still leads
+    table = " ".join(_plain(renderables[1]).split())
+    assert "database.is_anonymized │ yes" in table
+    assert "database.is_obfuscated │ no" in table
+    assert "database.is_shrunk │ not set" in table
+    assert "database.source_dump_datetime │ bogus" in table  # unparseable: shown as stored
+
+    # never copied, or flags not fetched yet: no section
+    assert len(rendered(_flags(neutralized=True))) == 1
+    assert len(rendered(None)) == 1
+
+    # a raw dump value is data, not markup
+    table = " ".join(_plain(rendered(_flags(source_dump_datetime="[/x]"))[1]).split())
+    assert "database.source_dump_datetime │ [/x]" in table
+
+
+def test_section_table_cells_are_not_read_as_markup():
+    from odoo_activity.panes.mail import section_table
+
+    rendered = _plain(section_table("t", ["a", "b"], [["[/x]", "[bold]x[/bold]"]]))
+    assert "[/x]" in rendered
+    assert "[bold]x[/bold]" in rendered  # not swallowed into a bold `x`
 
 
 # ---------------------------------------------------------------------------

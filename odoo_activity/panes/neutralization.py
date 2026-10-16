@@ -23,6 +23,7 @@ from rich.text import Text
 from textual.widgets import RichLog
 
 from odoo_activity.panes.mail import section_table
+from odoo_activity.probes import DATABASE_BOOL_FLAGS, DbFlags, dump_age
 
 # odoo-db's own three states, and the words it prints for each -- kept
 # identical so the tab and `odoo-db check-sensitive-information` say the
@@ -76,7 +77,27 @@ def _verdict(report: dict) -> Text:
     return Text(message, style=style)
 
 
-def render_neutralization(body: RichLog, report: dict) -> None:
+def _flag_value(value: bool | None) -> str:
+    # not set = never copied or odoo-db too old, unlike "no"
+    return "not set" if value is None else "yes" if value else "no"
+
+
+def _flags_section(flags: DbFlags | None) -> RenderableType | None:
+    """Every flag; None when none is set."""
+    if flags is None:
+        return None
+
+    dump = flags["source_dump_datetime"]
+    if dump is None and all(flags[name] is None for name in DATABASE_BOOL_FLAGS):
+        return None
+
+    age = dump_age(dump)
+    rows = [[f"database.is_{name}", _flag_value(flags[name])] for name in DATABASE_BOOL_FLAGS]
+    rows.append(["database.source_dump_datetime", f"{dump} ({age}d ago)" if age is not None else dump or "not set"])
+    return section_table("Database flags", ["parameter", "value"], rows)
+
+
+def render_neutralization(body: RichLog, report: dict, flags: DbFlags | None = None) -> None:
     """Populate `body` from odoo-db's `check-sensitive-information` bundle --
     same column choices as the command's own text output, so the TUI and the
     CLI tell the same story."""
@@ -88,6 +109,9 @@ def render_neutralization(body: RichLog, report: dict) -> None:
     tables = report.get("candidate_tables") or []
 
     renderables: list[RenderableType] = [_verdict(report)]
+
+    if (section := _flags_section(flags)) is not None:
+        renderables.append(section)
 
     if surfaces:
         renderables.append(

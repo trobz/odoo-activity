@@ -530,11 +530,20 @@ def test_instance_databases_reports_neutralization_per_database(monkeypatch):
     monkeypatch.setattr(mcp_server.probes, "pg_target_of", lambda *_a, **_k: mcp_server.probes.PgTarget())
     # `odoo-db list` answers for the whole cluster; only this instance's own
     # databases are reported back
-    cluster = {"staging": True, "someone_elses": True}
-    monkeypatch.setattr(mcp_server.probes, "neutralized_databases", lambda *_a, **_k: cluster)
+    staging = {
+        "neutralized": True,
+        "shrunk": None,
+        "anonymized": True,
+        "obfuscated": False,
+        "configured_for_safe_testing": None,
+        "source_dump_datetime": "2026-05-19",
+    }
+    cluster = {"staging": staging, "someone_elses": {**staging, "anonymized": None}}
+    monkeypatch.setattr(mcp_server.probes, "database_flags", lambda *_a, **_k: cluster)
 
     assert mcp_server.instance_databases("b.service") == {
         "databases": ["staging", "prod"],
         "db_port": "5432",
         "neutralized": {"staging": True},
+        "flags": {"staging": staging},
     }

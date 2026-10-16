@@ -356,18 +356,22 @@ in database mode).
   box's cluster) deliberately doesn't apply to it.
   Each db row then carries its neutralization status, straight off
   `odoo-db list`: green `NEUTRALIZED` where the database claims
-  `database.is_neutralized`, red `NOT NEUTRALIZED` where it does not —
+  `database.is_neutralized`, red `NOT NEUTRALIZED` where it is false or unset —
   treat every action on a red one as production. Binary on purpose, and one
   odoo-db run for the whole cluster: this fires on every instance
   highlight, often against a host loaded enough to be worth debugging. A
   database odoo-db couldn't read carries no tag at all rather than a guess,
   and a host with no odoo-db installed shows none.
 
+  The same run also tags each copy-pipeline step that is true — `ANON`,
+  `OBFUSC`, `SHRUNK`, `SAFE-TEST` — and the dump's age (`dump 142d`).
+
   The claim is not proof — a neutralization that died halfway, or a cron
   switched back on afterwards, leaves the flag set on a database that can
   still act. The **Neutralization** tab is where that gets checked, one
   database at a time and only when opened. The MCP `instance_databases`
-  tool returns the same binary claim as a `neutralized` map.
+  tool returns the same binary claim as a `neutralized` map, and every
+  flag as `flags`.
 - **Top** — the manager gives the instance's master pid (`systemctl ...
   -p MainPID` / `supervisorctl pid`); `ps -eo pid,ppid,user,%mem,args` is then
   walked down the ppid tree from there to find every worker.

@@ -184,6 +184,7 @@ class InstanceDatabases(TypedDict):
     databases: list[str]
     db_port: str | None
     neutralized: dict[str, bool]
+    flags: dict[str, probes.DbFlags]
 
 
 class InstanceTop(TypedDict):
@@ -324,6 +325,14 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
     safe: it lists the module surfaces neutralize should have cleared and
     did not, plus the credentials neutralization never clears at all.
 
+    `flags` maps each database to all its `database.*` params from the
+    same run: `neutralized`, `anonymized`, `obfuscated`, `shrunk`,
+    `configured_for_safe_testing` (`database.is_<name>`) and
+    `source_dump_datetime` (ISO 8601, or the raw value if unparseable).
+    Null means the key is not set (or the host's odoo-db predates it):
+    unknown, not false — false means the copy pipeline skipped that step.
+    `neutralized` is never null: unset counts as not neutralized.
+
     A database missing from the map is one odoo-db could not read (postgres
     down, or not an odoo database) — unknown, never a guess either way. The
     map is empty when the host has no `odoo-db` installed.
@@ -341,9 +350,10 @@ def instance_databases(name: str, *, target: Host) -> InstanceDatabases | None:
     databases, db_port = probes.databases_of(inst, target)
     # pg_target_of, not db_port: a docker instance's postgres also needs its
     # container address and credentials to be reachable at all.
-    cluster = probes.neutralized_databases(probes.pg_target_of(inst, target), target) if databases else {}
-    neutralized = {db: cluster[db] for db in databases if db in cluster}
-    return {"databases": databases, "db_port": db_port, "neutralized": neutralized}
+    cluster = probes.database_flags(probes.pg_target_of(inst, target), target) if databases else {}
+    flags = {db: cluster[db] for db in databases if db in cluster}
+    neutralized = {db: f["neutralized"] for db, f in flags.items()}
+    return {"databases": databases, "db_port": db_port, "neutralized": neutralized, "flags": flags}
 
 
 @mcp.tool()

@@ -18,4 +18,4 @@ def _no_neutralization_probe(monkeypatch):
     how it reached CI.
     """
     monkeypatch.setattr(tui, "pg_target_of", lambda *_a, **_k: probes.PgTarget())
-    monkeypatch.setattr(tui, "neutralized_databases", lambda *_a, **_k: {})
+    monkeypatch.setattr(tui, "database_flags", lambda *_a, **_k: {})
