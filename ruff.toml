@@ -52,6 +52,10 @@ extend-safe-fixes = ["UP008"]
 # runs its own scripts as `sys.executable -m <module>` -- an absolute
 # interpreter path and a module name, neither of them untrusted input
 "odoo_activity/plugins/odooly/__init__.py" = ["S603"]
+# runs hashcat over a fixed argv built in the same function (no shell, no
+# untrusted input); the /tmp work dir is the design: hash material must not
+# persist past the audit
+"odoo_activity/plugins/password_audit/__init__.py" = ["S108", "S603"]
 
 [format]
 preview = true

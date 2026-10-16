@@ -82,3 +82,75 @@ used to pin the server.
 See [Keybindings & Tabs — POS](keybindings.md#pos) for what each field
 means, including how it degrades on an instance whose version is missing a
 field.
+
+## `--enable-plugins=password-audit`
+
+This is a credential-material and local-GPU exception to the read-only
+surface. Both `oa-mcp` and `oa-mcp-multi` require the operator to enable
+`password-audit` at launch; installing the plugin does not enable it, and
+no per-call argument can bypass the gate. Export probes follow the pinned
+host or multi-host filter. Planning, calibration, attacks, status and
+findings run on the **MCP server machine**, not the database host.
+
+| Tool | Contract |
+| --- | --- |
+| `password_hashes` | Export active users' convertible hashes into a fresh private directory; return exact hash, derived/tier-2 wordlist and login-map paths, not hashes. |
+| `password_plan` | Read exports and both companion wordlists, calibrate synthetic wordlist attacks at each actual round count, and fund passes across databases under one explicit total-minute budget. Missing companions are errors, never fabricated candidate lists. |
+| `password_crack` | With a wordlist, launch a detached bounded attack; without one, only show prior audit-local cracks. Always supply explicit `minutes` when executing a plan. |
+| `password_crack_status` | Poll durable running/completed/error state after launch or a disconnected call; do not launch a replacement while the pass is running. |
+| `password_findings` | Return structured findings joined to the export and audit-local potfile for report aggregation; this can contain plaintext passwords. |
+
+### Budgeted workflow
+
+1. Export each authorized database and retain the exact returned paths.
+2. Call `password_plan(audits=[{"hash_file": "<exact export path>"}], minutes=...)`.
+   Calibration and input-reading time are charged to the total budget.
+   Planning is capped at the smaller of that budget and 250 seconds. Probes
+   reserve up to five seconds (at most half the remaining planning time)
+   for returning a result. A failed probe stops calibration and returns an
+   unsized tier-1-only plan whose explicit runtime caps share the remaining
+   audit budget; passes with less than one second allocated are unfunded.
+   These caps are allocations, not completion estimates. Input errors and
+   deadline exhaustion on the measured path still return errors. Calibration
+   uses `min(8, smallest actual salt-group count)` for each round count in
+   the audit. The output names both the synthetic benchmark shape and the
+   smallest actual count. Low-salt audits are not assigned an optimistic
+   eight-salt rate; for larger counts, the measured eight-salt rate is used
+   conservatively, without fabricated throughput scaling.
+3. Follow funded passes in order. Each pass names its exact hash and wordlist
+   paths and explicit minute/runtime cap; measured estimates are rounded up
+   to whole seconds for both funding and caps; unfunded/skipped passes are not
+   launch instructions. **All wordlist passes are asynchronous**, even short
+   ones: poll `password_crack_status` until completion before another pass.
+4. Preserve the original audit deadline. Before *every* pass, cap its seconds
+   to the smaller of its listed cap and the floored actual remaining audit
+   time, then divide by 60 for `minutes` (round down if floating-point
+   `ceil(minutes*60)` would exceed the cap). If less than one second remains,
+   stop. Startup, polling and operator delays consume budget too. Never omit
+   `minutes`: the independent 250-second crack default does not implement the
+   plan. Generic wordlists are optional only within actual remaining time.
+5. Collect `password_findings`, produce the authorized report, and apply the
+   agreed retention/deletion policy to the entire audit directory.
+
+Planner inputs must be regular files (not FIFOs/devices). Limits are 128
+exports, 32 MiB per hash/wordlist file, 200,000 records per file and 16 KiB
+per record; excess returns an explicit error. Streaming reads check the
+shared planning deadline between records.
+
+### Retention and checkpoints
+
+Treat exports, login mappings, wordlists, the canonical audit-local potfile,
+plaintext findings, logs, private input snapshots and checkpoints as
+credential material. Keep them private and off shared disks; there is no
+silent dependency on the global hashcat potfile. Agree retention before
+exporting and delete the **whole export directory** once the audit and any
+approved resumption are finished, only after its detached worker completes.
+
+Rerunning the same attack resumes only matching hash/wordlist/rules content
+fingerprints and private checkpoints; changed inputs must not silently
+resume old work. The worker holds the attack lock and publishes a durable
+completion code. Modern hashcat restore-position support and validated
+legacy checkpoints must honor the new bounded runtime rather than restoring
+an old unlimited/stale budget. A server disconnect does not cancel the
+worker: inspect status first, never truncate artifacts or start overlapping
+passes while its outcome is unknown.

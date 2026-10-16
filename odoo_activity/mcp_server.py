@@ -25,10 +25,14 @@ login.
 
 import functools
 import inspect
+import math
+import os
 import re
 import signal
+import stat
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 from types import ModuleType
 from typing import Annotated, Literal
@@ -117,6 +121,23 @@ def _pos() -> ModuleType:
         raise ValueError(msg)
 
     return pos
+
+
+def _password_audit() -> ModuleType:
+    """The password-audit plugin module, or a clear reason why it can't be
+    used -- same two-way gate as `_odooly()`/`_pos()`.
+    """
+    try:
+        from odoo_activity.plugins import password_audit
+    except ImportError as exc:
+        msg = "password-audit support unavailable -- the plugin is bundled, this is a bug"
+        raise ValueError(msg) from exc
+
+    if "password-audit" not in _enabled_plugins:
+        msg = "password-audit disabled -- restart the server with --enable-plugins=password-audit"
+        raise ValueError(msg)
+
+    return password_audit
 
 
 def _resolve_host(host: str | None, ssh_port: int | None) -> Host:
@@ -919,6 +940,589 @@ def pos_status(env: str) -> list[dict]:
         raise ValueError(message)
 
     return rows
+
+
+@mcp.tool()
+@_pinned_host
+def password_hashes(
+    name: str,
+    db: str,
+    *,
+    target: Host,
+) -> str:
+    """Bulk-export the active users' password hashes from `db` in hashcat
+    mode 12100 format (sha512:rounds:b64salt:b64digest), written to a local
+    file ready for `password_crack`. This is credential material: the answer
+    is the file path, never the hashes themselves — treat the file like a
+    password list, keep it off shared disks, delete it when done. Each call
+    reserves a fresh private export directory using the host, instance and
+    database identity; prior exports and their audit-local potfiles are not
+    overwritten. The response also names the derived/tier-2 wordlists and
+    .loginmap.json mapping. Delete the entire directory after the audit.
+
+    Requires --enable-plugins=password-audit: the plugin is the gate, and
+    enabling it is the operator's decision to export hashes at all.
+
+    Args:
+        name: instance name as `list_instances` reports it.
+        db: database name, as `instance_databases` reports it.
+        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
+            Omit to probe the machine this server runs on.
+        ssh_port: ssh port, if `host` is not on the default 22.
+    """
+    pa = _password_audit()
+    inst = _find(name, target)
+    if inst is None:
+        msg = f"no such instance {name!r}"
+        raise ValueError(msg)
+
+    rows, error = pa.fetch_hash_rows(probes.pg_target_of(inst, target), db, target)
+    if rows is None:
+        raise ValueError(error)
+
+    companies, _err = pa.fetch_company_names(probes.pg_target_of(inst, target), db, target)
+    # Every export gets a fresh private namespace, including repeated calls.
+    identity = target.alias or "local"
+    if target.port is not None:
+        identity += f":{target.port}"
+    if target.container is not None:
+        identity += f"/{target.container}"
+    path = pa.export_path(name, db, identity)
+    count = pa.write_hashcat_file(rows, path, companies=companies or [])
+    return (
+        f"{path} ({count} hashes, mode {pa.HASHCAT_MODE})\n"
+        f"{path.with_suffix('.derived.txt')} (tier-1 wordlist: common/login/company/single-char -- try it first)\n"
+        f"{path.with_suffix('.tier2.txt')} (tier-2 wordlist: 2-char combos and mutations -- when budget allows)\n"
+        f"{path.with_suffix('.loginmap.json')} (login mapping for findings)\n"
+        "Treat the entire export directory, including potfile and run artifacts, as credential material. "
+        "Delete it when the audit is done."
+    )
+
+
+def _minutes_seconds(minutes: float) -> int:
+    """Validate explicit budgets and round up to hashcat's integral seconds."""
+    seconds = minutes * 60.0
+    if not math.isfinite(seconds) or seconds <= 0:
+        msg = "minutes must be finite and positive (with finite seconds)"
+        raise ValueError(msg)
+    return math.ceil(seconds)
+
+
+class _AuditWork(TypedDict):
+    label: str
+    path: Path
+    hashes: int
+    groups: dict[tuple[int, str], int]
+
+
+def _plan_records(path: Path, check):
+    """Stream bounded regular inputs; check the shared deadline per record."""
+    check()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        msg = f"missing or unreadable planner input/companion wordlist: {path}"
+        raise ValueError(msg) from exc
+    try:
+        stream = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    total = 0
+    with stream:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            msg = f"non-regular planner input/companion wordlist: {path}"
+            raise ValueError(msg)
+        if info.st_size > _PASSWORD_PLAN_MAX_BYTES:
+            msg = f"planner input byte limit exceeded: {path}"
+            raise ValueError(msg)
+        for count in range(_PASSWORD_PLAN_MAX_RECORDS + 1):
+            check()
+            record = stream.readline(_PASSWORD_PLAN_MAX_RECORD_BYTES + 1)
+            check()
+            if not record:
+                return
+            total += len(record)
+            if (
+                count == _PASSWORD_PLAN_MAX_RECORDS
+                or len(record) > _PASSWORD_PLAN_MAX_RECORD_BYTES
+                or total > _PASSWORD_PLAN_MAX_BYTES
+            ):
+                msg = f"planner input record/byte limit exceeded: {path}"
+                raise ValueError(msg)
+            yield record.decode("utf-8").rstrip("\r\n")
+
+
+def _plan_hash_groups(path: Path, check) -> dict[tuple[int, str], int]:
+    groups: dict[tuple[int, str], set[str]] = {}
+    for line in _plan_records(path, check):
+        fields = line.strip().split(":")
+        if len(fields) != 5 or fields[1] != "sha512" or not fields[3] or not fields[4]:
+            continue
+        try:
+            rounds = int(fields[2])
+        except ValueError:
+            continue
+        if rounds > 0:
+            groups.setdefault((rounds, fields[3]), set()).add(fields[4])
+    return {group: len(digests) for group, digests in groups.items()}
+
+
+def _wordlist_sizes(entries: list[_AuditWork], tier: int, check) -> dict[Path, int]:
+    """Keep wordlist sizes associated with export paths, never sorted positions."""
+    sizes: dict[Path, int] = {}
+    for entry in entries:
+        wordlist = entry["path"].with_suffix(".derived.txt" if tier == 1 else ".tier2.txt")
+        sizes[entry["path"]] = sum(1 for _record in _plan_records(wordlist, check))
+    return sizes
+
+
+def _candidate_seconds(entry: _AuditWork, candidates: int, speeds: dict[int, float]) -> float:
+    """PBKDF2 runs once per candidate and distinct (rounds, salt), not digest."""
+    return sum(candidates / speeds[rounds] for rounds, _salt in entry["groups"])
+
+
+def _rounds_label(entry: _AuditWork) -> str:
+    return "/".join(f"{rounds:,}" for rounds in sorted({r for r, _s in entry["groups"]}))
+
+
+def _pass_call(entry: _AuditWork, tier: int, cost: float) -> str:
+    wordlist = entry["path"].with_suffix(".derived.txt" if tier == 1 else ".tier2.txt")
+    # Fund and cap complete integral seconds, including fractional estimates.
+    runtime = max(1, math.ceil(cost))
+    minutes = runtime / 60
+    if _minutes_seconds(minutes) > runtime:
+        minutes = math.nextafter(minutes, 0.0)
+    return (
+        f"   password_crack(hash_file={str(entry['path'])!r}, wordlist={str(wordlist)!r}, "
+        f"minutes={minutes!r}) — runtime cap {runtime}s; before launching use "
+        "min(this cap, floor(actual remaining audit time in seconds))/60; "
+        "round minutes down if ceil(minutes*60) would exceed that cap; "
+        "skip if less than 1s remains."
+    )
+
+
+def _allocate_tier1(
+    entries: list[_AuditWork],
+    sizes: dict[Path, int],
+    speeds: dict[int, float],
+    budget: float,
+) -> tuple[float, float, list[_AuditWork], list[str], list[str]]:
+    """Greedily fund complete tier-1 passes, largest unique hash count first."""
+    remaining = budget
+    plan: list[str] = []
+    funded = 0.0
+    funded_dbs: list[_AuditWork] = []
+    skipped: list[str] = []
+    for entry in sorted(entries, key=lambda e: -e["hashes"]):
+        label = entry["label"]
+        cost = max(1, math.ceil(_candidate_seconds(entry, sizes[entry["path"]], speeds)))
+        if cost <= remaining:
+            funded += cost
+            remaining = max(0.0, remaining - cost)
+            funded_dbs.append(entry)
+            plan.append(
+                f"1. tier 1 for {label} ({entry['hashes']} hashes, {_rounds_label(entry)} rounds): ~{cost:,.0f}s"
+            )
+            plan.append(_pass_call(entry, 1, cost))
+        else:
+            skipped.append(label)
+            plan.append(f"   tier 1 for {label}: UNFUNDED — est ~{cost:,.0f}s exceeds the remaining budget")
+    return funded, remaining, funded_dbs, skipped, plan
+
+
+def _fit_tier2(
+    entries: list[_AuditWork],
+    remaining: float,
+    speeds: dict[int, float],
+    sizes: dict[Path, int],
+) -> tuple[list[str], float]:
+    """Fit funded databases' tier-2 passes, highest round count first."""
+    plan: list[str] = []
+    total = 0.0
+    for entry in sorted(entries, key=lambda e: -max(r for r, _s in e["groups"])):
+        label = entry["label"]
+        cost = max(1, math.ceil(_candidate_seconds(entry, sizes[entry["path"]], speeds)))
+        if total + cost <= remaining:
+            total += cost
+            plan.append(
+                f"2. tier 2 for {label} ({entry['hashes']} hashes, {_rounds_label(entry)} rounds): ~{cost:,.0f}s"
+            )
+            plan.append(_pass_call(entry, 2, cost))
+        else:
+            plan.append(f"   tier 2 for {label}: SKIPPED — est ~{cost:,.0f}s exceeds remaining budget")
+    return plan, total
+
+
+_PASSWORD_PLAN_HEADROOM_S = 250.0
+_PASSWORD_PLAN_RESERVE_S = 5.0
+_PASSWORD_PLAN_MAX_FILES = 128
+_PASSWORD_PLAN_MAX_BYTES = 32 * 1024 * 1024
+_PASSWORD_PLAN_MAX_RECORDS = 200_000
+_PASSWORD_PLAN_MAX_RECORD_BYTES = 16 * 1024
+
+
+def _planning_remaining(started: float, budget: int, deadline: float) -> float:
+    """Never start another probe, or publish a plan, after its deadline."""
+    now = time.monotonic()
+    remaining = deadline - now
+    if remaining <= 0:
+        elapsed = max(0.0, now - started)
+        msg = (
+            "planning budget/time limit exhausted; no valid plan: not all calibration/planning completed in time; "
+            f"calibration + planning elapsed: {elapsed:,.0f}s (charged to budget); "
+            f"audit remaining {max(0.0, budget - elapsed):,.0f}s. "
+            "Retry with fewer round groups or a larger audit budget (planning is capped at 250s)."
+        )
+        raise ValueError(msg)
+    return remaining
+
+
+def _finalize_password_plan(
+    lines: list[str],
+    elapsed_index: int,
+    tier2_index: int,
+    started: float,
+    budget: int,
+    deadline: float,
+    minutes: float,
+    t1_funded: float,
+    t2_total: float,
+) -> str:
+    """Publish only current accounting and still-funded passes before the deadline."""
+
+    def accounting(elapsed: float) -> tuple[str, str, str]:
+        available = max(0.0, budget - elapsed)
+        return (
+            f"{elapsed:,.0f}",
+            f"{max(0.0, available - t1_funded):,.0f}",
+            f"{max(0.0, available - t1_funded - t2_total):,.0f}",
+        )
+
+    while True:
+        # Rebuild if output construction changed any displayed accounting.
+        displayed = accounting(max(0.0, time.monotonic() - started))
+        lines[elapsed_index] = f"calibration + planning elapsed: {displayed[0]}s (charged to budget)"
+        lines[tier2_index] = f"tier 2 fit: {t2_total:,.0f}s of {displayed[1]}s remaining (funded dbs only)"
+        lines[-1] = (
+            f"budget: {minutes:g} min; tier1+tier2 est {t1_funded + t2_total:,.0f}s"
+            f"; calibration+planning {displayed[0]}s"
+            f" — leftover {displayed[2]}s"
+            " may fund a generic wordlist pass (operator's call)"
+        )
+        result = "\n".join(lines)
+        planning_remaining = _planning_remaining(started, budget, deadline)
+        final_elapsed = max(0.0, deadline - started - planning_remaining)
+        final_available = max(0.0, budget - final_elapsed)
+        if t1_funded + t2_total > final_available:
+            msg = (
+                "planning budget invalidated; no valid plan: funded passes exceed the remaining audit budget; "
+                f"calibration + planning elapsed: {final_elapsed:,.0f}s (charged to budget); "
+                f"audit remaining {final_available:,.0f}s. Replan with a larger budget or fewer databases."
+            )
+            raise ValueError(msg)
+        if accounting(final_elapsed) == displayed:
+            return result
+
+
+def _disambiguate_audit_labels(entries: list[_AuditWork]) -> None:
+    labels = Counter(entry["label"] for entry in entries)
+    for entry in entries:
+        if labels[entry["label"]] > 1:
+            entry["label"] = str(entry["path"])
+
+
+def _smallest_salt_shape(entries: list[_AuditWork], rounds: int) -> int:
+    return min(count for entry in entries if (count := sum(r == rounds for r, _s in entry["groups"])))
+
+
+def _unsized_plan(
+    entries: list[_AuditWork],
+    cal_lines: list[str],
+    unsized: list[int],
+    started: float,
+    budget: int,
+) -> str:
+    """Degrade to an unsized tier-1-only plan when calibration cannot finish.
+
+    A slow GPU (e.g. an iGPU at 600k rounds) can fail every probe inside the
+    250s MCP-call headroom. That is not an audit-stopping error:
+    password_crack works without calibration, so emit every database's
+    tier-1 pass in order without seconds estimates, skip tier 2, and let the
+    operator reduce caps for launch delays against the audit deadline.
+    """
+    lines = [
+        "calibration (conservative min(8, smallest actual per-round salt-group count) wordlist benchmark; "
+        "measured rate used without throughput scaling): " + "; ".join(cal_lines)
+    ]
+    lines.append(
+        "ESTIMATES UNAVAILABLE: calibration unavailable for "
+        f"{', '.join(f'{r:,}' for r in unsized)} rounds; the plan is unsized. "
+        "Run tier 1 in order, poll password_crack_status, and stop at the "
+        "audit budget; tier 2 is skipped without measured rates."
+    )
+    elapsed = max(0.0, time.monotonic() - started)
+    remaining = max(0, math.floor(budget - elapsed))
+    lines.append(f"calibration + planning elapsed: {elapsed:,.0f}s (charged to budget)")
+    lines.append(f"audit remaining: {remaining}s; unsized caps share this budget, not completion estimates.")
+    for index, entry in enumerate(entries):
+        cap = remaining // (len(entries) - index)
+        if cap < 1:
+            lines.append(f"   tier 1 for {entry['label']}: UNFUNDED — less than 1s allocated")
+            continue
+        remaining -= cap
+        lines.append(f"1. tier 1 for {entry['label']} ({entry['hashes']} hashes, {_rounds_label(entry)} rounds)")
+        lines.append(_pass_call(entry, 1, cap))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def password_plan(
+    audits: list[dict],
+    minutes: float,
+) -> str:
+    """Build the time-budgeted crack plan for a password audit.
+
+    `audits`: one entry per database, each `{"hash_file": <path as returned
+    by `password_hashes`>}` — the tool reads each hash file to count hashes
+    and their round counts (no db access needed at this stage).
+
+    `minutes`: finite positive total time across all databases, rounded up
+    to seconds. Calibration and planning wall time are charged to this budget.
+    Planning is bounded by the smaller of this budget and 250 seconds of MCP
+    headroom. Each calibration's timeout includes CPU preparation and the
+    GPU probe. When calibration cannot finish inside that headroom (slow
+    GPUs, e.g. an iGPU at 600k rounds), the plan degrades to an unsized
+    tier-1-only result instead of aborting: run the tier-1 passes in order,
+    with explicit caps sharing the remaining budget, poll, and stop at the
+    budget; tier 2 is skipped without measured rates. Fractional pass estimates
+    are rounded up to whole seconds for both funding and runtime caps.
+
+    Calibrates each round count with min(8, smallest actual salt-group count)
+    among its databases. The measured eight-salt rate is used conservatively
+    for larger shapes, without fabricated throughput scaling. Costs
+    use unique (rounds, salt) groups, not export rows or an
+    unmeasured salt penalty. Tier 1 (`<db>.derived.txt`) is funded greedily,
+    largest unique-hash count first; unfunded databases are named explicitly.
+    Tier 2 (`<db>.tier2.txt`, combos and mutations as written) runs only for
+    funded databases when it fits. Estimates do not guarantee elapsed attack
+    time: process startup, polling and operator delay also consume real time.
+    Run passes in the listed order with `password_crack`, polling each with
+    `password_crack_status` until complete. A generic wordlist is optional
+    only if actual time remains. Planning itself launches no audit attacks.
+
+    Requires --enable-plugins=password-audit (same gate as the other
+    password tools).
+    """
+    started = time.monotonic()
+    pa = _password_audit()
+    budget = _minutes_seconds(minutes)
+    deadline = started + min(budget, _PASSWORD_PLAN_HEADROOM_S)
+
+    check = functools.partial(_planning_remaining, started, budget, deadline)
+    if len(audits) > _PASSWORD_PLAN_MAX_FILES:
+        msg = f"planner hash-file limit exceeded: maximum {_PASSWORD_PLAN_MAX_FILES} exports"
+        raise ValueError(msg)
+    entries: list[_AuditWork] = []
+    for a in audits:
+        hf = Path(a["hash_file"])
+        if not hf.is_file():
+            msg = f"{a['hash_file']}: no such hash file"
+            raise ValueError(msg)
+        groups = _plan_hash_groups(hf, check)
+        n_hashes = sum(groups.values())
+        if n_hashes == 0:
+            msg = f"{a['hash_file']}: no convertible hashes in the export — nothing to audit"
+            raise ValueError(msg)
+        entries.append({"label": hf.stem, "path": hf, "hashes": n_hashes, "groups": groups})
+
+    if not entries:
+        msg = "no hash files given"
+        raise ValueError(msg)
+
+    # Fresh export directories may contain identical filenames; keep them unambiguous.
+    _disambiguate_audit_labels(entries)
+
+    t1_sizes = _wordlist_sizes(entries, 1, check)
+    t2_sizes = _wordlist_sizes(entries, 2, check)
+
+    # calibrate at EVERY distinct round count in the audit (a mixed fleet —
+    # e.g. a v9 db at 19k rounds beside modern 600k dbs — has very
+    # different per-round throughput; one flat rate misestimates the
+    # low-round dbs). Same attack shape as the real passes; no scaling
+    # arithmetic (throughput is latency-bound, not round-proportional).
+    # Cap the smallest actual shape at calibrate's eight-salt maximum;
+    # retain that measured rate conservatively for larger actual shapes.
+    speeds: dict[int, float] = {}
+    cal_lines = []
+    unsized: list[int] = []
+    round_counts = sorted({r for entry in entries for r, _s in entry["groups"]})
+    for rounds in round_counts:
+        remaining = _planning_remaining(started, budget, deadline)
+        smallest_actual = _smallest_salt_shape(entries, rounds)
+        n_salts = min(8, smallest_actual)
+        reserve = min(_PASSWORD_PLAN_RESERVE_S, remaining / 2)
+        speed, cal_err = pa.calibrate(rounds, timeout_s=remaining - reserve, n_salts=n_salts)
+        if speed is None:
+            # Calibration can legitimately fail on slow GPUs (e.g. an iGPU
+            # cannot finish one 600k-round probe inside the 250s MCP-call
+            # headroom). That is not an audit-stopping error: password_crack
+            # works without calibration, so degrade to an unsized tier-1-only
+            # plan instead of aborting the whole flow.
+            unsized.extend(r for r in round_counts if r not in speeds)
+            cal_lines.append(f"unmeasured at {rounds:,} rounds ({cal_err})")
+            break
+        _planning_remaining(started, budget, deadline)
+        speeds[rounds] = speed
+        cal_lines.append(
+            f"{speed:,.0f} candidate-salt pairs/s at {rounds:,} rounds "
+            f"({n_salts} synthetic salts; smallest actual salt-group count {smallest_actual})"
+        )
+
+    lines = [
+        "calibration (conservative min(8, smallest actual per-round salt-group count) wordlist benchmark; "
+        "measured rate used without throughput scaling): " + "; ".join(cal_lines)
+    ]
+    if unsized:
+        return _unsized_plan(entries, cal_lines, unsized, started, budget)
+    lines.extend(f"database {entry['label']}: {entry['path']}" for entry in entries)
+    lines.append(
+        "Execution: never omit minutes (the independent 250s default is not the plan). "
+        "Poll password_crack_status until each pass completes; charge startup, polling and delays "
+        "against the original audit deadline, and cap every later pass to actual remaining audit time."
+    )
+
+    # Charge measured call overhead, including calibration setup and file reads.
+    _planning_remaining(started, budget, deadline)
+    elapsed = max(0.0, time.monotonic() - started)
+    available = max(0.0, budget - elapsed)
+    elapsed_index = len(lines)
+    lines.append(f"calibration + planning elapsed: {elapsed:,.0f}s (charged to budget)")
+    t1_funded, remaining, funded_dbs, skipped_dbs, plan = _allocate_tier1(entries, t1_sizes, speeds, available)
+    lines.append(f"tier 1 (prioritized): ~{t1_funded:,.0f}s funded across {len(funded_dbs)}/{len(entries)} dbs")
+    if skipped_dbs:
+        lines.append(f"BUDGET: {len(skipped_dbs)} dbs unfunded for tier-1: {', '.join(skipped_dbs)}")
+        lines.append("Run another audit with a bigger budget (or fewer dbs) to cover them.")
+
+    t2_plan, t2_total = _fit_tier2(funded_dbs, remaining, speeds, t2_sizes)
+    plan += t2_plan
+    tier2_index = len(lines)
+    lines.append(f"tier 2 fit: {t2_total:,.0f}s of {remaining:,.0f}s remaining (funded dbs only)")
+    lines += plan
+    lines.append("")
+    return _finalize_password_plan(
+        lines,
+        elapsed_index,
+        tier2_index,
+        started,
+        budget,
+        deadline,
+        minutes,
+        t1_funded,
+        t2_total,
+    )
+
+
+@mcp.tool()
+def password_crack(
+    hash_file: str,
+    wordlist: str | None = None,
+    rules: str | None = None,
+    minutes: float | None = None,
+) -> str:
+    """Run hashcat locally on this machine's GPU against a file produced by
+    `password_hashes` (mode 12100, PBKDF2-HMAC-SHA512 as Odoo 16+ stores).
+    With `wordlist`: launch a detached dictionary attack (optionally with
+    a rule file) under a 250-second default budget — the audit answers
+    "what could an HTTP bruteforce scanner find in a sitting", not a full
+    audit; poll `password_crack_status` until complete before another pass.
+    Hashcat stops at its runtime budget; process setup adds wall time.
+    Without `wordlist`: bounded `--show`, i.e. previous audit-local cracks.
+
+    Requires --enable-plugins=password-audit. Runs on the machine this MCP
+    server runs on — point it at a GPU host by running the server there.
+
+    Args:
+        hash_file: path as returned by `password_hashes`.
+        wordlist: wordlist path, e.g. the derived wordlist `password_hashes`
+            wrote, or rockyou.txt. Omit to run `--show`: re-list what
+            previous passes already cracked (the audit-local potfile) — no
+            new cracking happens without a wordlist.
+        rules: hashcat rules file applied to the wordlist (needs wordlist).
+        minutes: finite positive runtime override, rounded up to seconds
+            (even tiny positive budgets become one second). Omit for 250s.
+            All wordlist passes launch detached; poll `password_crack_status`.
+    """
+    pa = _password_audit()
+    path = Path(hash_file)
+    if not path.is_file():
+        msg = f"{hash_file}: no such file"
+        raise ValueError(msg)
+
+    hits, error = pa.run_hashcat(
+        path,
+        wordlist=Path(wordlist) if wordlist else None,
+        rules=Path(rules) if rules else None,
+        runtime_budget=_minutes_seconds(minutes) if minutes is not None else pa.RUNTIME_BUDGET_S,
+    )
+    if error:
+        raise ValueError(error)
+
+    return hits or "(no cracks yet)"
+
+
+@mcp.tool()
+def password_findings(hash_file: str) -> str:
+    """Consolidated cracks for a `password_hashes` export as STRUCTURED
+    JSON: [{"uid", "login", "digest", "password", "source"}], joined from
+    the audit-local potfile and the hash file. Use this for report
+    aggregation instead of parsing prose answers — it is the
+    machine-readable end of the audit flow, and it resolves the
+    audit-local-vs-global potfile question server-side (the audit-local
+    potfile is canonical).
+
+    Requires --enable-plugins=password-audit (same gate as the other
+    password tools).
+    """
+    pa = _password_audit()
+    path = Path(hash_file)
+    if not path.is_file():
+        msg = f"{hash_file}: no such file"
+        raise ValueError(msg)
+
+    findings, error = pa.password_findings(path)
+    if error:
+        raise ValueError(error)
+
+    import json
+
+    return json.dumps(findings, indent=2)
+
+
+@mcp.tool()
+def password_crack_status(hash_file: str) -> str:
+    """Where a detached wordlist pass launched by `password_crack` stands.
+    Poll this instead of re-calling `password_crack`:
+    while hashcat runs it answers "running, N cracks so far, ~Xs of budget
+    left"; once it finishes it returns the cracks and consumes the status.
+    A launch whose MCP call died still keeps cracking — this is how you
+    collect that work.
+
+    Requires --enable-plugins=password-audit (same gate as the other
+    password tools).
+    """
+    pa = _password_audit()
+    path = Path(hash_file)
+    if not path.is_file():
+        msg = f"{hash_file}: no such file"
+        raise ValueError(msg)
+
+    answer, error = pa.crack_status(path)
+    if error:
+        raise ValueError(error)
+
+    return answer
 
 
 @app.command()
