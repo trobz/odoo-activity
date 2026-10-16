@@ -139,7 +139,8 @@ _TRIVIAL_ALPHABET = string.digits + string.ascii_lowercase + string.ascii_upperc
 # is a separate wordlist so an attack can stop after tier 1 when the
 # budget is better spent there.
 _TIER1_CANDIDATES = tuple(_TRIVIAL_ALPHABET)
-_TIER2_CANDIDATES = tuple(a + b for a in _TRIVIAL_ALPHABET for b in _TRIVIAL_ALPHABET)
+# join keeps type inference from expanding thousands of literal concatenations.
+_TIER2_CANDIDATES = tuple("".join((a, b)) for a in _TRIVIAL_ALPHABET for b in _TRIVIAL_ALPHABET)
 # hashcat mask covering the same 62² candidates (used by calibrate() — a
 # mask attack avoids materializing the wordlist for the benchmark)
 _TIER2_MASK = "?1?1"
@@ -348,7 +349,7 @@ def build_tier2(companies: list[str] | None = None, logins: list[str] | None = N
     including suffix/template expansions. Bases are consumed round-robin.
     These limits NEVER remove original candidates; logins and the trivial
     alphabet are not mutated."""
-    candidates = list(_TIER2_CANDIDATES)
+    candidates: list[str] = list(_TIER2_CANDIDATES)
     companies = companies or []
     years = _years()
     for company in _company_variants(companies):
