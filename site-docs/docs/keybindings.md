@@ -33,8 +33,8 @@ tags:
 
 Some tabs on each side have no letter shortcut — cycle to them with
 `[`/`]` or click: **Processes**, **Stacks** and **Logs Analysis** (instance mode), **Queries**,
-**Modules** and **Reports** (database mode). A plugin-contributed tab (e.g. **POS**,
-see below) has none either.
+**Modules** and **Reports** (database mode). A plugin-contributed tab (e.g. **POS**
+or **MRP**, see below) has none either.
 
 `A` asks `odoo-db` for the rows it filters out by default (its `--all`
 flag). Against a host whose `odoo-db` predates that flag, the tab falls
@@ -74,8 +74,8 @@ list:
   Processes, Stacks, Logs, Logs Analysis, Config, Toolbox.
 - **Database mode** — one of its nested database rows is highlighted. Tabs:
   Queries, Users, Locks, Jobs, Crons, Mail, Neutralization, Modules, Params,
-  Reports, Toolbox, plus **POS** when the opt-in `pos` plugin is enabled
-  (see below).
+  Reports, Toolbox, plus **POS** and **MRP** when the opt-in `pos` and `mrp`
+  plugins are enabled (see below).
 
 Both modes share the same tab strip, and several letter-key shortcuts are
 reused across them for whichever tab they map to in each (e.g. `l` is Logs
@@ -193,6 +193,17 @@ and whether it waits for the terminal's own confirmation (per method on
 v14+, one flag for the whole till on older versions). No letter shortcut,
 no action strip — cycle to it with `[`/`]` or click, same
 as Queries/Modules.
+
+#### MRP
+
+Opt-in — only present with `--enable-plugins=mrp` (see
+[Plugins](plugins.md)). The open manufacturing orders scheduled to start
+within a week of today: reference, part number, ordered and produced-to-date
+quantities, status, scheduled start and deadline in the Odoo user's time
+zone, the sales order it came from, and its work center when all its work
+orders run on one. The plugin's real surface is the `mrp_*` MCP tools; this
+tab is the glance at the same connection. No letter shortcut, no action
+strip.
 
 ## Jobs (`j`)
 

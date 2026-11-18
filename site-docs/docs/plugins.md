@@ -5,6 +5,7 @@ tags:
   - plugins
   - odooly
   - pos
+  - mrp
 ---
 
 # Plugins
@@ -127,6 +128,34 @@ an older `pos.config` missing a newer field, `pos.payment.method` not
 existing at all before v14 — v12/v13 configure payment through plain
 `journal_ids` instead) shows as a blank cell rather than failing the whole
 tab. Verified back to v12.
+
+## mrp
+
+Read-only manufacturing data from Odoo MRP, for an agent's production
+skills: production plan, work orders, daily output, downtime, maintenance,
+work centers, routings, items and sales orders. It is a scoped wrapper on
+Odoo's documented API (rung 3 of the access ladder Anthropic's Claude for
+Manufacturing plugin walks in its `custom-connector` skill), and it exposes only those
+curated reads, never raw RPC.
+
+Rows use the column names those skills already read (`work_order`,
+`qty_good`, `asset_id`, `started_at`, ...), so rows written to CSV are
+picked up by the morning-pulse engine with no column manifest. Datetimes come
+back in the plant's time zone with their offset, never as Odoo's bare UTC.
+A field the instance's version or modules lack is named in `missing_fields`
+and left blank, never zeroed. See [MCP Server](mcp.md)
+for the tools.
+
+Opt-in, like pos, and it leans on odooly's `~/odooly.ini` matching the same
+way:
+
+```
+uv tool install "odoo-activity[mrp]"
+oa --enable-plugins=mrp
+```
+
+In the TUI it adds one **MRP** tab in database mode: the open manufacturing
+orders scheduled within a week of today.
 
 ## Writing one
 

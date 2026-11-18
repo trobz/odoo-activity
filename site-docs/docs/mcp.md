@@ -83,6 +83,50 @@ See [Keybindings & Tabs — POS](keybindings.md#pos) for what each field
 means, including how it degrades on an instance whose version is missing a
 field.
 
+## `--enable-plugins=mrp`
+
+Read-only Odoo MRP data for an agent's manufacturing skills, the Odoo
+counterpart of the NetSuite / Infor M3 reads in Claude for Manufacturing.
+Naming `mrp` pulls in `odooly` too, and it needs the `mrp` extra. Like
+`pos_status`, every tool resolves locally against `~/odooly.ini` and reaches
+the instance over the network, never over ssh.
+
+| Tool | Reads | Rows |
+| --- | --- | --- |
+| `mrp_scope` | `res.users`, `ir.module.module` | login, company, tz, version, installed MRP modules: the connection test, no business data |
+| `mrp_work_orders` | `mrp.production` by scheduled start | `work_order`, `part_number`, `qty_ordered`, `qty_produced_to_date`, `status`, `scheduled_start`, `due_date`, `sales_order`, `asset_id` |
+| `mrp_plan` | `mrp.production` by scheduled start | `plan_date`, `part_number`, `planned_qty`, `uom`, `asset_id`, `work_order` |
+| `mrp_output` | done finished `stock.move`, done `stock.scrap` | `production_day`, `work_order`, `part_number`, `qty_good`, `qty_scrap`, `uom`, `asset_id`, `sales_order` |
+| `mrp_downtime` | `mrp.workcenter.productivity` | `asset_id`, `started_at`, `ended_at`, `duration_minutes`, `working_minutes`, `reason_code`, `loss_type`, `reason_text`, `work_order` |
+| `mrp_maintenance` | `maintenance.request` | `maintenance_wo`, `asset_id`, `work_center`, `type`, `opened_date`, `closed_date`, `is_open`, `close_out_note` |
+| `mrp_work_centers` | `mrp.workcenter`, its calendar | `asset_id`, `capacity`, `time_efficiency_pct`, `oee_target_pct`, `costs_hour`, setup/cleanup minutes, `attendance` slots |
+| `mrp_routings` | `mrp.routing.workcenter` (v14+) | `part_number`, `op_seq`, `work_center`, `cycle_minutes`, `run_min_per_unit`, `setup_hours` |
+| `mrp_items` | `product.product`, by part number only | `part_number`, `description`, `uom`, `std_cost`, `make_buy` |
+| `mrp_sales_orders` | `sale.order.line`, by order name only | `sales_order`, `customer`, `part_number`, `qty_ordered`, `qty_delivered`, `promised_date` |
+
+What every result carries besides `rows`:
+
+- **`window`**: the windowed tools take `date_from`/`date_to` as local days and
+  a `tz`, defaulting to the Odoo user's own zone, else UTC, with a `notes` line
+  saying which. A "day" is a day in that zone.
+- **`truncated`**: the read hit `limit` (default 2000, max 20000). Narrow the
+  window and pull again; a capped pull never passes for a complete one.
+- **`missing_fields`**: what this version or module set doesn't have. The
+  cells stay blank: absent, not zero.
+- **`odoo_ref`** on every row (`odoo:mrp.production/42`), so a figure traces
+  back to its record.
+
+Two choices worth knowing. Output is per MO per day from done stock moves,
+not `mrp.production.qty_produced`, which is cumulative. And productive time
+is left out of `mrp_downtime` unless `include_productive` is set.
+
+`mrp_downtime` gives two durations because Odoo's own is not elapsed time.
+`duration_minutes` is `ended_at - started_at`. `working_minutes` is Odoo's
+`duration`, which for availability and quality losses counts only the
+minutes inside the work center's working calendar: a 90-minute stop outside
+that calendar reads 0 there. A wide gap between the two usually means the
+calendar is wrong, often its time zone.
+
 ## `--enable-plugins=password-audit`
 
 This is a credential-material and local-GPU exception to the read-only
