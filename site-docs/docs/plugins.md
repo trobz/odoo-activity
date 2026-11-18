@@ -128,6 +128,15 @@ existing at all before v14 — v12/v13 configure payment through plain
 `journal_ids` instead) shows as a blank cell rather than failing the whole
 tab. Verified back to v12.
 
+## users-audit and password-audit
+
+Both are opt-in credential plugins with no TUI surface: they run in the MCP
+server (`oa-mcp` / `oa-mcp-multi`), where `users_audit` exports one
+`<db>_accounts.json` per database and `password_hashes` converts such a file
+into a hashcat target. Enable them with
+`--enable-plugins=users-audit,password-audit`; see [MCP](mcp.md) for the
+workflow and retention rules.
+
 ## Writing one
 
 Plugins are found through Python entry points, so a plugin is a package that

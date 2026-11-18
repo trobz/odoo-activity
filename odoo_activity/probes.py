@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import csv
+import io
 import ipaddress
 import itertools
 import json
@@ -1536,6 +1538,40 @@ def _psql_json(
         return json.loads(out) or [], ""
     except (json.JSONDecodeError, ValueError):
         return None, out
+
+
+def _psql_csv(
+    sql: str, db: str, params: dict[str, str], port: str | PgTarget | None, host: Host
+) -> tuple[list[list[str | None]] | None, str]:
+    """Run a `SELECT` on `db` and return its rows as decoded CSV cells.
+
+    `(rows, error)`: rows is None only when the query didn't run. The
+    statement is wrapped in `COPY (<sql>) TO STDOUT WITH CSV NULL '\\N'`,
+    which works on PostgreSQL 8.0+ — Odoo 8 can run on 8.4/9.0, so the
+    account exports must not use `json_agg`/`json_build_object` (9.3/9.5).
+    `NULL '\\N'` keeps SQL NULL distinguishable from an empty string, and
+    Python's csv reader handles embedded commas, quotes and newlines.
+
+    Like `_psql_json`, values arrive as psql variables (`-v`), so they can't
+    reshape the statement.
+    """
+    cmd = PgTarget.of(port).psql("-d", db, "-v", "ON_ERROR_STOP=1")
+    for name, value in params.items():
+        cmd += ["-v", f"{name}={value}"]
+
+    cmd += ["-tA", "-f", "-"]
+    statement = f"COPY ({sql}) TO STDOUT WITH CSV NULL '\\N'"
+    result = host.run(cmd, input_text=statement)
+
+    if result.returncode != 0:
+        return None, result.stderr.strip() or f"psql exited {result.returncode}"
+    if not result.stdout.strip():
+        return [], ""
+    try:
+        rows = list(csv.reader(io.StringIO(result.stdout)))
+    except csv.Error as exc:
+        return None, f"unreadable CSV from psql: {exc}"
+    return [[None if cell == "\\N" else cell for cell in row] for row in rows], ""
 
 
 # `func_string` names the records too (`res.partner(1,).action()`), so it

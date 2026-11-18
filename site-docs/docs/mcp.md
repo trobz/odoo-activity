@@ -83,18 +83,51 @@ See [Keybindings & Tabs — POS](keybindings.md#pos) for what each field
 means, including how it degrades on an instance whose version is missing a
 field.
 
+## `--enable-plugins=users-audit`
+
+Opt-in batch export of Odoo user accounts and password hashes. Both
+`oa-mcp` and `oa-mcp-multi` require the operator to enable `users-audit` at
+launch; installing the plugin does not enable it, and no per-call argument
+can bypass the gate. Targets are explicit `{host, instance, db}` entries — on
+a pinned server every target must be on the pinned host, on `oa-mcp-multi`
+each host is checked against `--host-filter`. Targets run sequentially and a
+failing database is reported in the manifest without stopping the batch.
+A repeated target is reported as `duplicate target` and not exported again.
+Failure entries carry a fixed message (`permission denied` or
+`account export failed`), never backend error text, so the manifest cannot
+echo logins, emails or hashes.
+
+| Tool | Contract |
+| --- | --- |
+| `users_audit` | Export one `<db>_accounts.json` per database into a fresh private run directory: `summary.last_login_by_year`, `summary.mfa_by_type`, and every active user's id/login/email/profile/stored hash. Returns a manifest of paths and counts, never accounts or hashes. |
+
+Each user's `profile` is `admin` for Administration / Settings membership
+(`base.group_system`), otherwise `internal` when `share` is false, or `portal`
+for external accounts (including public users). Settings takes precedence;
+Administration / Access Rights alone does not make a user `admin`.
+Settings membership includes transitively implied groups on every supported
+version, including Odoo 19+. Odoo 8 lacks `share`, so internal access is
+determined by direct or implied `base.group_user` membership there.
+
+The files are credential material **and** personal data. Delete the run
+directory once `password_hashes` and any authorized leak-check have consumed
+it. Old schemas are handled: a database without `res_users_log`, `share`,
+`auth_totp` or `auth_passkey` (Odoo 8 through current) still exports with the
+matching summary shape. Queries are `COPY`-based CSV and catalog probes, never
+`json_agg`/`json_build_object`/`to_regclass`, with recursive group traversal requiring PostgreSQL 8.4+.
+
 ## `--enable-plugins=password-audit`
 
 This is a credential-material and local-GPU exception to the read-only
 surface. Both `oa-mcp` and `oa-mcp-multi` require the operator to enable
 `password-audit` at launch; installing the plugin does not enable it, and
-no per-call argument can bypass the gate. Export probes follow the pinned
-host or multi-host filter. Planning, calibration, attacks, status and
+no per-call argument can bypass the gate. `password_hashes` reads only a
+`users-audit` accounts file; planning, calibration, attacks, status and
 findings run on the **MCP server machine**, not the database host.
 
 | Tool | Contract |
 | --- | --- |
-| `password_hashes` | Export active users' convertible hashes into a fresh private directory; return exact hash, derived/tier-2 wordlist and login-map paths, not hashes. |
+| `password_hashes` | Convert a `<db>_accounts.json` from `users_audit` into a fresh private hashcat target; return exact hash, derived/tier-2 wordlist and login-map paths, not hashes. No database access. |
 | `password_plan` | Read exports and both companion wordlists, calibrate synthetic wordlist attacks at each actual round count, and fund passes across databases under one explicit total-minute budget. Missing companions are errors, never fabricated candidate lists. |
 | `password_crack` | With a wordlist, launch a detached bounded attack; without one, only show prior audit-local cracks. Always supply explicit `minutes` when executing a plan. |
 | `password_crack_status` | Poll durable running/completed/error state after launch or a disconnected call; do not launch a replacement while the pass is running. |
@@ -102,7 +135,9 @@ findings run on the **MCP server machine**, not the database host.
 
 ### Budgeted workflow
 
-1. Export each authorized database and retain the exact returned paths.
+1. Run `users_audit` for the authorized databases, then call
+   `password_hashes(<db>_accounts.json>)` for each and retain the exact
+   returned paths.
 2. Call `password_plan(audits=[{"hash_file": "<exact export path>"}], minutes=...)`.
    Calibration and input-reading time are charged to the total budget.
    Planning is capped at the smaller of that budget and 250 seconds. Probes

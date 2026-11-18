@@ -56,6 +56,9 @@ extend-safe-fixes = ["UP008"]
 # untrusted input); the /tmp work dir is the design: hash material must not
 # persist past the audit
 "odoo_activity/plugins/password_audit/__init__.py" = ["S108", "S603"]
+# same scratch-dir design, and the account SQL is assembled from constant
+# fragments (values go through psql -v, never interpolation)
+"odoo_activity/plugins/users_audit/__init__.py" = ["S108", "S608"]
 
 [format]
 preview = true
