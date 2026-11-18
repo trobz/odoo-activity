@@ -21,6 +21,11 @@ is not.
 pos_status: point-of-sale status for a database, the same data the TUI's
 opt-in POS tab shows. Read-only, but gated the same way -- it still needs a
 login.
+
+`--enable-plugins=mrp` (which pulls in odooly too) adds the mrp_* tools:
+read-only manufacturing data -- work orders, plan, output, downtime,
+maintenance, work centers, routings, items, sales orders -- in the column
+shapes an agent's production skills already read. Same login, same gate.
 """
 
 import functools
@@ -121,6 +126,33 @@ def _pos() -> ModuleType:
         raise ValueError(msg)
 
     return pos
+
+
+def _mrp() -> ModuleType:
+    """The mrp plugin module, or a clear reason why it can't be used --
+    same two-way gate as `_odooly()`/`_pos()`.
+    """
+    try:
+        from odoo_activity.plugins import mrp
+    except ImportError as exc:
+        msg = "mrp support unavailable -- install the extra: pip install 'odoo-activity[mrp]'"
+        raise ValueError(msg) from exc
+
+    if "mrp" not in _enabled_plugins:
+        msg = "mrp support disabled -- restart the server with --enable-plugins=mrp"
+        raise ValueError(msg)
+
+    return mrp
+
+
+def _mrp_read(read: str, env: str, **kwargs):
+    """Run the mrp plugin's `read` against odooly env `env`, raising its
+    message when it can't connect or the read fails."""
+    mrp = _mrp()
+    result, message = mrp.run(env, getattr(mrp, read), **kwargs)
+    if result is None:
+        raise ValueError(message)
+    return result
 
 
 def _password_audit() -> ModuleType:
@@ -942,6 +974,208 @@ def pos_status(env: str) -> list[dict]:
     return rows
 
 
+# The mrp_* tools: read-only Odoo MRP data for an agent's production skills
+# -- the Odoo counterpart of the ERP reads Claude for Manufacturing makes
+# against NetSuite or Infor M3. Rows use the column names those skills
+# already recognise, so they can be written to CSV and read without a
+# manifest. Every windowed tool returns `window` (local dates, zone, UTC
+# bounds), `truncated` (the limit was hit -- narrow the window and pull
+# again) and `missing_fields` (what this version/module set lacks: absent,
+# not zero). All of them run locally against ~/odooly.ini, never over ssh.
+
+
+@mcp.tool()
+def mrp_scope(env: str) -> dict:
+    """Connection test for the mrp tools: signed-in login, company, time
+    zone, Odoo version, and which manufacturing modules (mrp, maintenance,
+    mrp_workorder, quality_control, sale_mrp, ...) are installed. Pulls no
+    business data. Requires --enable-plugins=mrp.
+
+    Args:
+        env: odooly env, e.g. from `instance_odooly_env` or
+            `list_odooly_envs`.
+    """
+    return _mrp_read("mrp_scope", env)
+
+
+@mcp.tool()
+def mrp_work_orders(
+    env: str, date_from: str, date_to: str, tz: str | None = None, include_closed: bool = False, limit: int = 2000
+) -> dict:
+    """Manufacturing orders (mrp.production) scheduled to start in the
+    window -- open ones only unless `include_closed`. Rows: work_order,
+    part_number, qty_ordered, qty_produced_to_date (cumulative, not a
+    day's output), uom, status, scheduled_start, due_date, sales_order (the
+    MO's origin), asset_id (when all its work orders use one work center).
+    Requires --enable-plugins=mrp.
+
+    Args:
+        env: odooly env, e.g. from `instance_odooly_env`.
+        date_from: first local day, YYYY-MM-DD.
+        date_to: last local day, YYYY-MM-DD (inclusive).
+        tz: the plant's IANA zone (e.g. Asia/Ho_Chi_Minh). Defaults to the
+            Odoo user's tz, else UTC -- `notes` says which.
+        include_closed: also return done and cancelled MOs.
+        limit: max rows (capped at 20000); `truncated` says it was hit.
+    """
+    return _mrp_read(
+        "mrp_work_orders",
+        env,
+        date_from=date_from,
+        date_to=date_to,
+        tz=tz,
+        include_closed=include_closed,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def mrp_plan(env: str, date_from: str, date_to: str, tz: str | None = None, limit: int = 2000) -> dict:
+    """The production plan as standard Odoo holds it: each non-cancelled
+    MO's quantity on the local day it is scheduled to start. Rows:
+    plan_date, part_number, planned_qty, uom, asset_id, work_order. A
+    project with its own plan model has a different plan, not read here.
+    Requires --enable-plugins=mrp.
+
+    Args:
+        env: odooly env.
+        date_from: first local day, YYYY-MM-DD.
+        date_to: last local day, YYYY-MM-DD (inclusive).
+        tz: the plant's IANA zone. Defaults to the Odoo user's tz, else UTC.
+        limit: max rows (capped at 20000); `truncated` says it was hit.
+    """
+    return _mrp_read("mrp_plan", env, date_from=date_from, date_to=date_to, tz=tz, limit=limit)
+
+
+@mcp.tool()
+def mrp_output(env: str, date_from: str, date_to: str, tz: str | None = None, limit: int = 2000) -> dict:
+    """Good output per MO per local day, from done finished-product stock
+    moves (by-products excluded), with that MO's done scrap that day.
+    Rows: production_day, work_order, part_number, qty_good, qty_scrap,
+    uom, asset_id, sales_order. Not mrp.production.qty_produced, which is
+    cumulative. Requires --enable-plugins=mrp.
+
+    Args:
+        env: odooly env.
+        date_from: first local day, YYYY-MM-DD.
+        date_to: last local day, YYYY-MM-DD (inclusive).
+        tz: the plant's IANA zone. Defaults to the Odoo user's tz, else UTC.
+        limit: max stock moves read (capped at 20000); `truncated` says it
+            was hit.
+    """
+    return _mrp_read("mrp_output", env, date_from=date_from, date_to=date_to, tz=tz, limit=limit)
+
+
+@mcp.tool()
+def mrp_downtime(
+    env: str, date_from: str, date_to: str, tz: str | None = None, include_productive: bool = False, limit: int = 2000
+) -> dict:
+    """Work-center time-tracking entries (mrp.workcenter.productivity)
+    overlapping the window, open ones included (ended_at and
+    duration_minutes None). Rows: asset_id, started_at, ended_at,
+    duration_minutes (elapsed), working_minutes (Odoo's own duration: for
+    stops, only the minutes inside the work center's calendar),
+    reason_code (the loss reason, None if blank),
+    loss_type (availability = stopped, performance = running slow,
+    quality = making scrap), reason_text, work_order. Requires
+    --enable-plugins=mrp.
+
+    Args:
+        env: odooly env.
+        date_from: first local day, YYYY-MM-DD.
+        date_to: last local day, YYYY-MM-DD (inclusive).
+        tz: the plant's IANA zone. Defaults to the Odoo user's tz, else UTC.
+        include_productive: also return productive time, which is not
+            downtime.
+        limit: max rows (capped at 20000); `truncated` says it was hit.
+    """
+    return _mrp_read(
+        "mrp_downtime",
+        env,
+        date_from=date_from,
+        date_to=date_to,
+        tz=tz,
+        include_productive=include_productive,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def mrp_maintenance(env: str, date_from: str, date_to: str, tz: str | None = None, limit: int = 2000) -> dict:
+    """Maintenance requests raised in the window, plus every one still open
+    whenever raised. Rows: maintenance_wo (the request's subject),
+    asset_id (equipment name), work_center (when mrp_maintenance links
+    one), type (corrective/preventive), opened_date, closed_date, is_open,
+    stage, close_out_note. Requires --enable-plugins=mrp and the
+    maintenance module.
+
+    Args:
+        env: odooly env.
+        date_from: first local day, YYYY-MM-DD.
+        date_to: last local day, YYYY-MM-DD (inclusive).
+        tz: the plant's IANA zone. Defaults to the Odoo user's tz, else UTC.
+        limit: max rows (capped at 20000); `truncated` says it was hit.
+    """
+    return _mrp_read("mrp_maintenance", env, date_from=date_from, date_to=date_to, tz=tz, limit=limit)
+
+
+@mcp.tool()
+def mrp_work_centers(env: str) -> dict:
+    """Every active work center: asset_id (its code, else name),
+    capacity, time_efficiency_pct, oee_target_pct, costs_hour,
+    setup_minutes, cleanup_minutes, and its working calendar as attendance
+    slots -- the planned time OEE availability needs (leaves and holidays
+    not included). Requires --enable-plugins=mrp.
+
+    Args:
+        env: odooly env.
+    """
+    return _mrp_read("mrp_work_centers", env)
+
+
+@mcp.tool()
+def mrp_routings(env: str, part_numbers: list[str] | None = None, limit: int = 2000) -> dict:
+    """BoM operations for the given part numbers (internal references), or
+    every active BoM: part_number, op_seq, operation, work_center,
+    cycle_minutes, capacity, run_min_per_unit (cycle / capacity, before
+    efficiency -- the ideal cycle time), setup_hours. Odoo 14+ only.
+    Requires --enable-plugins=mrp.
+
+    Args:
+        env: odooly env.
+        part_numbers: internal references to limit to; omit for all.
+        limit: max rows (capped at 20000); `truncated` says it was hit.
+    """
+    return _mrp_read("mrp_routings", env, part_numbers=part_numbers, limit=limit)
+
+
+@mcp.tool()
+def mrp_items(env: str, part_numbers: list[str]) -> dict:
+    """Part master for the given part numbers: description, uom, std_cost
+    (the user's company's standard price; None when unset, never 0),
+    make_buy. Never pulled whole. Requires --enable-plugins=mrp.
+
+    Args:
+        env: odooly env.
+        part_numbers: internal references, e.g. from mrp_output rows.
+    """
+    return _mrp_read("mrp_items", env, part_numbers=part_numbers)
+
+
+@mcp.tool()
+def mrp_sales_orders(env: str, names: list[str]) -> dict:
+    """Lines of the given sales orders -- e.g. the sales_order of a late
+    work order: customer, part_number, qty_ordered, qty_delivered,
+    order_date, promised_date (commitment date, else expected date),
+    status. Requires --enable-plugins=mrp and the sale module.
+
+    Args:
+        env: odooly env.
+        names: sales order references, e.g. ["S00042"].
+    """
+    return _mrp_read("mrp_sales_orders", env, names=names)
+
+
 @mcp.tool()
 @_pinned_host
 def password_hashes(
@@ -1550,7 +1784,8 @@ def main(
             help="Plugins (comma-separated, or repeat the flag) whose gated tools should be exposed, "
             "e.g. --enable-plugins=odooly to expose list_odooly_envs/instance_odooly_env/create_test_job/"
             "restore_app_icons/send_test_mail, or --enable-plugins=pos (pulls in odooly too) to also expose "
-            "pos_status -- matching databases "
+            "pos_status, or --enable-plugins=mrp (pulls in odooly too) for the read-only mrp_* tools -- "
+            "matching databases "
             "against ~/odooly.ini the same way `oa --enable-plugins=...` does. Launch-time only -- no tool "
             "call can turn this on itself; set it only if the agent should be able to log in and reach a "
             "matched database. Omit to expose none of them.",
@@ -1620,7 +1855,8 @@ def main_multi(
             help="Plugins (comma-separated, or repeat the flag) whose gated tools should be exposed, "
             "e.g. --enable-plugins=odooly to expose list_odooly_envs/instance_odooly_env/create_test_job/"
             "restore_app_icons/send_test_mail, or --enable-plugins=pos (pulls in odooly too) to also expose "
-            "pos_status -- matching databases "
+            "pos_status, or --enable-plugins=mrp (pulls in odooly too) for the read-only mrp_* tools -- "
+            "matching databases "
             "against ~/odooly.ini the same way `oa --enable-plugins=...` does. Launch-time only -- no tool "
             "call can turn this on itself; set it only if the agent should be able to log in and reach a "
             "matched database. Omit to expose none of them.",
