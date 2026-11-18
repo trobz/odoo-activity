@@ -639,6 +639,17 @@ def test_checkpoint_resume_is_content_scoped(tmp_path, monkeypatch):
     wl.write_text("pw\n")
     rules.write_text(":\n")
 
+    def lock_released():
+        # The supervisor persists returncode *before* releasing the audit
+        # lock, so a recorded returncode alone does not mean the next launch
+        # can take the lock (crack_status treats a held lock as "running").
+        try:
+            fd = pa._audit_lock(hf.resolve())
+        except BlockingIOError:
+            return False
+        os.close(fd)
+        return True
+
     def launch():
         status, err = pa.launch_hashcat(hf, wl, rules, 1)
         assert not err
@@ -646,7 +657,7 @@ def test_checkpoint_resume_is_content_scoped(tmp_path, monkeypatch):
         while time.monotonic() < deadline:
             assert status is not None
             record = json.loads(status.read_text())
-            if record.get("returncode") is not None:
+            if record.get("returncode") is not None and lock_released():
                 return record
             time.sleep(0.02)
         pytest.fail("worker did not finish")
