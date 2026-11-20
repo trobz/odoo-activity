@@ -101,9 +101,12 @@ Installed modules include those pending an upgrade or uninstall (`state` is
 modules are not installed yet and are left out.
 
 Parameters: `auth_signup.invitation_scope`, `auth_password_policy.minlength`,
-`auth_totp.policy`, `web.base.url`, `web.base.url.freeze`, `report.url`, and
-`database.is_neutralized`. These cover signup/password/MFA policy, generated
-links, report rendering, and the neutralization marker. Only those keys are
+`auth_totp.policy`, `web.base.url`, `web.base.url.freeze`, `report.url`,
+`database.is_neutralized`, `database.is_configured_for_safe_testing`,
+`database.is_shrunk`, `database.is_anonymized`, `database.is_obfuscated`, and
+`database.source_dump_datetime`. These cover signup/password/MFA policy,
+generated links, report rendering, and the copy-pipeline markers (the same keys
+`odoo-db list` reports, read here without odoo-db). Only those keys are
 queried; arbitrary parameters and secrets are excluded.
 
 Values are stored strings, with `null` for an absent key and `""` for a stored

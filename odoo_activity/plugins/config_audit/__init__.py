@@ -21,6 +21,12 @@ PARAMETERS = {
     "web.base.url.freeze": "Whether automatic base URL updates are frozen",
     "report.url": "Base URL used for report rendering",
     "database.is_neutralized": "Database neutralization marker",
+    # Copy-pipeline markers, same keys as odoo-db's `list` flags.
+    "database.is_configured_for_safe_testing": "Copy configured for safe testing marker",
+    "database.is_shrunk": "Database shrinking marker",
+    "database.is_anonymized": "Database anonymization marker",
+    "database.is_obfuscated": "Database obfuscation marker",
+    "database.source_dump_datetime": "When the source dump of this copy was taken (raw stored value)",
 }
 
 _MODULES_SQL = """

@@ -25,6 +25,8 @@ def test_inventory_filters_modules_and_secrets_preserving_unset_and_blank(monkey
                 ('auth_signup.invitation_scope', 'b2b'),
                 ('auth_password_policy.minlength', '12'),
                 ('web.base.url', ''),
+                ('database.is_shrunk', 'True'),
+                ('database.source_dump_datetime', '20260519T143000'),
                 ('database.secret', 'do-not-export');
         """)
         monkeypatch.setattr(ca, "_psql_csv", lambda sql, *_: (list(db.execute(sql)), ""))
@@ -40,6 +42,9 @@ def test_inventory_filters_modules_and_secrets_preserving_unset_and_blank(monkey
     assert params["auth_password_policy.minlength"] == "12"  # noqa: S105 — policy value, not a password
     assert params["web.base.url"] == ""
     assert params["auth_totp.policy"] is None
+    assert params["database.is_shrunk"] == "True"
+    assert params["database.source_dump_datetime"] == "20260519T143000"
+    assert params["database.is_anonymized"] is None
     assert "database.secret" not in params
     assert "do-not-export" not in str(result)
 
