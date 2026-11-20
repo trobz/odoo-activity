@@ -1,14 +1,11 @@
-"""SQL/export review regressions using synthetic hashes and in-memory SQL only."""
+"""Credential-file regressions: hashcat conversion, label escaping, findings."""
 
 import base64
 import hashlib
 import json
-import sqlite3
-from pathlib import Path
 
 import pytest
 
-from odoo_activity import mcp_server
 from odoo_activity.plugins import password_audit as pa
 
 
@@ -20,115 +17,6 @@ def _hash(plain="synthetic"):
         return base64.b64encode(raw).decode().rstrip("=").replace("+", ".")
 
     return f"$pbkdf2-sha512$1${ab64(salt)}${ab64(digest)}"
-
-
-def _database(monkeypatch, *, legacy=False, rows=()):
-    """Evaluate production row-selection SQL, replacing only PostgreSQL JSON wrapping."""
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    columns = "id integer, login text, password text, share boolean, active boolean"
-    if legacy:
-        columns += ", password_crypt text"
-    conn.execute(f"CREATE TABLE res_users ({columns})")
-    insert = (
-        "INSERT INTO res_users VALUES (?, ?, ?, ?, ?, ?)" if legacy else "INSERT INTO res_users VALUES (?, ?, ?, ?, ?)"
-    )
-    for row in rows:
-        conn.execute(insert, row)
-    calls = []
-
-    def psql(sql, db, params, target, host):
-        calls.append(sql)
-        if "pg_attribute" in sql:
-            return ([{"attname": "password_crypt"}] if legacy else []), ""
-        inner = sql.split("SELECT json_agg(t) FROM (", 1)[1].rsplit(") t", 1)[0]
-        try:
-            return [dict(row) for row in conn.execute(inner)], ""
-        except sqlite3.Error as exc:
-            return None, str(exc)
-
-    monkeypatch.setattr(pa, "_psql_json", psql)
-    return calls
-
-
-def test_modern_empty_export_does_not_query_missing_legacy_column(monkeypatch):
-    calls = _database(monkeypatch)
-    assert pa.fetch_hash_rows(pa.PgTarget(), "synthetic") == ([], "")
-    assert all("password_crypt END" not in sql for sql in calls)
-
-
-@pytest.mark.parametrize("password", ["", "plaintext", "$unsupported$hash"])
-def test_modern_unconvertible_rows_do_not_trigger_legacy_probe(monkeypatch, password):
-    _database(monkeypatch, rows=[(1, "modern", password, False, True)])
-    rows, error = pa.fetch_hash_rows(pa.PgTarget(), "synthetic")
-    assert error == ""
-    assert rows == [{"id": 1, "login": "modern", "password": password, "share": 0}]
-
-
-def test_legacy_schema_selects_password_or_crypt_per_row(monkeypatch):
-    modern, legacy = _hash("modern"), _hash("legacy")
-    _database(
-        monkeypatch,
-        legacy=True,
-        rows=[
-            (1, "modern", modern, False, True, _hash("stale")),
-            (2, "legacy", "", True, True, legacy),
-            (3, "null", None, False, True, legacy),
-            (4, "empty", "", False, True, ""),
-            (5, "inactive", "", False, False, legacy),
-        ],
-    )
-    rows, error = pa.fetch_hash_rows(pa.PgTarget(), "synthetic")
-    assert error == ""
-    assert rows == [
-        {"id": 1, "login": "modern", "password": modern, "share": 0},
-        {"id": 2, "login": "legacy", "password": legacy, "share": 1},
-        {"id": 3, "login": "null", "password": legacy, "share": 0},
-    ]
-
-
-@pytest.mark.parametrize("failure", ["schema", "rows"])
-def test_sql_failure_is_not_masked_by_fallback(monkeypatch, failure):
-    calls = []
-    error = "permission denied for synthetic relation"
-
-    def psql(sql, *_args):
-        calls.append(sql)
-        if "pg_attribute" in sql and failure == "rows":
-            return [], ""
-        if len(calls) == 1 or failure == "rows":
-            return None, error
-        return [], ""
-
-    monkeypatch.setattr(pa, "_psql_json", psql)
-    assert pa.fetch_hash_rows(pa.PgTarget(), "synthetic") == (None, error)
-    assert len(calls) == (1 if failure == "schema" else 2)
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-def test_password_hashes_mcp_exports_modern_empty_and_mixed_legacy(monkeypatch, tmp_path, legacy):
-    rows = (
-        [(1, "modern", _hash("modern"), False, True, ""), (2, "legacy", "", True, True, _hash("legacy"))]
-        if legacy
-        else []
-    )
-    _database(monkeypatch, legacy=legacy, rows=rows)
-    monkeypatch.setattr(pa, "WORK_DIR", tmp_path)
-    monkeypatch.setattr(pa, "fetch_company_names", lambda *_args: ([], ""))
-    monkeypatch.setattr(mcp_server, "_password_audit", lambda: pa)
-    monkeypatch.setattr(mcp_server, "_find", lambda *_args: {"name": "synthetic"})
-    monkeypatch.setattr(mcp_server.probes, "pg_target_of", lambda *_args: pa.PgTarget())
-    monkeypatch.setattr(mcp_server, "_pinned_target", None)
-    monkeypatch.setattr(mcp_server, "_host_filter", None)
-    result = mcp_server.password_hashes("synthetic", "synthetic")
-    count = 2 if legacy else 0
-    assert f"({count} hashes, mode 12100)" in result
-    path = Path(result.split(" (", 1)[0])
-    records = [line for line in path.read_text().splitlines() if line]
-    assert len(records) == count
-    assert json.loads(path.with_suffix(".loginmap.json").read_text()) == (
-        {"1": "modern", "2": "legacy"} if legacy else {}
-    )
 
 
 _SEPARATORS = ("\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")

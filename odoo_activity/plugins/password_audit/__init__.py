@@ -18,8 +18,9 @@ Design notes (why it looks like this):
 
 - **`password_hashes` answers one flat payload** — never per-user rows in
   a conversation, so the hashes land in a file the operator feeds to
-  hashcat, not in the chat log. In multi-host mode the file aggregates
-  every reachable host.
+  hashcat, not in the chat log. It does not read the database itself: it
+  converts an accounts file produced by the `users-audit` plugin, which is
+  the single exporter of user accounts and hashes.
 
 - **hashcat runs locally** on this machine's GPU (`password_crack`), with
   mode 12100 (`PBKDF2-HMAC-SHA512`, the passlib scheme Odoo 16+ stores).
@@ -41,29 +42,14 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from odoo_activity.plugins import Plugin
-from odoo_activity.probes import LOCAL, Host, PgTarget, _psql_json
+from odoo_activity.plugins._private import ensure_dir as _ensure_dir
+from odoo_activity.plugins._private import safe_write as _safe_write
+from odoo_activity.probes import LOCAL, Host
 from odoo_activity.probes import pg_target_of as pg_target_of  # re-exported for mcp_server
 
 # where hash material and wordlists live. Scratch by default: a tmpfs-backed
 # workspace the OS clears, so the hashes do not outlive the audit.
 WORK_DIR = Path("/tmp/oa-password-audit")
-
-
-def _ensure_dir(d: Path) -> Path:
-    """A credential-bearing dir, 0700 and owned by us — other local users
-    must not be able to read (or pre-create) it: a pre-created dir or a
-    symlinked file could redirect the material."""
-    import os
-
-    d.mkdir(mode=0o700, exist_ok=True)
-    if d.is_symlink():
-        msg = f"{d}: symlinked audit directory is not allowed"
-        raise PermissionError(msg)
-    st = d.stat()
-    if st.st_uid != os.getuid() or (st.st_mode & 0o777) != 0o700:
-        msg = f"{d} exists with uid {st.st_uid} mode {oct(st.st_mode & 0o777)} — expected 0700 owned by us"
-        raise PermissionError(msg)
-    return d
 
 
 def export_path(instance: str, db: str, host_identity: str = "local") -> Path:
@@ -82,16 +68,6 @@ def export_path(instance: str, db: str, host_identity: str = "local") -> Path:
     audit = Path(tempfile.mkdtemp(prefix="audit-", dir=scope))
     name = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{instance}_{db}")[:100] or "export"
     return audit / f"{name}.hashcat"
-
-
-def _safe_write(path: Path, content: str | bytes) -> None:
-    """0600 without following symlinks: O_CREAT|O_EXCL fails if a hostile
-    file/symlink already sits at the path (predictable names in /tmp)."""
-    import os
-
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(content.encode("utf-8") if isinstance(content, str) else content)
 
 
 # hashcat mode for passlib's pbkdf2-sha512
@@ -372,69 +348,6 @@ def tier2_candidates() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def fetch_hash_rows(target: PgTarget, db: str, host: Host = LOCAL) -> tuple[list[dict] | None, str]:
-    """Export active users, detecting legacy storage from the table schema.
-
-    Empty/unconvertible modern results are valid, not evidence of a legacy
-    column. On legacy schemas select password or password_crypt per row,
-    including mixed databases. Preserve schema and row-query errors.
-    """
-    columns, error = _psql_json(_HASH_COLUMNS_SQL, db, {}, target, host)
-    if columns is None:
-        return None, error
-    legacy = any(column.get("attname") == "password_crypt" for column in columns)
-    return _psql_json(_HASH_SQL_LEGACY if legacy else _HASH_SQL, db, {}, target, host)
-
-
-_HASH_COLUMNS_SQL = """
-SELECT json_agg(t) FROM (
-    SELECT attname FROM pg_attribute
-    WHERE attrelid = 'res_users'::regclass
-      AND attname = 'password_crypt' AND NOT attisdropped
-) t
-"""
-
-
-_HASH_SQL = """
-SELECT json_agg(t) FROM (
-    SELECT id, login, password, COALESCE(share, false) AS share
-    FROM res_users
-    WHERE active AND password IS NOT NULL
-    ORDER BY id
-) t
-"""
-
-
-# Odoo < 10 (and some odd cases) store the passlib hash in password_crypt
-# with res_users.password empty — exports on those DBs must read the
-# crypt column or every user looks "unexportable".
-_HASH_SQL_LEGACY = """
-SELECT json_agg(t) FROM (
-    SELECT id, login,
-           CASE WHEN COALESCE(password, '') <> '' THEN password ELSE password_crypt END AS password,
-           COALESCE(share, false) AS share
-    FROM res_users
-    WHERE active
-      AND (COALESCE(password, '') <> '' OR COALESCE(password_crypt, '') <> '')
-    ORDER BY id
-) t
-"""
-
-
-def fetch_company_names(target: PgTarget, db: str, host: Host = LOCAL) -> tuple[list[str] | None, str]:
-    """The res.company names, feeding the mutation guesses. `None` rows
-    (query failed) leave the company mutations out rather than guessing."""
-    # bare json_agg: the column value IS the array — _psql_json returns the
-    # list of names directly (no subselect wrapper like fetch_hash_rows).
-    rows, error = _psql_json("SELECT json_agg(name) FROM res_company", db, {}, target, host)
-    if rows is None:
-        return None, error
-
-    # type: _psql_json's declared rows are dicts, but a bare json_agg column
-    # is an array of scalars — keep only the string values (defensive too).
-    return [name for name in rows if isinstance(name, str) and name], ""
-
-
 def read_hash_work_groups(path: Path) -> dict[tuple[int, str], int]:
     """Unique digest counts per (rounds, salt), excluding duplicate user rows."""
     groups: dict[tuple[int, str], set[str]] = {}
@@ -575,6 +488,53 @@ def write_hashcat_file(rows: list[dict], path: Path, companies: list[str] | None
     # doubled tier-1 beyond any sane minimum-coverage budget)
     _safe_write(path.with_suffix(".tier2.txt"), "\n".join(build_tier2(companies or [], logins)) + "\n")
     return len(lines)
+
+
+def rows_from_accounts(accounts: dict) -> list[dict]:
+    """`{id, login, password}` rows for `write_hashcat_file` from an
+    accounts file produced by the users-audit plugin.
+
+    Users with no password (OAuth-only, never set) are dropped here.
+    Reject malformed rows rather than silently producing a partial audit.
+    """
+    if not isinstance(accounts, dict) or not isinstance(accounts.get("users"), list):
+        msg = "not a users-audit accounts file (no users list)"
+        raise ValueError(msg)  # noqa: TRY004 — invalid file content
+    companies = accounts.get("companies", [])
+    if not isinstance(companies, list) or any(not isinstance(name, str) for name in companies):
+        msg = "accounts companies must be a list of strings"
+        raise ValueError(msg)
+    rows = []
+    ids = set()
+    for index, user in enumerate(accounts["users"]):
+        if (
+            not isinstance(user, dict)
+            or type(user.get("id")) is not int
+            or user["id"] <= 0
+            or not isinstance(user.get("login"), str)
+            or not user["login"]
+            or "password" not in user
+            or (user["password"] is not None and not isinstance(user["password"], str))
+        ):
+            msg = f"invalid accounts user row at index {index}: expected id, login and password"
+            raise ValueError(msg)
+        if user["id"] in ids:
+            msg = f"duplicate accounts user id at index {index}"
+            raise ValueError(msg)
+        ids.add(user["id"])
+        if user["password"]:
+            rows.append({"id": user["id"], "login": user["login"], "password": user["password"]})
+    return rows
+
+
+def export_from_accounts(accounts: dict, path: Path) -> int:
+    """Write the hashcat file and both wordlists from an accounts payload.
+
+    `accounts` is a decoded `<db>_accounts.json`: its `users` feed the hash
+    lines and its `companies` feed the company mutations, so the converter
+    never touches postgres.
+    """
+    return write_hashcat_file(rows_from_accounts(accounts), path, companies=accounts.get("companies") or [])
 
 
 def _decode_label(label: str) -> str:

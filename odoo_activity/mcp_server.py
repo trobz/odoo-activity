@@ -25,6 +25,7 @@ login.
 
 import functools
 import inspect
+import json
 import math
 import os
 import re
@@ -35,7 +36,7 @@ import time
 from collections import Counter
 from pathlib import Path
 from types import ModuleType
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeGuard
 
 import typer
 from mcp.server.fastmcp import FastMCP
@@ -138,6 +139,23 @@ def _password_audit() -> ModuleType:
         raise ValueError(msg)
 
     return password_audit
+
+
+def _users_audit() -> ModuleType:
+    """The users-audit plugin module, or a clear reason why it can't be used
+    -- same two-way gate as `_password_audit()`.
+    """
+    try:
+        from odoo_activity.plugins import users_audit
+    except ImportError as exc:
+        msg = "users-audit support unavailable -- the plugin is bundled, this is a bug"
+        raise ValueError(msg) from exc
+
+    if "users-audit" not in _enabled_plugins:
+        msg = "users-audit disabled -- restart the server with --enable-plugins=users-audit"
+        raise ValueError(msg)
+
+    return users_audit
 
 
 def _resolve_host(host: str | None, ssh_port: int | None) -> Host:
@@ -944,56 +962,212 @@ def pos_status(env: str) -> list[dict]:
 
 @mcp.tool()
 @_pinned_host
-def password_hashes(
-    name: str,
-    db: str,
-    *,
-    target: Host,
-) -> str:
-    """Bulk-export the active users' password hashes from `db` in hashcat
-    mode 12100 format (sha512:rounds:b64salt:b64digest), written to a local
-    file ready for `password_crack`. This is credential material: the answer
-    is the file path, never the hashes themselves — treat the file like a
-    password list, keep it off shared disks, delete it when done. Each call
-    reserves a fresh private export directory using the host, instance and
-    database identity; prior exports and their audit-local potfiles are not
-    overwritten. The response also names the derived/tier-2 wordlists and
-    .loginmap.json mapping. Delete the entire directory after the audit.
+def config_audit(name: str, db: str, *, target: Host) -> dict:
+    """Retrieve installed modules and allowlisted stored config parameters.
 
-    Requires --enable-plugins=password-audit: the plugin is the gate, and
-    enabling it is the operator's decision to export hashes at all.
+    Requires --enable-plugins=config-audit. Reads PostgreSQL directly using
+    the instance's connection settings; no odooly or odoo-db installation
+    required. Unset parameters are null, not inferred effective defaults.
 
     Args:
-        name: instance name as `list_instances` reports it.
-        db: database name, as `instance_databases` reports it.
-        host: `[user@]hostname` to probe over ssh, or a ~/.ssh/config alias.
-            Omit to probe the machine this server runs on.
-        ssh_port: ssh port, if `host` is not on the default 22.
+        name: instance name from list_instances.
+        db: database name.
+        host: SSH alias or hostname; omit for the server's default host.
+        ssh_port: optional SSH port.
     """
-    pa = _password_audit()
+    if "config-audit" not in _enabled_plugins:
+        msg = "config-audit disabled -- restart the server with --enable-plugins=config-audit"
+        raise ValueError(msg)
+    from odoo_activity.plugins.config_audit import retrieve
+
     inst = _find(name, target)
     if inst is None:
-        msg = f"no such instance {name!r}"
+        msg = "no such instance on target host"
+        raise ValueError(msg)
+    return {"instance": name, **retrieve(db, probes.pg_target_of(inst, target), target)}
+
+
+_USERS_AUDIT_MAX_TARGETS = 100
+
+
+def _target_error(host: str | None, instance: str | None, database: str | None, error: str) -> dict:
+    return {
+        "host": host if isinstance(host, str) else None,
+        "instance": instance if isinstance(instance, str) else None,
+        "database": database if isinstance(database, str) else None,
+        "path": None,
+        "users": 0,
+        "summary": None,
+        "error": error,
+    }
+
+
+def _audit_name(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and bool(value.strip()) and not any(ord(c) < 32 for c in value)
+
+
+def _users_audit_entry(  # noqa: C901 — per-target validation and failure isolation
+    spec: dict, run: Path, include_inactive: bool, seen: set[tuple[str, str, str]] | None = None
+) -> dict:
+    """Validate one target and export it; always returns a manifest entry."""
+    if not isinstance(spec, dict):
+        return _target_error(None, None, None, "target must be an object")
+    instance = spec.get("instance")
+    database = spec.get("db")
+    host_value = spec.get("host")
+    if not _audit_name(instance):
+        return _target_error(host_value, instance, database, "target needs an `instance` name")
+    if not _audit_name(database):
+        return _target_error(host_value, instance, database, "target needs a `db` name")
+    ssh_port = spec.get("ssh_port")
+    if host_value is not None and (not _audit_name(host_value) or host_value.startswith("-")):
+        return _target_error(
+            host_value, instance, database, "`host` must be a non-empty host string (not an SSH option) or null"
+        )
+    if ssh_port is not None and (type(ssh_port) is not int or not 1 <= ssh_port <= 65535):
+        return _target_error(host_value, instance, database, "`ssh_port` must be an integer between 1 and 65535")
+    try:
+        target = _resolve_host(host_value, ssh_port)
+    except ValueError as exc:
+        return _target_error(host_value, instance, database, str(exc))
+
+    ua = _users_audit()
+    identity = ua.host_identity(target)
+    key = (identity, instance, database)
+    if seen is not None:
+        if key in seen:
+            return _target_error(identity, instance, database, "duplicate target")
+        seen.add(key)
+    try:
+        inst = _find(instance, target)
+        if inst is None:
+            return _target_error(identity, instance, database, "no such instance on target host")
+        entry, error = ua.export_database(
+            instance=instance,
+            database=database,
+            pg=probes.pg_target_of(inst, target),
+            host=target,
+            host_identity_value=identity,
+            include_inactive=include_inactive,
+            run=run,
+        )
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        # Exception messages and backend stderr can contain account data.
+        return _target_error(identity, instance, database, "account export failed")
+    if entry is not None:
+        return entry
+    safe_error = "permission denied" if error == "permission denied" else "account export failed"
+    return _target_error(identity, instance, database, safe_error)
+
+
+@mcp.tool()
+def users_audit(
+    targets: list[dict],
+    output_dir: str | None = None,
+    include_inactive: bool = False,
+) -> str:
+    """Export Odoo user accounts and password hashes for a batch of databases,
+    one `<db>_accounts.json` per database under a fresh private run directory.
+
+    Each file carries `summary.last_login_by_year` and `summary.mfa_by_type`
+    (the same picture as `odoo-db users --summarize --summarize-by year`),
+    plus every active user's `id`, `login`, `email`, `profile` and stored password hash.
+    Also includes OAuth providers with enabled status and each user's
+    `oauth_provider_id` / `oauth_linked` (stored linkage, not login history).
+    OAuth tokens and external user IDs are not exported.
+    That file feeds `password_hashes` (password-audit) and an external
+    leaked-account check. This is credential material AND personal data: the
+    answer is a manifest of paths/counts/summaries, never the users or hashes
+    themselves. Delete the run directory when both consumers are done.
+
+    Targets are explicit; there is no fleet sweep. Each entry is
+    `{"host": <ssh alias or null for local>, "instance": <name>, "db":
+    <database>, "ssh_port": <optional int>}`. `db` is required.
+
+    On a pinned `oa-mcp` server every target must be on the pinned host (or
+    omit `host`); on `oa-mcp-multi` each target's host is checked against
+    --host-filter and batches may span allowed hosts.
+
+    Requires --enable-plugins=users-audit: enabling it is the operator's
+    decision to export credential material at all.
+    """
+    ua = _users_audit()
+    if not isinstance(targets, list):
+        msg = "targets must be a list"
+        raise ValueError(msg)  # noqa: TRY004 — MCP argument error
+    if type(include_inactive) is not bool:
+        msg = "include_inactive must be a boolean"
+        raise ValueError(msg)
+    if output_dir is not None and not _audit_name(output_dir):
+        msg = "output_dir must be a non-empty path string"
+        raise ValueError(msg)
+    if not targets:
+        msg = "no targets given"
+        raise ValueError(msg)
+    if len(targets) > _USERS_AUDIT_MAX_TARGETS:
+        msg = f"too many targets: {len(targets)} (maximum {_USERS_AUDIT_MAX_TARGETS})"
         raise ValueError(msg)
 
-    rows, error = pa.fetch_hash_rows(probes.pg_target_of(inst, target), db, target)
-    if rows is None:
-        raise ValueError(error)
+    try:
+        run = ua.run_path(Path(output_dir).expanduser() if output_dir is not None else None)
+    except (OSError, ValueError, RuntimeError):
+        msg = "cannot create private users-audit run directory"
+        raise ValueError(msg) from None
+    seen: set[tuple[str, str, str]] = set()
+    entries = [_users_audit_entry(spec, run, include_inactive, seen) for spec in targets]
+    return json.dumps({"run_dir": str(run), "databases": entries}, indent=2)
 
-    companies, _err = pa.fetch_company_names(probes.pg_target_of(inst, target), db, target)
-    # Every export gets a fresh private namespace, including repeated calls.
-    identity = target.alias or "local"
-    if target.port is not None:
-        identity += f":{target.port}"
-    if target.container is not None:
-        identity += f"/{target.container}"
-    path = pa.export_path(name, db, identity)
-    count = pa.write_hashcat_file(rows, path, companies=companies or [])
+
+@mcp.tool()
+def password_hashes(accounts_file: str) -> str:
+    """Convert a `users-audit` accounts file into a hashcat target (mode
+    12100 format `sha512:rounds:b64salt:b64digest`), written to a fresh local
+    file ready for `password_crack`. No database access: users-audit already
+    exported the hashes; this tool only converts them.
+
+    This is credential material: the answer is the file path, never the
+    hashes themselves — treat the file like a password list, keep it off
+    shared disks, delete it when done. The response also names the
+    derived/tier-2 wordlists and .loginmap.json mapping.
+
+    Requires --enable-plugins=password-audit: the plugin is the gate, and
+    enabling it is the operator's decision to run password audits at all.
+
+    Args:
+        accounts_file: path to a `<db>_accounts.json` written by `users_audit`.
+    """
+    pa = _password_audit()
+    if not _audit_name(accounts_file):
+        msg = "accounts_file must be a non-empty path string"
+        raise ValueError(msg)
+    try:
+        path = Path(accounts_file).expanduser()
+        if not path.is_file():
+            msg = "accounts_file must refer to an existing regular file"
+            raise ValueError(msg)  # noqa: TRY301 — normalize file errors below
+        accounts = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RuntimeError):
+        msg = "not a users-audit accounts file (unreadable or invalid JSON)"
+        raise ValueError(msg) from None
+    # Validate before reserving an export directory or writing any files.
+    from odoo_activity.plugins.password_audit import rows_from_accounts
+
+    rows_from_accounts(accounts)
+
+    instance = accounts.get("instance")
+    database = accounts.get("database")
+    identity = accounts.get("host")
+    export = pa.export_path(
+        instance if isinstance(instance, str) and instance else "instance",
+        database if isinstance(database, str) and database else path.stem,
+        identity if isinstance(identity, str) and identity else "local",
+    )
+    count = pa.export_from_accounts(accounts, export)
     return (
-        f"{path} ({count} hashes, mode {pa.HASHCAT_MODE})\n"
-        f"{path.with_suffix('.derived.txt')} (tier-1 wordlist: common/login/company/single-char -- try it first)\n"
-        f"{path.with_suffix('.tier2.txt')} (tier-2 wordlist: 2-char combos and mutations -- when budget allows)\n"
-        f"{path.with_suffix('.loginmap.json')} (login mapping for findings)\n"
+        f"{export} ({count} hashes, mode {pa.HASHCAT_MODE})\n"
+        f"{export.with_suffix('.derived.txt')} (tier-1 wordlist: common/login/company/single-char -- try it first)\n"
+        f"{export.with_suffix('.tier2.txt')} (tier-2 wordlist: 2-char combos and mutations -- when budget allows)\n"
+        f"{export.with_suffix('.loginmap.json')} (login mapping for findings)\n"
         "Treat the entire export directory, including potfile and run artifacts, as credential material. "
         "Delete it when the audit is done."
     )
