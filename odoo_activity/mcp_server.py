@@ -960,6 +960,33 @@ def pos_status(env: str) -> list[dict]:
     return rows
 
 
+@mcp.tool()
+@_pinned_host
+def config_audit(name: str, db: str, *, target: Host) -> dict:
+    """Retrieve installed modules and allowlisted stored config parameters.
+
+    Requires --enable-plugins=config-audit. Reads PostgreSQL directly using
+    the instance's connection settings; no odooly or odoo-db installation
+    required. Unset parameters are null, not inferred effective defaults.
+
+    Args:
+        name: instance name from list_instances.
+        db: database name.
+        host: SSH alias or hostname; omit for the server's default host.
+        ssh_port: optional SSH port.
+    """
+    if "config-audit" not in _enabled_plugins:
+        msg = "config-audit disabled -- restart the server with --enable-plugins=config-audit"
+        raise ValueError(msg)
+    from odoo_activity.plugins.config_audit import retrieve
+
+    inst = _find(name, target)
+    if inst is None:
+        msg = "no such instance on target host"
+        raise ValueError(msg)
+    return {"instance": name, **retrieve(db, probes.pg_target_of(inst, target), target)}
+
+
 _USERS_AUDIT_MAX_TARGETS = 100
 
 

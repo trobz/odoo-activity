@@ -83,6 +83,30 @@ See [Keybindings & Tabs — POS](keybindings.md#pos) for what each field
 means, including how it degrades on an instance whose version is missing a
 field.
 
+## `--enable-plugins=config-audit`
+
+Bundled and opt-in, with no additional dependencies. Start `oa-mcp` or
+`oa-mcp-multi` with `--enable-plugins=config-audit`.
+
+| Tool | What it returns |
+|---|---|
+| `config_audit` | Installed modules (name, version, auto-install flag) and allowlisted configuration parameters for one database. |
+
+Call with `name` (instance name), `db`, and optionally `host` / `ssh_port`.
+The tool uses the instance's PostgreSQL connection and the normal pinned-host
+or multi-host restrictions. It returns structured data directly, without files.
+
+Parameters: `auth_signup.invitation_scope`, `auth_password_policy.minlength`,
+`auth_totp.policy`, `web.base.url`, `web.base.url.freeze`, `report.url`, and
+`database.is_neutralized`. These cover signup/password/MFA policy, generated
+links, report rendering, and the neutralization marker. Only those keys are
+queried; arbitrary parameters and secrets are excluded.
+
+Values are stored strings, with `null` for an absent key and `""` for a stored
+blank. Missing keys do not establish effective defaults: behavior depends on
+the Odoo version and installed addons. The neutralization marker alone is not
+proof that a database contains no secrets.
+
 ## `--enable-plugins=users-audit`
 
 Opt-in batch export of Odoo user accounts and password hashes. Both

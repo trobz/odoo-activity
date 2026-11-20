@@ -36,7 +36,7 @@ nothing to say.
 
 ## odooly
 
-The one bundled plugin today. It reads `~/odooly.ini` at startup and matches
+The login-based bundled plugin. It reads `~/odooly.ini` at startup and matches
 each database against it, which unlocks the actions that need a login:
 
 - an `ODOOLY` tag on every database row — green where an environment reaches
@@ -127,6 +127,14 @@ an older `pos.config` missing a newer field, `pos.payment.method` not
 existing at all before v14 — v12/v13 configure payment through plain
 `journal_ids` instead) shows as a blank cell rather than failing the whole
 tab. Verified back to v12.
+
+## config-audit
+
+An opt-in MCP plugin for installed modules and selected configuration settings.
+It reads PostgreSQL directly using the instance connection, without extra
+packages or odooly credentials. Enable it with `--enable-plugins=config-audit`
+and call `config_audit(name, db)`. See [MCP](mcp.md#--enable-pluginsconfig-audit)
+for the parameter allowlist and unset-value semantics. It has no TUI tab.
 
 ## users-audit and password-audit
 
