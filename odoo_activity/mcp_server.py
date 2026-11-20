@@ -1072,6 +1072,9 @@ def users_audit(
     Each file carries `summary.last_login_by_year` and `summary.mfa_by_type`
     (the same picture as `odoo-db users --summarize --summarize-by year`),
     plus every active user's `id`, `login`, `email`, `profile` and stored password hash.
+    Also includes OAuth providers with enabled status and each user's
+    `oauth_provider_id` / `oauth_linked` (stored linkage, not login history).
+    OAuth tokens and external user IDs are not exported.
     That file feeds `password_hashes` (password-audit) and an external
     leaked-account check. This is credential material AND personal data: the
     answer is a manifest of paths/counts/summaries, never the users or hashes

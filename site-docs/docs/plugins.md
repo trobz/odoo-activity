@@ -140,7 +140,8 @@ for the parameter allowlist and unset-value semantics. It has no TUI tab.
 
 Both are opt-in credential plugins with no TUI surface: they run in the MCP
 server (`oa-mcp` / `oa-mcp-multi`), where `users_audit` exports one
-`<db>_accounts.json` per database and `password_hashes` converts such a file
+`<db>_accounts.json` per database (including OAuth provider enabled status
+and per-user linkage) and `password_hashes` converts such a file
 into a hashcat target. Enable them with
 `--enable-plugins=users-audit,password-audit`; see [MCP](mcp.md) for the
 workflow and retention rules.

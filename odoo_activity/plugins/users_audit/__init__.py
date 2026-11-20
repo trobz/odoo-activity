@@ -104,7 +104,10 @@ SELECT
   ({_TABLE_COUNT.format(table="res_users_log")}) AS has_log,
   ({_TABLE_COUNT.format(table="auth_passkey_key")}) AS has_passkey,
   (SELECT value FROM ir_config_parameter WHERE key = 'auth_totp.policy') AS totp_policy,
-  (SELECT latest_version FROM ir_module_module WHERE name = 'base') AS latest_version
+  (SELECT latest_version FROM ir_module_module WHERE name = 'base') AS latest_version,
+  ({_TABLE_COUNT.format(table="auth_oauth_provider")}) AS has_oauth_providers,
+  ({_COLUMN_COUNT.format(column="oauth_provider_id")}) AS has_oauth_provider_id,
+  ({_COLUMN_COUNT.format(column="oauth_uid")}) AS has_oauth_uid
 """
 
 
@@ -116,9 +119,20 @@ def _probe(pg: PgTarget, db: str, host: Host) -> tuple[dict | None, str]:
     if not rows:
         return None, "schema probe returned no row"
     cells = rows[0]
-    if len(cells) != 7:
-        return None, f"schema probe returned {len(cells)} columns, expected 7"
-    has_crypt, has_share, has_totp, has_log, has_passkey, policy, version = cells
+    if len(cells) != 10:
+        return None, f"schema probe returned {len(cells)} columns, expected 10"
+    (
+        has_crypt,
+        has_share,
+        has_totp,
+        has_log,
+        has_passkey,
+        policy,
+        version,
+        oauth_providers,
+        oauth_provider_id,
+        oauth_uid,
+    ) = cells
     return {
         "legacy": _truthy(has_crypt),
         "share": _truthy(has_share),
@@ -127,6 +141,9 @@ def _probe(pg: PgTarget, db: str, host: Host) -> tuple[dict | None, str]:
         "passkey": _truthy(has_passkey),
         "policy": policy,
         "version": _short_version(version),
+        "oauth_providers": _truthy(oauth_providers),
+        "oauth_provider_id": _truthy(oauth_provider_id),
+        "oauth_uid": _truthy(oauth_uid),
     }, ""
 
 
@@ -148,7 +165,17 @@ def _short_version(version: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _accounts_sql(*, legacy: bool, log: bool, totp: bool, passkey: bool, share: bool, include_inactive: bool) -> str:
+def _accounts_sql(
+    *,
+    legacy: bool,
+    log: bool,
+    totp: bool,
+    passkey: bool,
+    share: bool,
+    include_inactive: bool,
+    oauth_provider_id: bool = False,
+    oauth_uid: bool = False,
+) -> str:
     """The account query, built from the probe facts.
 
     Mirrors `odoo-db`'s `get_users` (`db.py:657-769`) and adds the partner
@@ -198,6 +225,12 @@ def _accounts_sql(*, legacy: bool, log: bool, totp: bool, passkey: bool, share: 
     profile_expr = (
         f"CASE WHEN {in_group('group_system')} THEN 'admin' WHEN {internal_expr} THEN 'internal' ELSE 'portal' END"
     )
+    provider_expr = "ru.oauth_provider_id" if oauth_provider_id else "NULL"
+    linked_expr = (
+        "(ru.oauth_provider_id IS NOT NULL AND COALESCE(ru.oauth_uid, '') <> '')"
+        if oauth_provider_id and oauth_uid
+        else "FALSE"
+    )
     where = "" if include_inactive else "WHERE ru.active = TRUE"
     # UNION deduplicates memberships and terminates even if groups form a cycle.
     return f"""
@@ -211,7 +244,7 @@ WITH RECURSIVE effective_groups(uid, gid) AS (
 SELECT ru.id, ru.login, rp.email, {password} AS password,
        {last_login} AS last_login, {totp_expr} AS totp_set,
        {passkey_expr} AS passkey_count, {share_expr} AS share,
-       {profile_expr} AS profile
+       {profile_expr} AS profile, {provider_expr} AS oauth_provider_id, {linked_expr} AS oauth_linked
 FROM res_users ru
 LEFT JOIN res_partner rp ON rp.id = ru.partner_id
 {last_login_join}
@@ -232,6 +265,8 @@ def _accounts(
         passkey=facts["passkey"],
         share=facts["share"],
         include_inactive=include_inactive,
+        oauth_provider_id=facts["oauth_provider_id"],
+        oauth_uid=facts["oauth_uid"],
     )
     rows, error = _psql_csv(sql, db, {}, pg, host)
     if rows is None:
@@ -242,16 +277,20 @@ def _accounts(
 def _decode_rows(rows: list[list[str | None]], *, policy: str | None) -> list[dict]:
     out = []
     for row in rows:
-        if len(row) != 9:
-            msg = f"account query returned {len(row)} columns, expected 9"
+        if len(row) != 11:
+            msg = f"account query returned {len(row)} columns, expected 11"
             raise ValueError(msg)
-        uid, login, email, password, last_login, totp_set, passkey_count, share, profile = row
+        uid, login, email, password, last_login, totp_set, passkey_count, share, profile, provider_id, oauth_linked = (
+            row
+        )
         out.append({
             "id": int(uid or 0),
             "login": login or "",
             "email": email or "",
             "password": password,
             "profile": profile,
+            "oauth_provider_id": int(provider_id) if provider_id is not None else None,
+            "oauth_linked": _truthy(oauth_linked),
             "last_login": last_login,
             "mfa": compute_mfa(
                 totp_set=_truthy(totp_set),
@@ -323,6 +362,26 @@ def _companies(pg: PgTarget, db: str, host: Host) -> tuple[list[str], str]:
     return [row[0] for row in rows if row and row[0]], ""
 
 
+def _oauth_providers(pg: PgTarget, db: str, host: Host) -> tuple[list[dict] | None, str]:
+    """Include disabled providers too, so existing user links remain resolvable.
+
+    Checked against upstream auth_oauth in 8.0-20.0 and master: provider
+    name is a non-translated Char, enabled a Boolean; res_users stores
+    oauth_provider_id (Many2one) and oauth_uid (Char) throughout.
+    """
+    rows, error = _psql_csv("SELECT id, name, enabled FROM auth_oauth_provider ORDER BY id", db, {}, pg, host)
+    if rows is None:
+        return None, error
+    providers = []
+    for row in rows:
+        if len(row) != 3:
+            msg = "OAuth provider query returned an unexpected column count"
+            raise ValueError(msg)
+        provider_id, name, enabled = row
+        providers.append({"id": int(provider_id or 0), "name": name, "enabled": _truthy(enabled)})
+    return providers, ""
+
+
 def build_payload(
     *,
     database: str,
@@ -333,6 +392,7 @@ def build_payload(
     odoo_version: str | None,
     include_inactive: bool,
     exported_at: datetime | None = None,
+    oauth_providers: list[dict] | None = None,
 ) -> dict:
     """The `<db>_accounts.json` document.
 
@@ -348,6 +408,7 @@ def build_payload(
         "odoo_version": odoo_version,
         "include_inactive": include_inactive,
         "companies": companies,
+        "oauth_providers": oauth_providers or [],
         "summary": summarize_users(rows, by="year"),
         "users": [
             {
@@ -356,6 +417,8 @@ def build_payload(
                 "email": row["email"],
                 "password": row["password"],
                 "profile": row["profile"],
+                "oauth_provider_id": row.get("oauth_provider_id"),
+                "oauth_linked": row.get("oauth_linked", False),
             }
             for row in rows
         ],
@@ -380,6 +443,11 @@ def export_database(
     rows, error = _accounts(pg, database, host, include_inactive=include_inactive, facts=facts)
     if rows is None:
         return None, error
+    providers = []
+    if facts["oauth_providers"]:
+        providers, error = _oauth_providers(pg, database, host)
+        if providers is None:
+            return None, error
     companies, _company_error = _companies(pg, database, host)
     payload = build_payload(
         database=database,
@@ -388,6 +456,7 @@ def export_database(
         rows=rows,
         companies=companies,
         odoo_version=facts["version"],
+        oauth_providers=providers,
         include_inactive=include_inactive,
     )
     path = accounts_path(run_dir, host_identity_value, instance, database)

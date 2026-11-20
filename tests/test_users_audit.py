@@ -28,9 +28,9 @@ def _hash(plain="synthetic"):
     return f"$pbkdf2-sha512$1${ab64(salt)}${ab64(digest)}"
 
 
-# probe row: has_crypt, has_share, has_totp, has_log, has_passkey, policy, version
-_MODERN = ["0", "1", "1", "1", "0", None, "16.0.1.3"]
-_ODOO8 = ["0", "0", "0", "0", "0", None, "8.0"]
+# Probe: crypt/share/totp/log/passkey, policy/version, OAuth table/provider column/uid column.
+_MODERN = ["0", "1", "1", "1", "0", None, "16.0.1.3", "0", "0", "0"]
+_ODOO8 = ["0", "0", "0", "0", "0", None, "8.0", "0", "0", "0"]
 
 
 def _fake_db(monkeypatch, *, probe=_MODERN, accounts=(), companies=("Acme",)):
@@ -41,7 +41,7 @@ def _fake_db(monkeypatch, *, probe=_MODERN, accounts=(), companies=("Acme",)):
         if "AS has_password_crypt" in sql:
             return [list(probe)], ""
         if "FROM res_users ru" in sql:
-            return [list(row) for row in accounts], ""
+            return [[*row, None, "f"] if len(row) == 9 else list(row) for row in accounts], ""
         if "FROM res_company" in sql:
             return [[name] for name in companies], ""
         return [], ""
@@ -118,8 +118,24 @@ def test_payload_shaping_keeps_null_password_and_short_version():
     assert payload["odoo_version"] == "16.0"
     assert payload["include_inactive"] is False
     assert payload["users"] == [
-        {"id": 2, "login": "admin", "email": "admin@example.test", "password": "$hash", "profile": "admin"},
-        {"id": 3, "login": "oauth", "email": "", "password": None, "profile": "internal"},
+        {
+            "id": 2,
+            "login": "admin",
+            "email": "admin@example.test",
+            "password": "$hash",
+            "profile": "admin",
+            "oauth_provider_id": None,
+            "oauth_linked": False,
+        },
+        {
+            "id": 3,
+            "login": "oauth",
+            "email": "",
+            "password": None,
+            "profile": "internal",
+            "oauth_provider_id": None,
+            "oauth_linked": False,
+        },
     ]
     assert payload["exported_at"].endswith("+00:00")
 
@@ -208,8 +224,24 @@ def test_export_database_writes_a_private_accounts_file(monkeypatch, tmp_path):
         "mfa_by_type": {"totp": 1, "none": 1},
     }
     assert payload["users"] == [
-        {"id": 2, "login": "admin", "email": "admin@example.test", "password": "$hash", "profile": "admin"},
-        {"id": 3, "login": "portal", "email": "", "password": "", "profile": "portal"},
+        {
+            "id": 2,
+            "login": "admin",
+            "email": "admin@example.test",
+            "password": "$hash",
+            "profile": "admin",
+            "oauth_provider_id": None,
+            "oauth_linked": False,
+        },
+        {
+            "id": 3,
+            "login": "portal",
+            "email": "",
+            "password": "",
+            "profile": "portal",
+            "oauth_provider_id": None,
+            "oauth_linked": False,
+        },
     ]
     assert entry["users"] == 2
 
@@ -681,3 +713,74 @@ def test_profile_with_share_consistent_with_groups(groups, expected):
 def test_profile_internal_access_follows_share_column(groups, share, expected):
     # Groups and share disagree on purpose, proving which source is used.
     assert _profile(groups, share=share) == expected
+
+
+@pytest.mark.parametrize("include_inactive", [False, True])
+def test_oauth_linkage_sql(include_inactive):
+    with sqlite3.connect(":memory:") as db:
+        db.executescript("""
+            CREATE TABLE res_users (id, login, partner_id, password, login_date, active,
+                                    oauth_provider_id, oauth_uid);
+            CREATE TABLE res_partner (id, email);
+            CREATE TABLE res_groups_users_rel (uid, gid);
+            CREATE TABLE res_groups_implied_rel (gid, hid);
+            CREATE TABLE ir_model_data (module, name, model, res_id);
+            INSERT INTO res_users VALUES
+                (1, 'linked', NULL, NULL, NULL, TRUE, 7, 'external-id'),
+                (2, 'local', NULL, NULL, NULL, TRUE, NULL, NULL),
+                (3, 'incomplete', NULL, NULL, NULL, TRUE, 7, ''),
+                (4, 'inactive', NULL, NULL, NULL, FALSE, 8, 'other-id');
+        """)
+        sql = ua._accounts_sql(
+            legacy=False,
+            log=False,
+            totp=False,
+            passkey=False,
+            share=False,
+            include_inactive=include_inactive,
+            oauth_provider_id=True,
+            oauth_uid=True,
+        )
+        rows = [[str(c) if c is not None else None for c in row] for row in db.execute(sql)]
+    decoded = ua._decode_rows(rows, policy=None)
+    assert [(r["oauth_provider_id"], r["oauth_linked"]) for r in decoded] == (
+        [(7, True), (None, False), (7, False)] + ([(8, True)] if include_inactive else [])
+    )
+    assert "external-id" not in str(decoded)
+    assert "oauth_access_token" not in sql
+
+
+def test_oauth_providers_export_and_manifest_privacy(monkeypatch, tmp_path):
+    calls = _fake_db(
+        monkeypatch,
+        probe=[*_MODERN[:7], "1", "1", "1"],
+        accounts=[["1", "linked", "", None, None, "f", "0", "f", "internal", "7", "t"]],
+    )
+    original = ua._psql_csv
+
+    def query(sql, *args):
+        if "FROM auth_oauth_provider" in sql:
+            calls.append(sql)
+            return [["7", "Corporate SSO", "t"], ["8", "Old SSO", "f"]], ""
+        return original(sql, *args)
+
+    monkeypatch.setattr(ua, "_psql_csv", query)
+    entry, error = ua.export_database(instance="i", database="d", pg=PgTarget(), run=tmp_path)
+    assert not error and entry is not None
+    payload = json.loads(Path(entry["path"]).read_text())
+    assert payload["oauth_providers"] == [
+        {"id": 7, "name": "Corporate SSO", "enabled": True},
+        {"id": 8, "name": "Old SSO", "enabled": False},
+    ]
+    assert payload["users"][0]["oauth_provider_id"] == 7
+    assert payload["users"][0]["oauth_linked"] is True
+    assert "Corporate SSO" not in str(entry)
+    assert all("oauth_access_token" not in sql for sql in calls)
+
+
+def test_oauth_provider_error_prevents_incomplete_export(monkeypatch, tmp_path):
+    _fake_db(monkeypatch, probe=[*_MODERN[:7], "1", "1", "1"])
+    monkeypatch.setattr(ua, "_oauth_providers", lambda *_: (None, "permission denied"))
+    entry, error = ua.export_database(instance="i", database="d", pg=PgTarget(), run=tmp_path)
+    assert entry is None and error == "permission denied"
+    assert not list(tmp_path.rglob("*.json"))

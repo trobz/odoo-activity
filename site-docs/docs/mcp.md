@@ -125,6 +125,19 @@ echo logins, emails or hashes.
 | --- | --- |
 | `users_audit` | Export one `<db>_accounts.json` per database into a fresh private run directory: `summary.last_login_by_year`, `summary.mfa_by_type`, and every active user's id/login/email/profile/stored hash. Returns a manifest of paths and counts, never accounts or hashes. |
 
+The accounts file also contains `oauth_providers`: all configured providers
+with `id`, `name`, and `enabled`, including disabled providers so old account
+links remain resolvable. Each user has `oauth_provider_id` (or `null`) and
+`oauth_linked` (true when both a provider and a nonempty OAuth user ID exist).
+This reports stored linkage, not the last login method or proof of recent OAuth
+use. OAuth is not counted as MFA. Tokens and external OAuth user IDs are never
+exported. Without the OAuth schema, providers are empty and user linkage is
+null/false. These details stay in the private accounts file, not the manifest.
+The OAuth fields and provider schema were checked against local upstream source
+for every major version from 8.0 through 20.0, plus master; they are unchanged
+for these queries. This is source verification, not live database testing of
+each version.
+
 Each user's `profile` is `admin` for Administration / Settings membership
 (`base.group_system`), otherwise `internal` when `share` is false, or `portal`
 for external accounts (including public users). Settings takes precedence;
