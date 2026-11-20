@@ -16,6 +16,9 @@ def test_inventory_filters_modules_and_secrets_preserving_unset_and_blank(monkey
             INSERT INTO ir_module_module VALUES
                 ('base', '16.0.1.0', 'f', 'installed'),
                 ('auto', NULL, 't', 'installed'),
+                ('pending_upgrade', '16.0.1.1', 'f', 'to upgrade'),
+                ('pending_removal', '16.0.1.0', 'f', 'to remove'),
+                ('pending_install', '16.0', 'f', 'to install'),
                 ('unused', '16.0', 'f', 'uninstalled');
             CREATE TABLE ir_config_parameter (key, value);
             INSERT INTO ir_config_parameter VALUES
@@ -27,8 +30,10 @@ def test_inventory_filters_modules_and_secrets_preserving_unset_and_blank(monkey
         monkeypatch.setattr(ca, "_psql_csv", lambda sql, *_: (list(db.execute(sql)), ""))
         result = ca.retrieve("test", PgTarget())
     assert result["modules"] == [
-        {"name": "auto", "version": "", "auto_install": True},
-        {"name": "base", "version": "16.0.1.0", "auto_install": False},
+        {"name": "auto", "version": "", "auto_install": True, "state": "installed"},
+        {"name": "base", "version": "16.0.1.0", "auto_install": False, "state": "installed"},
+        {"name": "pending_removal", "version": "16.0.1.0", "auto_install": False, "state": "to remove"},
+        {"name": "pending_upgrade", "version": "16.0.1.1", "auto_install": False, "state": "to upgrade"},
     ]
     params = {p["key"]: p["value"] for p in result["config_parameters"]}
     assert params["auth_signup.invitation_scope"] == "b2b"

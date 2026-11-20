@@ -90,11 +90,15 @@ Bundled and opt-in, with no additional dependencies. Start `oa-mcp` or
 
 | Tool | What it returns |
 |---|---|
-| `config_audit` | Installed modules (name, version, auto-install flag) and allowlisted configuration parameters for one database. |
+| `config_audit` | Installed modules (name, version, auto-install flag, state) and allowlisted configuration parameters for one database. |
 
 Call with `name` (instance name), `db`, and optionally `host` / `ssh_port`.
 The tool uses the instance's PostgreSQL connection and the normal pinned-host
 or multi-host restrictions. It returns structured data directly, without files.
+
+Installed modules include those pending an upgrade or uninstall (`state` is
+`to upgrade` or `to remove`), since both are still loaded; `to install`
+modules are not installed yet and are left out.
 
 Parameters: `auth_signup.invitation_scope`, `auth_password_policy.minlength`,
 `auth_totp.policy`, `web.base.url`, `web.base.url.freeze`, `report.url`, and

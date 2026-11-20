@@ -1,6 +1,8 @@
 """Opt-in, read-only configuration inventory over the existing psql transport.
 
 Mirrors odoo-db's get_modules and allowlisted config parameter queries.
+"Installed" includes modules pending an upgrade or uninstall ('to upgrade',
+'to remove'): both are still loaded. 'to install' is not installed yet.
 CSV keeps the queries compatible with PostgreSQL versions predating JSON.
 """
 
@@ -22,9 +24,9 @@ PARAMETERS = {
 }
 
 _MODULES_SQL = """
-SELECT name, latest_version, auto_install
+SELECT name, latest_version, auto_install, state
 FROM ir_module_module
-WHERE state = 'installed'
+WHERE state IN ('installed', 'to upgrade', 'to remove')
 ORDER BY name
 """
 _PARAMETERS_SQL = (
@@ -41,11 +43,11 @@ def retrieve(database: str, pg: PgTarget, host: Host = LOCAL) -> dict:
         raise ValueError(error or "installed module query failed")
     modules = []
     for row in rows:
-        if len(row) != 3:
+        if len(row) != 4:
             msg = "installed module query returned an unexpected column count"
             raise ValueError(msg)
-        name, version, auto_install = row
-        modules.append({"name": name, "version": version or "", "auto_install": auto_install == "t"})
+        name, version, auto_install, state = row
+        modules.append({"name": name, "version": version or "", "auto_install": auto_install == "t", "state": state})
 
     rows, error = _psql_csv(_PARAMETERS_SQL, database, {}, pg, host)
     if rows is None:
