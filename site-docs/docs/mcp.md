@@ -104,10 +104,22 @@ Parameters: `auth_signup.invitation_scope`, `auth_password_policy.minlength`,
 `auth_totp.policy`, `web.base.url`, `web.base.url.freeze`, `report.url`,
 `database.is_neutralized`, `database.is_configured_for_safe_testing`,
 `database.is_shrunk`, `database.is_anonymized`, `database.is_obfuscated`, and
-`database.source_dump_datetime`. These cover signup/password/MFA policy,
-generated links, report rendering, and the copy-pipeline markers (the same keys
-`odoo-db list` reports, read here without odoo-db). Only those keys are
-queried; arbitrary parameters and secrets are excluded.
+`database.source_dump_datetime`, plus the OCA `password_security` keys of
+17.0+ (`password_security.expiration_days`, `.minimum_hours`, `.history`,
+`.lower`, `.upper`, `.numeric`, `.special`). These cover signup/password/MFA
+policy, generated links, report rendering, and the copy-pipeline markers (the
+same keys `odoo-db list` reports, read here without odoo-db). Only those keys
+are queried; arbitrary parameters and secrets are excluded.
+
+`password_security` is `null` unless the OCA module is installed. Before 17.0
+the module keeps one policy per company on `res_company`; the result then
+lists each company (`id`, `name`) with whichever policy columns its version
+has: `password_policy_enabled` (15.0), `password_length` and
+`password_estimate` (up to 15.0; 16.0 uses `auth_password_policy.minlength`),
+`password_lower`, `password_upper`, `password_numeric`, `password_special`,
+`password_expiration`, `password_minimum`, `password_history`, with an
+`explanations` map. On 17.0+ `companies` is empty and the policy is in the
+parameters above. Column values are typed (integer, boolean, `null`).
 
 Values are stored strings, with `null` for an absent key and `""` for a stored
 blank. Missing keys do not establish effective defaults: behavior depends on

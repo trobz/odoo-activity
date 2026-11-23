@@ -4,6 +4,11 @@ Mirrors odoo-db's get_modules and allowlisted config parameter queries.
 "Installed" includes modules pending an upgrade or uninstall ('to upgrade',
 'to remove'): both are still loaded. 'to install' is not installed yet.
 CSV keeps the queries compatible with PostgreSQL versions predating JSON.
+
+OCA `password_security` keeps its policy in `ir_config_parameter` from 17.0
+(`password_security.*`, in the allowlist) and on `res_company` before (one
+policy per company, columns varying by version): when the module is
+installed, those columns are read too, whichever of them exist.
 """
 
 from __future__ import annotations
@@ -27,6 +32,30 @@ PARAMETERS = {
     "database.is_anonymized": "Database anonymization marker",
     "database.is_obfuscated": "Database obfuscation marker",
     "database.source_dump_datetime": "When the source dump of this copy was taken (raw stored value)",
+    # OCA password_security, 17.0+ (earlier versions: per company, see PASSWORD_SECURITY_COLUMNS).
+    "password_security.expiration_days": "password_security: days before a password expires (0: never)",
+    "password_security.minimum_hours": "password_security: hours before a password can be changed again",
+    "password_security.history": "password_security: previous passwords that cannot be reused (-1: all)",
+    "password_security.lower": "password_security: minimum lowercase letters",
+    "password_security.upper": "password_security: minimum uppercase letters",
+    "password_security.numeric": "password_security: minimum digits",
+    "password_security.special": "password_security: minimum special characters",
+}
+
+# OCA password_security before 17.0: res_company columns (password_policy_enabled
+# from 15.0; password_length and password_estimate dropped in 16.0 for
+# auth_password_policy.minlength). Only the ones present are read.
+PASSWORD_SECURITY_COLUMNS = {
+    "password_policy_enabled": "Policy enabled for the company (15.0; off: no rule enforced)",
+    "password_length": "Minimum password length (up to 15.0)",
+    "password_lower": "Minimum lowercase letters",
+    "password_upper": "Minimum uppercase letters",
+    "password_numeric": "Minimum digits",
+    "password_special": "Minimum special characters",
+    "password_estimate": "Minimum zxcvbn strength score, 0-4 (up to 15.0)",
+    "password_expiration": "Days before a password expires (0: never)",
+    "password_minimum": "Hours before a password can be changed again",
+    "password_history": "Previous passwords that cannot be reused (-1: all)",
 }
 
 _MODULES_SQL = """
@@ -41,9 +70,55 @@ _PARAMETERS_SQL = (
     + ") ORDER BY key"
 )
 
+_COMPANY_COLUMNS_SQL = (
+    # Resolve the same relation as the unqualified SELECT below, even when
+    # res_company lives later in search_path than current_schema().
+    "SELECT attname FROM pg_catalog.pg_attribute"  # noqa: S608 — constant allowlist only
+    " WHERE attrelid = 'res_company'::regclass AND attnum > 0 AND NOT attisdropped AND attname IN ("
+    + ", ".join(f"'{column}'" for column in PASSWORD_SECURITY_COLUMNS)
+    + ")"
+)
+
+
+def _cell(value: str | None) -> bool | int | str | None:
+    """psql CSV cell -> bool ('t'/'f'), int, or the raw string; NULL stays None."""
+    if value in ("t", "f"):
+        return value == "t"
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return value
+
+
+def _password_security_companies(database: str, pg: PgTarget, host: Host) -> list[dict]:
+    """Per-company password_security policy (before 17.0); [] when it keeps none on res_company."""
+    rows, error = _psql_csv(_COMPANY_COLUMNS_SQL, database, {}, pg, host)
+    if rows is None:
+        raise ValueError(error or "res_company column query failed")
+    present = {row[0] for row in rows if row}
+    columns = [column for column in PASSWORD_SECURITY_COLUMNS if column in present]  # allowlist order
+    if not columns:
+        return []
+    sql = f"SELECT id, name, {', '.join(columns)} FROM res_company ORDER BY id"  # noqa: S608 — allowlisted names
+    rows, error = _psql_csv(sql, database, {}, pg, host)
+    if rows is None:
+        raise ValueError(error or "res_company policy query failed")
+    companies = []
+    for row in rows:
+        if len(row) != len(columns) + 2:
+            msg = "res_company policy query returned an unexpected column count"
+            raise ValueError(msg)
+        companies.append({
+            "id": _cell(row[0]),
+            "name": row[1],
+            **{c: _cell(v) for c, v in zip(columns, row[2:], strict=True)},
+        })
+    return companies
+
 
 def retrieve(database: str, pg: PgTarget, host: Host = LOCAL) -> dict:
-    """Return installed modules and stored settings; fail on either query error."""
+    """Return installed modules, stored settings and, when OCA password_security is
+    installed, its per-company policy; fail on any query error."""
     rows, error = _psql_csv(_MODULES_SQL, database, {}, pg, host)
     if rows is None:
         raise ValueError(error or "installed module query failed")
@@ -66,6 +141,14 @@ def retrieve(database: str, pg: PgTarget, host: Host = LOCAL) -> dict:
         key, value = row
         if key in PARAMETERS:
             values[key] = value
+    installed = {module["name"] for module in modules}
+    password_security = None
+    if "password_security" in installed:
+        companies = _password_security_companies(database, pg, host)
+        password_security = {
+            "companies": companies,
+            "explanations": {c: e for c, e in PASSWORD_SECURITY_COLUMNS.items() if any(c in co for co in companies)},
+        }
     return {
         "database": database,
         "modules": modules,
@@ -73,6 +156,8 @@ def retrieve(database: str, pg: PgTarget, host: Host = LOCAL) -> dict:
             {"key": key, "value": values.get(key), "explanation": explanation}
             for key, explanation in PARAMETERS.items()
         ],
+        # None: module not installed; companies == [] on 17.0+ (policy in config_parameters)
+        "password_security": password_security,
     }
 
 

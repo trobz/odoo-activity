@@ -968,6 +968,9 @@ def config_audit(name: str, db: str, *, target: Host) -> dict:
     Requires --enable-plugins=config-audit. Reads PostgreSQL directly using
     the instance's connection settings; no odooly or odoo-db installation
     required. Unset parameters are null, not inferred effective defaults.
+    When OCA password_security is installed, `password_security.companies`
+    lists each company's policy (before 17.0; from 17.0 it is in the
+    parameters); null when the module is not installed.
 
     Args:
         name: instance name from list_instances.
