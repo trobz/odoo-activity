@@ -279,6 +279,7 @@ def test_exports_reserve_unique_paths_with_host_identity(monkeypatch, tmp_path, 
         WORK_DIR=tmp_path,
         HASHCAT_MODE=12100,
         export_path=destination,
+        rows_from_accounts=lambda accounts: accounts["users"],
         export_from_accounts=convert,
     )
     monkeypatch.setattr(mcp_server, "_password_audit", lambda: pa)

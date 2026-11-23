@@ -82,16 +82,14 @@ def accounts_path(run: Path, host_identity_value: str, instance: str, database: 
 # ---------------------------------------------------------------------------
 
 _COLUMN_COUNT = (
-    "SELECT count(*) FROM pg_attribute a "
-    "JOIN pg_class c ON c.oid = a.attrelid "
-    "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
-    "WHERE c.relname = 'res_users' AND ns.nspname = 'public' "
+    "SELECT count(*) FROM pg_catalog.pg_attribute a "
+    "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+    "WHERE c.relname = 'res_users' AND pg_catalog.pg_table_is_visible(c.oid) "
     "AND a.attname = '{column}' AND NOT a.attisdropped"
 )
 _TABLE_COUNT = (
-    "SELECT count(*) FROM pg_class c "
-    "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
-    "WHERE c.relname = '{table}' AND ns.nspname = 'public' AND c.relkind = 'r'"
+    "SELECT count(*) FROM pg_catalog.pg_class c "
+    "WHERE c.relname = '{table}' AND pg_catalog.pg_table_is_visible(c.oid) AND c.relkind IN ('r', 'p')"
 )
 
 # One row of facts per database. Scalar subqueries keep it a single psql call
@@ -209,19 +207,21 @@ def _accounts_sql(
         passkey_join = ""
     # res_users.share only exists from 9.0 on; a database without it has no
     # share users to enforce email OTP against.
-    share_expr = "ru.share" if share else "FALSE"
+    share_expr = "COALESCE(ru.share, FALSE)" if share else "FALSE"
 
-    # Odoo 19+ stores only explicit memberships. Traverse implied groups on
-    # every version, resolving XML IDs rather than assuming numeric IDs.
+    # Odoo 19+ stores only explicit memberships. Walk res_groups_implied_rel
+    # backwards from the target XML ID(s) so the recursive CTE stays bounded by
+    # the small group graph rather than scaling with every user in the database.
+    target_groups = "'group_system'" if share else "'group_system', 'group_user'"
+
     def in_group(name: str) -> str:
         return (
-            "EXISTS (SELECT 1 FROM effective_groups gu "
-            "JOIN ir_model_data imd ON imd.res_id = gu.gid "
-            "WHERE gu.uid = ru.id AND imd.model = 'res.groups' "
-            f"AND imd.module = 'base' AND imd.name = '{name}')"
+            "EXISTS (SELECT 1 FROM res_groups_users_rel gu "
+            "JOIN implying_groups ig ON ig.gid = gu.gid "
+            f"WHERE gu.uid = ru.id AND ig.target = '{name}')"
         )
 
-    internal_expr = "NOT ru.share" if share else in_group("group_user")
+    internal_expr = "NOT COALESCE(ru.share, FALSE)" if share else in_group("group_user")
     profile_expr = (
         f"CASE WHEN {in_group('group_system')} THEN 'admin' WHEN {internal_expr} THEN 'internal' ELSE 'portal' END"
     )
@@ -234,12 +234,15 @@ def _accounts_sql(
     where = "" if include_inactive else "WHERE ru.active = TRUE"
     # UNION deduplicates memberships and terminates even if groups form a cycle.
     return f"""
-WITH RECURSIVE effective_groups(uid, gid) AS (
-    SELECT uid, gid FROM res_groups_users_rel
+WITH RECURSIVE implying_groups(target, gid) AS (
+    SELECT imd.name, imd.res_id
+    FROM ir_model_data imd
+    WHERE imd.model = 'res.groups' AND imd.module = 'base'
+      AND imd.name IN ({target_groups})
     UNION
-    SELECT eg.uid, implied.hid
-    FROM effective_groups eg
-    JOIN res_groups_implied_rel implied ON implied.gid = eg.gid
+    SELECT ig.target, implied.gid
+    FROM implying_groups ig
+    JOIN res_groups_implied_rel implied ON implied.hid = ig.gid
 )
 SELECT ru.id, ru.login, rp.email, {password} AS password,
        {last_login} AS last_login, {totp_expr} AS totp_set,

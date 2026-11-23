@@ -1059,7 +1059,7 @@ def _users_audit_entry(  # noqa: C901 — per-target validation and failure isol
         return _target_error(identity, instance, database, "account export failed")
     if entry is not None:
         return entry
-    safe_error = "permission denied" if error == "permission denied" else "account export failed"
+    safe_error = "permission denied" if "permission denied" in error.lower() else "account export failed"
     return _target_error(identity, instance, database, safe_error)
 
 
@@ -1153,9 +1153,7 @@ def password_hashes(accounts_file: str) -> str:
         msg = "not a users-audit accounts file (unreadable or invalid JSON)"
         raise ValueError(msg) from None
     # Validate before reserving an export directory or writing any files.
-    from odoo_activity.plugins.password_audit import rows_from_accounts
-
-    rows_from_accounts(accounts)
+    pa.rows_from_accounts(accounts)
 
     instance = accounts.get("instance")
     database = accounts.get("database")

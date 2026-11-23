@@ -45,7 +45,6 @@ from odoo_activity.plugins import Plugin
 from odoo_activity.plugins._private import ensure_dir as _ensure_dir
 from odoo_activity.plugins._private import safe_write as _safe_write
 from odoo_activity.probes import LOCAL, Host
-from odoo_activity.probes import pg_target_of as pg_target_of  # re-exported for mcp_server
 
 # where hash material and wordlists live. Scratch by default: a tmpfs-backed
 # workspace the OS clears, so the hashes do not outlive the audit.

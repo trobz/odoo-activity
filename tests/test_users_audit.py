@@ -297,7 +297,7 @@ def test_batch_reports_partial_failure_without_disclosing_accounts(monkeypatch, 
 
     def export(**kwargs):
         if kwargs["database"] == "bad":
-            return None, "permission denied"
+            return None, "ERROR:  permission denied for table res_users"
         return {
             "host": "local",
             "instance": kwargs["instance"],
@@ -313,7 +313,7 @@ def test_batch_reports_partial_failure_without_disclosing_accounts(monkeypatch, 
     manifest = json.loads(result)
     assert [d["error"] for d in manifest["databases"]] == [None, "permission denied"]
     assert manifest["databases"][0]["users"] == 1
-    for secret in ("admin", "password", "$pbkdf2"):
+    for secret in ("admin", "password", "$pbkdf2", "res_users"):
         assert secret not in result
 
 
@@ -635,13 +635,15 @@ def test_password_hashes_expands_home(monkeypatch, tmp_path):
     assert "(0 hashes" in mcp_server.password_hashes("~/accounts.json")
 
 
-def _profile(groups: list[int], *, share: bool | None = None) -> str:
+def _profile(groups: list[int], *, share: bool | None = None, has_share: bool | None = None) -> str:
     """Run the account SQL against a minimal schema and return user 7's profile.
 
-    `share=None` models Odoo 8 (no `share` column); otherwise the column is
-    added with the given value. Memberships are explicit only, with arbitrary
-    group IDs and unrelated XML IDs to guard against loose joins.
+    `has_share=False` (default when `share is None`) models Odoo 8 (no `share`
+    column); `has_share=True, share=None` models a NULL `share` value.
+    Memberships are explicit only, with arbitrary group IDs and unrelated XML
+    IDs to guard against loose joins.
     """
+    include_share = share is not None if has_share is None else has_share
     with sqlite3.connect(":memory:") as db:
         db.executescript("""
             CREATE TABLE res_users (id, login, partner_id, password, login_date, active);
@@ -649,7 +651,7 @@ def _profile(groups: list[int], *, share: bool | None = None) -> str:
             CREATE TABLE res_groups_users_rel (uid, gid);
             CREATE TABLE res_groups_implied_rel (gid, hid);
             INSERT INTO res_groups_implied_rel VALUES
-                (50, 30), (60, 61), (61, 10), (70, 71), (71, 70);
+                (50, 30), (60, 61), (61, 10), (70, 71), (71, 70), (80, 81), (81, 80), (81, 10);
             CREATE TABLE ir_model_data (module, name, model, res_id);
             INSERT INTO res_users VALUES (7, 'user', 1, NULL, NULL, TRUE);
             INSERT INTO res_partner VALUES (1, 'user@example.test');
@@ -661,14 +663,14 @@ def _profile(groups: list[int], *, share: bool | None = None) -> str:
                 ('custom', 'group_system', 'res.groups', 30),
                 ('base', 'group_system', 'other.model', 30);
         """)
-        if share is not None:
+        if include_share:
             db.execute("ALTER TABLE res_users ADD COLUMN share")
             db.execute("UPDATE res_users SET share = ?", (share,))
         # Another user's Settings membership must not affect this user's profile.
         db.execute("INSERT INTO res_groups_users_rel VALUES (8, 10)")
         db.executemany("INSERT INTO res_groups_users_rel VALUES (7, ?)", [(gid,) for gid in groups])
         sql = ua._accounts_sql(
-            legacy=False, log=False, totp=False, passkey=False, share=share is not None, include_inactive=False
+            legacy=False, log=False, totp=False, passkey=False, share=include_share, include_inactive=False
         )
         rows = [[str(cell) if cell is not None else None for cell in row] for row in db.execute(sql)]
     return ua._decode_rows(rows, policy=None)[0]["profile"]
@@ -685,6 +687,7 @@ _PROFILE_CASES = [
     ([50], "internal"),  # only an implied internal membership
     ([60], "admin"),  # multi-hop implied Settings membership
     ([70], "portal"),  # cycle with no internal/admin access
+    ([80], "admin"),  # cycle that also implies Settings
 ]
 
 
@@ -713,6 +716,10 @@ def test_profile_with_share_consistent_with_groups(groups, expected):
 def test_profile_internal_access_follows_share_column(groups, share, expected):
     # Groups and share disagree on purpose, proving which source is used.
     assert _profile(groups, share=share) == expected
+
+
+def test_profile_treats_null_share_as_internal():
+    assert _profile([], share=None, has_share=True) == "internal"
 
 
 @pytest.mark.parametrize("include_inactive", [False, True])

@@ -19,6 +19,7 @@ def test_company_columns_follow_search_path(tmp_path):
         pytest.skip("requires PostgreSQL server binaries and a non-root user")
     bindir = Path(initdb).parent
     data = tmp_path / "data"
+
     def run(binary, *args, input_text=None):
         return subprocess.run(  # noqa: S603 — local PostgreSQL binaries, fixed test arguments
             [str(bindir / binary), *map(str, args)],
