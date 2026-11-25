@@ -221,3 +221,59 @@ def test_password_security_query_error_fails_the_audit(monkeypatch):
     monkeypatch.setattr(ca, "_psql_csv", query)
     with pytest.raises(ValueError, match="permission denied for res_company"):
         ca.retrieve("db", PgTarget())
+
+
+def test_websites_reports_signup_scope_per_website(monkeypatch):
+    db, query, _ = _fake_db(
+        """
+        INSERT INTO ir_module_module VALUES ('website', '17.0.1.0', 'f', 'installed');
+        CREATE TABLE website (id, name, domain, auth_signup_uninvited, secret);
+        INSERT INTO website VALUES (1, 'Main', 'https://example.com', 'b2b', 'nope'),
+                                   (2, 'Shop', NULL, 'b2c', 'nope'),
+                                   (3, 'Legacy', '', NULL, 'nope');
+        """,
+        ["domain", "auth_signup_uninvited"],
+    )
+    monkeypatch.setattr(ca, "_psql_csv", query)
+    with db:
+        result = ca.retrieve("test", PgTarget())
+    assert result["websites"] == [
+        {"id": 1, "name": "Main", "domain": "https://example.com", "auth_signup_uninvited": "b2b"},
+        {"id": 2, "name": "Shop", "domain": None, "auth_signup_uninvited": "b2c"},
+        {"id": 3, "name": "Legacy", "domain": "", "auth_signup_uninvited": None},
+    ]
+    assert "nope" not in str(result)
+
+
+def test_websites_without_signup_column_returns_empty(monkeypatch):
+    db, query, calls = _fake_db(
+        "INSERT INTO ir_module_module VALUES ('website', '11.0.1.0', 'f', 'installed');",
+        ["domain"],
+    )
+    monkeypatch.setattr(ca, "_psql_csv", query)
+    with db:
+        result = ca.retrieve("test", PgTarget())
+    assert result["websites"] == []
+    assert len(calls) == 3  # modules, parameters, pg_attribute only
+
+
+def test_websites_absent_runs_no_website_query(monkeypatch):
+    db, query, calls = _fake_db("INSERT INTO ir_module_module VALUES ('base', '17.0', 'f', 'installed');", [])
+    monkeypatch.setattr(ca, "_psql_csv", query)
+    with db:
+        result = ca.retrieve("test", PgTarget())
+    assert result["websites"] is None
+    assert len(calls) == 2
+
+
+def test_websites_query_error_fails_the_audit(monkeypatch):
+    def query(sql, *_):
+        if "ir_module_module" in sql:
+            return [["website", "17.0.1.0", "f", "installed"]], ""
+        if "pg_catalog.pg_attribute" in sql:
+            return None, "permission denied for website"
+        return [], ""
+
+    monkeypatch.setattr(ca, "_psql_csv", query)
+    with pytest.raises(ValueError, match="permission denied for website"):
+        ca.retrieve("db", PgTarget())

@@ -970,7 +970,10 @@ def config_audit(name: str, db: str, *, target: Host) -> dict:
     required. Unset parameters are null, not inferred effective defaults.
     When OCA password_security is installed, `password_security.companies`
     lists each company's policy (before 17.0; from 17.0 it is in the
-    parameters); null when the module is not installed.
+    parameters); null when the module is not installed. When `website` is
+    installed, `websites` lists each website's `domain` and
+    `auth_signup_uninvited` (which overrides `auth_signup.invitation_scope`
+    on Odoo 12.0+); null when `website` is not installed.
 
     Args:
         name: instance name from list_instances.

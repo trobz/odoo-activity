@@ -121,6 +121,12 @@ has: `password_policy_enabled` (15.0), `password_length` and
 `explanations` map. On 17.0+ `companies` is empty and the policy is in the
 parameters above. Column values are typed (integer, boolean, `null`).
 
+`websites` is `null` unless `website` is installed. On Odoo 12.0+ each website
+has its own `auth_signup_uninvited` (`b2b`, `b2c`, or `null` to fall back to
+`auth_signup.invitation_scope`), overriding the `ir_config_parameter` value;
+`websites` lists each website (`id`, `name`, `domain`, `auth_signup_uninvited`),
+or `[]` on versions without `auth_signup_uninvited`.
+
 Values are stored strings, with `null` for an absent key and `""` for a stored
 blank. Missing keys do not establish effective defaults: behavior depends on
 the Odoo version and installed addons. The neutralization marker alone is not

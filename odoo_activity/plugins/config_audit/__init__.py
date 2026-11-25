@@ -9,6 +9,10 @@ OCA `password_security` keeps its policy in `ir_config_parameter` from 17.0
 (`password_security.*`, in the allowlist) and on `res_company` before (one
 policy per company, columns varying by version): when the module is
 installed, those columns are read too, whichever of them exist.
+
+When `website` is installed (Odoo 12.0+), `website.auth_signup_uninvited`
+overrides `auth_signup.invitation_scope` per website: each website's signup
+scope is read from `website` when that column exists.
 """
 
 from __future__ import annotations
@@ -79,6 +83,15 @@ _COMPANY_COLUMNS_SQL = (
     + ")"
 )
 
+WEBSITE_COLUMNS = ("domain", "auth_signup_uninvited")
+
+_WEBSITE_COLUMNS_SQL = (
+    "SELECT attname FROM pg_catalog.pg_attribute"  # noqa: S608 — constant allowlist only
+    " WHERE attrelid = 'website'::regclass AND attnum > 0 AND NOT attisdropped AND attname IN ("
+    + ", ".join(f"'{column}'" for column in WEBSITE_COLUMNS)
+    + ")"
+)
+
 
 def _cell(value: str | None) -> bool | int | str | None:
     """psql CSV cell -> bool ('t'/'f'), int, or the raw string; NULL stays None."""
@@ -116,9 +129,36 @@ def _password_security_companies(database: str, pg: PgTarget, host: Host) -> lis
     return companies
 
 
+def _websites(database: str, pg: PgTarget, host: Host) -> list[dict]:
+    """Per-website signup scope (Odoo 12.0+); [] when website has no auth_signup_uninvited column."""
+    rows, error = _psql_csv(_WEBSITE_COLUMNS_SQL, database, {}, pg, host)
+    if rows is None:
+        raise ValueError(error or "website column query failed")
+    present = {row[0] for row in rows if row}
+    if "auth_signup_uninvited" not in present:
+        return []
+    columns = [column for column in WEBSITE_COLUMNS if column in present]
+    sql = f"SELECT id, name, {', '.join(columns)} FROM website ORDER BY id"  # noqa: S608 — allowlisted names
+    rows, error = _psql_csv(sql, database, {}, pg, host)
+    if rows is None:
+        raise ValueError(error or "website query failed")
+    websites = []
+    for row in rows:
+        if len(row) != len(columns) + 2:
+            msg = "website query returned an unexpected column count"
+            raise ValueError(msg)
+        websites.append({
+            "id": _cell(row[0]),
+            "name": row[1],
+            **dict(zip(columns, row[2:], strict=True)),
+        })
+    return websites
+
+
 def retrieve(database: str, pg: PgTarget, host: Host = LOCAL) -> dict:
-    """Return installed modules, stored settings and, when OCA password_security is
-    installed, its per-company policy; fail on any query error."""
+    """Return installed modules, stored settings and, when installed, OCA
+    password_security's per-company policy and per-website signup scopes; fail
+    on any query error."""
     rows, error = _psql_csv(_MODULES_SQL, database, {}, pg, host)
     if rows is None:
         raise ValueError(error or "installed module query failed")
@@ -149,6 +189,7 @@ def retrieve(database: str, pg: PgTarget, host: Host = LOCAL) -> dict:
             "companies": companies,
             "explanations": {c: e for c, e in PASSWORD_SECURITY_COLUMNS.items() if any(c in co for co in companies)},
         }
+    websites = _websites(database, pg, host) if "website" in installed else None
     return {
         "database": database,
         "modules": modules,
@@ -158,6 +199,8 @@ def retrieve(database: str, pg: PgTarget, host: Host = LOCAL) -> dict:
         ],
         # None: module not installed; companies == [] on 17.0+ (policy in config_parameters)
         "password_security": password_security,
+        # None: website not installed; [] when website has no auth_signup_uninvited column (<= 11.0)
+        "websites": websites,
     }
 
 
