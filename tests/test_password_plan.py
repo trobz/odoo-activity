@@ -1,6 +1,7 @@
 """Planner regressions use synthetic exports and a fake calibrator, never a GPU."""
 
 import base64
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -262,29 +263,41 @@ def test_planning_call_overhead_is_charged(planner):
     assert "leftover 2s" in result
 
 
-@pytest.mark.parametrize("host,port,identity", [(None, None, "local"), ("ops@prod", 2222, "ops@prod:2222")])
-def test_exports_reserve_unique_paths_with_host_identity(monkeypatch, tmp_path, host, port, identity):
+@pytest.mark.parametrize("identity", ["local", "ops@prod:2222"])
+def test_exports_reserve_unique_paths_with_host_identity(monkeypatch, tmp_path, identity):
     calls = []
 
     def destination(instance, db, host_identity="local"):
         calls.append((instance, db, host_identity))
         return tmp_path / f"export-{len(calls)}.hashcat"
 
+    def convert(accounts, path):
+        path.write_text("synthetic\n")
+        return 1
+
     pa = SimpleNamespace(
         WORK_DIR=tmp_path,
         HASHCAT_MODE=12100,
         export_path=destination,
-        fetch_hash_rows=lambda *_: ([], ""),
-        fetch_company_names=lambda *_: ([], ""),
-        write_hashcat_file=lambda _rows, path, **_kw: path.write_text("synthetic\n") and 1,
+        rows_from_accounts=lambda accounts: accounts["users"],
+        export_from_accounts=convert,
     )
     monkeypatch.setattr(mcp_server, "_password_audit", lambda: pa)
-    monkeypatch.setattr(mcp_server, "_find", lambda *_: {"name": "instance"})
-    monkeypatch.setattr(mcp_server.probes, "pg_target_of", lambda *_: None)
-    monkeypatch.setattr(mcp_server, "_pinned_target", None)
-    monkeypatch.setattr(mcp_server, "_host_filter", None)
-    first = mcp_server.password_hashes("instance", "db", host=host, ssh_port=port)
-    second = mcp_server.password_hashes("instance", "db", host=host, ssh_port=port)
+
+    def accounts_file(n):
+        path = tmp_path / f"db{n}_accounts.json"
+        path.write_text(
+            json.dumps({
+                "database": "db",
+                "instance": "instance",
+                "host": identity,
+                "users": [{"id": 1, "login": "a", "email": "", "password": "x"}],
+            })
+        )
+        return str(path)
+
+    first = mcp_server.password_hashes(accounts_file(1))
+    second = mcp_server.password_hashes(accounts_file(2))
     assert calls == [("instance", "db", identity)] * 2
     assert first.splitlines()[0] != second.splitlines()[0]
     assert "\\n" not in first
@@ -316,7 +329,7 @@ def test_launch_time_gate_still_blocks_planning_and_exports(monkeypatch):
     with pytest.raises(ValueError, match="password-audit disabled"):
         mcp_server.password_plan([], 1)
     with pytest.raises(ValueError, match="password-audit disabled"):
-        mcp_server.password_hashes("synthetic", "db")
+        mcp_server.password_hashes("/nonexistent/accounts.json")
 
 
 def test_allocation_cannot_publish_after_planning_deadline(planner, monkeypatch):
